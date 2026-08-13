@@ -38,6 +38,7 @@ from .live_mesh import LiveMeshEngine, LiveMeshFrame, LiveMeshResult, LiveMeshTe
 from .model import (
     CORE_PORTS,
     HARDWARE_POWER_PROFILE_KEYS,
+    BeaconProfile,
     LiveMeshConfig,
     OBSTACLE_DEFAULTS,
     PRESETS,
@@ -90,6 +91,8 @@ MAX_CACHED_TILE_PIXELS = 1024
 PACKET_LAYER_TAG = "packet-layer"
 NODE_LAYER_TAG = "node-layer"
 CURRENT_WAVE_TAG = "current-wave"
+BEACON_TAG = "beacon-pulse"
+STATIC_COVERAGE_TAG = "static-coverage"
 HUD_LAYER_TAG = "hud-layer"
 SELECTED_OBSTACLE_TAG = "selected-obstacle"
 LIVE_TRAFFIC_PRESETS: dict[str, dict[str, Any]] = {
@@ -499,8 +502,14 @@ def build_coverage_contours(
     result: SimulationResult,
     model: PropagationModel | None = None,
     transmitter_ids: list[str] | None = None,
+    max_range_m: float | None = None,
 ) -> dict[str, list[tuple[float, float, str]]]:
-    """Sample a deterministic RF reception boundary around every transmitter."""
+    """Sample a deterministic RF reception boundary around every transmitter.
+
+    ``max_range_m`` caps how far each ray is traced.  The unobstructed link
+    budget can span 100+ km, so an uncapped sweep across every transmitter and
+    hop is what makes a busy flood freeze; the UI passes a viewport-sized cap.
+    """
     nodes = {node.id: node for node in scenario.nodes}
     all_transmitter_ids = list(
         dict.fromkeys(event.node_id for event in result.events if event.kind == "TX" and event.node_id in nodes)
@@ -523,76 +532,28 @@ def build_coverage_contours(
         angular_samples = 24
     else:
         angular_samples = 16
-    environment = scenario.environment
     model = model or PropagationModel(scenario)
-    mismatch_reasons = {
-        "frequency mismatch",
-        "bandwidth mismatch",
-        "spreading factor mismatch",
-        "coding rate mismatch",
-        "offline",
-    }
 
+    # Use the exact same coverage computation as the beacon so the packet's
+    # first-hop coverage and the beacon heatmap always agree in shape.  Each
+    # beacon ray becomes one boundary point; "weakened" fades read as a soft
+    # threshold edge, "blocked" as a hard stop.
     contours: dict[str, list[tuple[float, float, str]]] = {}
     for source_id in transmitter_ids:
         source = nodes[source_id]
-        compatible_receivers = [
-            node for node in scenario.nodes
-            if node.id != source.id and model.radios_compatible(source, node)[0]
-        ]
-        receiver_reference = compatible_receivers[len(compatible_receivers) // 2] if compatible_receivers else source
-        probe = Node(
-            id=f"coverage-probe-{source.id}",
-            name="Coverage probe",
-            x=source.x,
-            y=source.y,
-            elevation_m=source.elevation_m,
-            antenna_height_m=receiver_reference.antenna_height_m,
-            antenna_gain_dbi=receiver_reference.antenna_gain_dbi,
-            cable_loss_db=receiver_reference.cable_loss_db,
-            noise_figure_db=receiver_reference.noise_figure_db,
-            channel=source.channel,
+        profile = model.beacon_profile(
+            source, angular_samples=angular_samples, max_range_m=max_range_m
         )
-        probe.radio = type(source.radio)(**vars(source.radio))
-        maximum_range = model.unobstructed_range_m(source, probe) * 1.08
         points: list[tuple[float, float, str]] = []
-        for index in range(angular_samples):
-            angle = math.tau * index / angular_samples
-            dx, dy = math.cos(angle), math.sin(angle)
-            maximum = maximum_range
-            probe.x = source.x + dx * maximum
-            probe.y = source.y + dy * maximum
-            ray_obstacles = model._candidate_obstacles(source, probe)
-
-            def sample(distance: float):
-                probe.x = source.x + dx * distance
-                probe.y = source.y + dy * distance
-                elevation = environment.terrain_elevation(probe.x, probe.y)
-                probe.elevation_m = source.elevation_m if elevation is None else elevation
-                return model.link(source, probe, obstacle_candidates=ray_obstacles)
-
-            far_link = sample(maximum)
-            if far_link.compatible and far_link.margin_db >= 0:
-                reach = maximum
-                boundary_kind = "threshold"
-            else:
-                low, high = 0.0, maximum
-                failed_link = far_link
-                for _iteration in range(14):
-                    midpoint = (low + high) / 2.0
-                    midpoint_link = sample(max(1.0, midpoint))
-                    if midpoint_link.compatible and midpoint_link.margin_db >= 0:
-                        low = midpoint
-                    else:
-                        high = midpoint
-                        failed_link = midpoint_link
-                reach = low
-                boundary_kind = (
-                    "blocked"
-                    if not failed_link.compatible and failed_link.reason not in mismatch_reasons
-                    else "threshold"
+        for ray in profile.rays:
+            boundary_kind = "blocked" if ray.kind == "blocked" else "threshold"
+            points.append(
+                (
+                    source.x + math.cos(ray.angle) * ray.reach_m,
+                    source.y + math.sin(ray.angle) * ray.reach_m,
+                    boundary_kind,
                 )
-            points.append((source.x + dx * reach, source.y + dy * reach, boundary_kind))
+            )
         contours[source_id] = points
     return contours
 
@@ -667,6 +628,28 @@ class MeshSimulatorApp:
         self.animation_revealed_nodes: set[str] = set()
         self.animation_progress = 0.0
         self.animation_frame = 0
+        self.beacon_node_id: str | None = None
+        self.beacon_profile: BeaconProfile | None = None
+        self.beacon_after: str | None = None
+        self.beacon_phase = 0.0
+        self.beacon_request_id = 0
+        self.beacon_cancel = threading.Event()
+        self.beacon_compute_queue: queue.Queue[tuple[int, Any, Any]] = queue.Queue()
+        self.beacon_blocking_obstacles: list[Obstacle] = []
+        self.beacon_weakening_obstacles: list[Obstacle] = []
+        # Static (frozen, non-pulsing) coverage shown when a sent packet reaches
+        # no other node -- same heatmap/colours as the beacon, but never animates.
+        self.static_coverage_profile: BeaconProfile | None = None
+        self.static_coverage_blocking: list[Obstacle] = []
+        self.static_coverage_weakening: list[Obstacle] = []
+        self.static_coverage_cancel = threading.Event()
+        self.static_coverage_request_id = 0
+        self.static_coverage_queue: queue.Queue[tuple[int, Any, Any, str]] = queue.Queue()
+        self.static_coverage_grow = 1.0   # one-shot expand 0->1, then frozen
+        self.static_coverage_after: str | None = None
+        # When the zero-hop heatmap finishes expanding: freeze (reached nobody) or
+        # clear it and continue the normal hop animation (reached another node).
+        self.static_coverage_then_animate = False
         self.animation_frame_count = 1
         self.sidebar_visible = False
         self.render_after: str | None = None
@@ -879,6 +862,7 @@ class MeshSimulatorApp:
 
         edit_menu = tk.Menu(menubar, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
         edit_menu.add_command(label="Add node", accelerator="N", command=lambda: self.set_tool("node"))
+        edit_menu.add_command(label="Drop beacon", accelerator="B", command=lambda: self.set_tool("beacon"))
         edit_menu.add_command(label="Add random nodesâ€¦", command=self.add_random_nodes)
         edit_menu.add_separator()
         edit_menu.add_command(label="Duplicate selected", accelerator="Ctrl+D", command=self.duplicate_selected)
@@ -913,6 +897,10 @@ class MeshSimulatorApp:
         sim_menu.add_command(label="Run packet", accelerator="Ctrl+Enter", command=self.run_simulation)
         sim_menu.add_command(label="Run live mesh traffic", command=self.start_live_mesh)
         sim_menu.add_command(label="Stop live mesh traffic", command=self.stop_live_mesh)
+        sim_menu.add_separator()
+        sim_menu.add_command(label="Pulse beacon from selected node", command=self.start_beacon)
+        sim_menu.add_command(label="Stop beacon", command=self.stop_beacon)
+        sim_menu.add_separator()
         sim_menu.add_command(label="Replay animation", command=self.replay_animation)
         sim_menu.add_command(label="Stop animation", command=self.stop_animation)
         menubar.add_cascade(label="Simulation", menu=sim_menu)
@@ -943,6 +931,7 @@ class MeshSimulatorApp:
         tools = [
             ("select", "↖  Select"),
             ("node", "●  Node"),
+            ("beacon", "📡  Beacon"),
         ]
         for key, label in tools:
             button = ttk.Button(bar, text=label, style="Tool.TButton", command=lambda k=key: self.set_tool(k))
@@ -2999,6 +2988,7 @@ class MeshSimulatorApp:
         self.root.bind("<Tab>", lambda _e: (self.toggle_sidebar(), "break")[1])
         self.root.bind("<Escape>", lambda _e: self.set_tool("select"))
         self.root.bind("<Key-n>", lambda _e: self.set_tool("node"))
+        self.root.bind("<Key-b>", lambda _e: self.set_tool("beacon"))
 
     def _form_header(self, parent: ttk.Frame, title: str, subtitle: str = "") -> None:
         ttk.Label(parent, text=title, style="Title.TLabel").pack(anchor="w", padx=12, pady=(12, 2))
@@ -3633,6 +3623,11 @@ class MeshSimulatorApp:
         if isinstance(obj, Node) and not self._terrain_covers(obj.x, obj.y):
             self.status_var.set("Node coordinates updated · refreshing terrain around current scene")
             self.load_topography()
+        # Editing the beacon node (height, power, position, radio…) changes its
+        # coverage, so re-pulse it from the updated settings.
+        if isinstance(obj, Node) and obj.id == self.beacon_node_id:
+            self.selected_id = obj.id
+            self.start_beacon()
 
     def apply_environment(self) -> None:
         env = self.scenario.environment
@@ -4084,6 +4079,7 @@ class MeshSimulatorApp:
             self.status_var.set("Calculating link budgets and first-hop coverage…")
         self.send_button.configure(state="disabled", text="Calculating…")
         snapshot = Scenario.from_dict(self.scenario.to_dict())
+        coverage_cap = self._coverage_range_cap()
         self.simulation_request_id += 1
         request_id = self.simulation_request_id
         self.simulation_contours_complete = False
@@ -4111,6 +4107,7 @@ class MeshSimulatorApp:
                             result,
                             engine.model,
                             transmitter_ids=grouped[hop],
+                            max_range_m=coverage_cap,
                         )
                         if index == 0:
                             self.simulation_updates.put((request_id, "result", (result, contours)))
@@ -4183,8 +4180,9 @@ class MeshSimulatorApp:
         self.results_stale = False
         self._update_result_metrics()
         self._prepare_hop_animation()
-        self.send_button.configure(state="disabled", text="Finishing simulation…")
         self.clear_hops_button.configure(state="normal")
+        source_id = self.scenario.packet.source_id
+        reached_others = [nid for nid in result.reached if nid != source_id]
         if result.routing_mode == "DM_LEARNED":
             self.result_status.configure(
                 text=f"Learned DM route · {max(0, len(result.learned_route) - 1)} hop"
@@ -4204,12 +4202,28 @@ class MeshSimulatorApp:
                 )
             )
             self.status_var.set("DM route discovery ready · starting managed-flood propagation")
+        elif not reached_others:
+            self.result_status.configure(
+                text=f"0 of {max(0, len(self.scenario.nodes) - 1)} other nodes heard the packet"
+            )
         else:
             self.result_status.configure(
                 text=f"{len(self.last_result.reached)} of {len(self.scenario.nodes)} nodes heard the packet"
             )
             self.status_var.set("First-hop coverage ready · starting packet propagation")
-        self._animate_next()
+        # Floods/discovery always begin with the zero-hop coverage heatmap.  It
+        # then freezes (reached nobody) or clears and continues the hop animation
+        # (reached another node).  A learned DM has no coverage -- animate directly.
+        if result_uses_coverage_ripples(result):
+            if reached_others:
+                self.send_button.configure(state="disabled", text="Finishing simulation…")
+            else:
+                self.send_button.configure(state="normal", text="▶  Send packet")
+                self.root.after_idle(self._populate_results_once)
+            self._begin_source_coverage(continue_after=bool(reached_others))
+        else:
+            self.send_button.configure(state="disabled", text="Finishing simulation…")
+            self._animate_next()
 
     def schedule_render(self) -> None:
         if self.pan_start is not None:
@@ -4431,11 +4445,265 @@ class MeshSimulatorApp:
         if was_animating and self.last_result is not None:
             self.root.after_idle(self._populate_results_once)
 
+    def _beacon_running(self) -> bool:
+        return self.beacon_after is not None
+
+    @staticmethod
+    def _beacon_ray_count(obstacle_count: int) -> int:
+        """Fewer rays on obstacle-dense maps keeps the one-off sweep responsive."""
+        if obstacle_count <= 200:
+            return 120
+        if obstacle_count <= 1000:
+            return 96
+        if obstacle_count <= 4000:
+            return 72
+        return 48
+
+    def start_beacon(self) -> None:
+        """Turn the selected node into a pulsating beacon that maps its own coverage.
+
+        The coverage sweep is computed on a worker thread and bounded to the
+        viewport, so even a dense imported map cannot freeze the UI."""
+        node = next((n for n in self.scenario.nodes if n.id == self.selected_id), None)
+        if node is None:
+            self.status_var.set("Select a node first, then pulse a beacon from it")
+            return
+        if not node.online:
+            self.status_var.set(f"{node.name} is offline · bring it online to pulse a beacon")
+            return
+        self.stop_beacon()
+        self.beacon_node_id = node.id
+        self.beacon_phase = 0.0
+        self.beacon_cancel = threading.Event()
+        cancel = self.beacon_cancel
+        self.beacon_request_id += 1
+        request_id = self.beacon_request_id
+        cap = self._coverage_range_cap()
+        samples = self._beacon_ray_count(len(self.scenario.nodes) + len(self.scenario.obstacles))
+        snapshot = self.scenario
+        self.status_var.set(f"Computing beacon coverage from {node.name}…")
+
+        def worker() -> None:
+            try:
+                model = PropagationModel(snapshot)
+                profile = model.beacon_profile(node, angular_samples=samples, max_range_m=cap)
+                if not cancel.is_set():
+                    self.beacon_compute_queue.put((request_id, profile, None))
+            except Exception as error:  # noqa: BLE001 - surfaced to the status bar
+                self.beacon_compute_queue.put((request_id, None, error))
+
+        threading.Thread(target=worker, name="BeaconProfile", daemon=True).start()
+        self.root.after(40, self._poll_beacon_compute)
+
+    def _poll_beacon_compute(self) -> None:
+        try:
+            request_id, profile, error = self.beacon_compute_queue.get_nowait()
+        except queue.Empty:
+            if self.beacon_node_id is not None and not self.beacon_cancel.is_set():
+                self.root.after(50, self._poll_beacon_compute)
+            return
+        if request_id != self.beacon_request_id or self.beacon_cancel.is_set():
+            return  # a newer beacon (or a stop) superseded this compute
+        if error is not None or profile is None:
+            self.status_var.set(f"Beacon failed: {error}")
+            self.stop_beacon()
+            return
+        self.beacon_profile = profile
+        blocking = set(profile.blocking_obstacle_ids)
+        weakening = set(profile.weakening_obstacle_ids)
+        self.beacon_blocking_obstacles = [o for o in self.scenario.obstacles if o.id in blocking]
+        self.beacon_weakening_obstacles = [o for o in self.scenario.obstacles if o.id in weakening]
+        node = next((n for n in self.scenario.nodes if n.id == self.beacon_node_id), None)
+        name = node.name if node is not None else "node"
+        blocked = sum(1 for ray in profile.rays if ray.kind == "blocked")
+        weakened = sum(1 for ray in profile.rays if ray.kind == "weakened")
+        self.status_var.set(
+            f"Beacon pulsing from {name} · {blocked} blocked · {weakened} weakened directions"
+        )
+        self.beacon_phase = 0.0
+        self._beacon_tick()
+
+    def stop_beacon(self, render: bool = True) -> None:
+        self.beacon_cancel.set()
+        self.beacon_request_id += 1
+        if self.beacon_after is not None:
+            try:
+                self.root.after_cancel(self.beacon_after)
+            except tk.TclError:
+                pass
+        self.beacon_after = None
+        self.beacon_node_id = None
+        self.beacon_profile = None
+        self.beacon_blocking_obstacles = []
+        self.beacon_weakening_obstacles = []
+        self.beacon_phase = 0.0
+        if render and hasattr(self, "canvas"):
+            self.canvas.delete(BEACON_TAG)
+
+    def _beacon_tick(self) -> None:
+        # The node may have been deleted or taken offline while pulsing.
+        node = next((n for n in self.scenario.nodes if n.id == self.beacon_node_id), None)
+        if self.beacon_profile is None or node is None or not node.online:
+            self.stop_beacon()
+            return
+        self.beacon_phase = (self.beacon_phase + 0.045) % 1.0
+        if hasattr(self, "canvas"):
+            c = self.canvas
+            c.delete(BEACON_TAG)
+            starting_count = len(c.find_all())
+            self._draw_beacon(c)
+            self._tag_items_created_since(c, starting_count, BEACON_TAG)
+        self.beacon_after = self.root.after(45, self._beacon_tick)
+
+    def clear_static_coverage(self, render: bool = True) -> None:
+        self.static_coverage_cancel.set()
+        self.static_coverage_request_id += 1
+        if self.static_coverage_after is not None:
+            try:
+                self.root.after_cancel(self.static_coverage_after)
+            except tk.TclError:
+                pass
+        self.static_coverage_after = None
+        self.static_coverage_profile = None
+        self.static_coverage_blocking = []
+        self.static_coverage_weakening = []
+        if render and hasattr(self, "canvas"):
+            self.canvas.delete(STATIC_COVERAGE_TAG)
+
+    def _begin_source_coverage(self, continue_after: bool) -> None:
+        """Show the zero-hop coverage heatmap expanding from the sender.  When it
+        finishes it either freezes (packet reached nobody) or clears itself and
+        hands off to the normal hop animation (``continue_after``)."""
+        result = self.last_result
+        if result is None:
+            return
+        source_id = self.scenario.packet.source_id
+        node = next((n for n in self.scenario.nodes if n.id == source_id), None)
+        if node is None or not node.online:
+            if continue_after:
+                self._animate_next()
+            return
+        self.static_coverage_then_animate = continue_after
+        self.clear_static_coverage(render=False)
+        self.static_coverage_cancel = threading.Event()
+        cancel = self.static_coverage_cancel
+        self.static_coverage_request_id += 1
+        request_id = self.static_coverage_request_id
+        cap = self._coverage_range_cap()
+        samples = self._beacon_ray_count(len(self.scenario.nodes) + len(self.scenario.obstacles))
+        snapshot = self.scenario
+        name = node.name
+
+        def worker() -> None:
+            try:
+                model = PropagationModel(snapshot)
+                profile = model.beacon_profile(node, angular_samples=samples, max_range_m=cap)
+                if not cancel.is_set():
+                    self.static_coverage_queue.put((request_id, profile, None, name))
+            except Exception as error:  # noqa: BLE001 - surfaced to the status bar
+                self.static_coverage_queue.put((request_id, None, error, name))
+
+        threading.Thread(target=worker, name="PacketCoverage", daemon=True).start()
+        self.root.after(40, self._poll_static_coverage)
+
+    def _poll_static_coverage(self) -> None:
+        try:
+            request_id, profile, error, name = self.static_coverage_queue.get_nowait()
+        except queue.Empty:
+            if not self.static_coverage_cancel.is_set():
+                self.root.after(50, self._poll_static_coverage)
+            return
+        if request_id != self.static_coverage_request_id or self.static_coverage_cancel.is_set():
+            return
+        if error is not None or profile is None:
+            return
+        self.static_coverage_profile = profile
+        blocking = set(profile.blocking_obstacle_ids)
+        weakening = set(profile.weakening_obstacle_ids)
+        self.static_coverage_blocking = [o for o in self.scenario.obstacles if o.id in blocking]
+        self.static_coverage_weakening = [o for o in self.scenario.obstacles if o.id in weakening]
+        blocked = sum(1 for ray in profile.rays if ray.kind == "blocked")
+        weakened = sum(1 for ray in profile.rays if ray.kind == "weakened")
+        if self.static_coverage_then_animate:
+            self.status_var.set(f"Coverage from {name} · continuing packet propagation…")
+        else:
+            self.status_var.set(
+                f"Packet reached no other node · coverage from {name} · "
+                f"{blocked} blocked · {weakened} weakened directions"
+            )
+        # One-shot expand from the sender outwards.
+        self.static_coverage_grow = 0.0
+        self._animate_static_coverage()
+
+    def _animate_static_coverage(self) -> None:
+        if self.static_coverage_profile is None:
+            return
+        self._render_static_coverage_layer()
+        if self.static_coverage_grow >= 1.0:
+            self.static_coverage_after = None
+            if self.static_coverage_then_animate:
+                # Zero hop shown -- clear it and continue the normal hop animation.
+                self.static_coverage_then_animate = False
+                self.clear_static_coverage()
+                self._animate_next()
+            return
+        self.static_coverage_grow = min(1.0, self.static_coverage_grow + 0.06)
+        self.static_coverage_after = self.root.after(30, self._animate_static_coverage)
+
+    def _render_static_coverage_layer(self) -> None:
+        if not hasattr(self, "canvas"):
+            return
+        c = self.canvas
+        c.delete(STATIC_COVERAGE_TAG)
+        start = len(c.find_all())
+        self._draw_static_coverage(c)
+        self._tag_items_created_since(c, start, STATIC_COVERAGE_TAG)
+
+    def _draw_static_coverage(self, c: tk.Canvas) -> None:
+        """Coverage heatmap for the sender of an unreached packet: it expands once
+        to full extent then holds (no pulsing).  Green->yellow->red fill, yellow
+        slows / red blocks obstacles."""
+        profile = self.static_coverage_profile
+        if profile is None or len(profile.rays) < 3:
+            return
+        grow = max(0.0, min(1.0, self.static_coverage_grow))
+        if grow <= 0.01:
+            return
+        w2s = self.world_to_screen
+        ox, oy = profile.x, profile.y
+        # Boundary points scaled by the current growth so the whole shape expands.
+        world = [
+            (ox + math.cos(ray.angle) * ray.reach_m * grow, oy + math.sin(ray.angle) * ray.reach_m * grow)
+            for ray in profile.rays
+        ]
+        bands = 7
+        for band in range(bands, 0, -1):
+            frac = band / bands
+            color = self._strength_color((band - 0.5) / bands)
+            coords: list[float] = []
+            for (bx, by) in world:
+                coords.extend(w2s(ox + (bx - ox) * frac, oy + (by - oy) * frac))
+            if len(coords) >= 6:
+                c.create_polygon(*coords, fill=color, outline="", stipple="gray50")
+        edge: list[float] = []
+        for (bx, by) in world:
+            edge.extend(w2s(bx, by))
+        edge.extend(edge[:2])
+        c.create_line(*edge, fill=self._BEACON_HALO, width=3, joinstyle=tk.ROUND)
+        c.create_line(*edge, fill="#ffffff", width=1, joinstyle=tk.ROUND)
+        # Reveal the culprit obstacles only once the wave has fully arrived.
+        if grow >= 0.999:
+            for obstacle in self.static_coverage_weakening:
+                self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
+            for obstacle in self.static_coverage_blocking:
+                self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
+
     def clear_results(self) -> None:
         if self._live_mesh_running():
             self.live_mesh_hidden_test_ids.update(self.live_mesh_tests)
             self.live_path_test_id = None
         self.stop_animation()
+        self.clear_static_coverage(render=False)
         self.last_result = None
         self.results_populated = True
         self.path_focus_id = None
@@ -4491,6 +4759,8 @@ class MeshSimulatorApp:
             self.status_var.set("Select and drag objects · right-drag pans · wheel zooms")
         elif tool == "node":
             self.status_var.set("Node tool stays active: click repeatedly to place nodes")
+        elif tool == "beacon":
+            self.status_var.set("Beacon tool: click the map to drop a pulsating beacon")
         elif tool == "Forest":
             self.status_var.set("Forest brush stays active: press and drag to paint forest")
         else:
@@ -4503,6 +4773,17 @@ class MeshSimulatorApp:
     def screen_to_world(self, x: float, y: float) -> tuple[float, float]:
         base = self._base_scale() * self.zoom
         return x / max(1e-9, base) + self.view_x, y / max(1e-9, base) + self.view_y
+
+    def _coverage_range_cap(self) -> float:
+        """How far coverage/beacon rays should be traced: the visible map plus a
+        margin.  Tracing the full 100+ km link budget is what makes sweeps freeze,
+        and reach past the viewport is not visible anyway."""
+        if not hasattr(self, "canvas"):
+            return 20_000.0
+        left, top = self.screen_to_world(0, 0)
+        right, bottom = self.screen_to_world(self.canvas.winfo_width(), self.canvas.winfo_height())
+        diagonal = math.hypot(right - left, bottom - top)
+        return max(3_000.0, diagonal * 1.15)
 
     def _base_scale(self) -> float:
         width = max(1, self.canvas.winfo_width())
@@ -4617,6 +4898,12 @@ class MeshSimulatorApp:
         scale_start = len(c.find_all())
         self._draw_scale(c)
         self._tag_items_created_since(c, scale_start, HUD_LAYER_TAG)
+        static_start = len(c.find_all())
+        self._draw_static_coverage(c)
+        self._tag_items_created_since(c, static_start, STATIC_COVERAGE_TAG)
+        beacon_start = len(c.find_all())
+        self._draw_beacon(c)
+        self._tag_items_created_since(c, beacon_start, BEACON_TAG)
         wave_start = len(c.find_all())
         self._draw_current_wave(c)
         self._draw_live_mesh_overlay(c)
@@ -4683,6 +4970,14 @@ class MeshSimulatorApp:
         for node in self.scenario.nodes:
             self._draw_node(c, node)
         self._tag_items_created_since(c, node_start, NODE_LAYER_TAG)
+
+        static_start = len(c.find_all())
+        self._draw_static_coverage(c)
+        self._tag_items_created_since(c, static_start, STATIC_COVERAGE_TAG)
+
+        beacon_start = len(c.find_all())
+        self._draw_beacon(c)
+        self._tag_items_created_since(c, beacon_start, BEACON_TAG)
 
         wave_start = len(c.find_all())
         self._draw_current_wave(c)
@@ -5383,6 +5678,10 @@ class MeshSimulatorApp:
     def _draw_retained_coverage(self, c: tk.Canvas) -> None:
         if not self.retained_coverage_transmitters:
             return
+        # The frozen heatmap replaces the old retained-coverage outline for a
+        # sender that reached nobody -- don't draw both on top of each other.
+        if self.static_coverage_profile is not None:
+            return
         nodes = {node.id: node for node in self.scenario.nodes}
         selected_path = self._selected_packet_path()
         path_nodes = set(selected_path) if selected_path is not None else None
@@ -5546,6 +5845,130 @@ class MeshSimulatorApp:
             self._draw_outlined_text(
                 c, (x1 + x2) / 2, (y1 + y2) / 2 - 9, f"H{hop}",
                 fill=color, font=("Segoe UI Bold", 9),
+            )
+
+    _BEACON_BLOCK = "#ff2d55"   # red: obstacles that BLOCK the signal
+    _BEACON_SLOW = "#ffd23f"    # yellow: obstacles that SLOW / weaken the signal
+    _BEACON_EDGE = "#38e1ff"    # cyan: live ripple + beacon centre
+    _BEACON_HALO = "#05080d"    # dark outline that keeps thin lines readable
+    # Signal-strength ramp for the coverage fill: strong (green) -> weak (red).
+    _BEACON_STRENGTH_STOPS = ((0.0, (47, 209, 106)), (0.5, (255, 210, 63)), (1.0, (255, 77, 79)))
+
+    @classmethod
+    def _strength_color(cls, t: float) -> str:
+        """Colour for signal strength: t=0 strong (green) .. t=1 weak (red)."""
+        t = max(0.0, min(1.0, t))
+        stops = cls._BEACON_STRENGTH_STOPS
+        for index in range(len(stops) - 1):
+            t0, c0 = stops[index]
+            t1, c1 = stops[index + 1]
+            if t <= t1:
+                f = (t - t0) / max(1e-9, t1 - t0)
+                r = round(c0[0] + (c1[0] - c0[0]) * f)
+                g = round(c0[1] + (c1[1] - c0[1]) * f)
+                b = round(c0[2] + (c1[2] - c0[2]) * f)
+                return f"#{r:02x}{g:02x}{b:02x}"
+        r, g, b = stops[-1][1]
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_beacon(self, c: tk.Canvas) -> None:
+        """Draw the beacon coverage as a filled strong->weak heatmap, with the
+        obstacles that SLOW the signal in yellow and those that BLOCK it in red."""
+        profile = self.beacon_profile
+        if profile is None or len(profile.rays) < 3:
+            return
+        phase = self.beacon_phase
+        glow = 0.5 + 0.5 * math.sin(math.tau * phase)
+        rays = profile.rays
+        w2s = self.world_to_screen
+        ox, oy = profile.x, profile.y
+
+        # Boundary points in world space (where the signal reaches per direction).
+        world = [
+            (ox + math.cos(ray.angle) * ray.reach_m, oy + math.sin(ray.angle) * ray.reach_m)
+            for ray in rays
+        ]
+
+        # Filled coverage heatmap: nested bands from the weak edge inwards to the
+        # strong centre, each the coverage shape scaled down, so colour shows how
+        # strong the signal is at every point (and the shape shows how far it got).
+        bands = 7
+        for band in range(bands, 0, -1):
+            frac = band / bands
+            color = self._strength_color((band - 0.5) / bands)
+            coords: list[float] = []
+            for (bx, by) in world:
+                coords.extend(w2s(ox + (bx - ox) * frac, oy + (by - oy) * frac))
+            if len(coords) >= 6:
+                c.create_polygon(*coords, fill=color, outline="", stipple="gray50")
+
+        # A crisp edge line marks the outer limit of the range.
+        edge: list[float] = []
+        for (bx, by) in world:
+            edge.extend(w2s(bx, by))
+        edge.extend(edge[:2])
+        c.create_line(*edge, fill=self._BEACON_HALO, width=3, joinstyle=tk.ROUND)
+        c.create_line(*edge, fill="#ffffff", width=1, joinstyle=tk.ROUND)
+
+        # Culprit obstacles (static, no pulsing): yellow slows the signal, red blocks
+        # it.  Only obstacles the signal actually reached are in these lists.
+        for obstacle in self.beacon_weakening_obstacles:
+            self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
+        for obstacle in self.beacon_blocking_obstacles:
+            self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
+
+        # A single outward ripple keeps the "beacon is live" feel without clutter.
+        frac = phase
+        if frac > 0.02:
+            ripple: list[float] = []
+            for (bx, by) in world:
+                ripple.extend(w2s(ox + (bx - ox) * frac, oy + (by - oy) * frac))
+            ripple.extend(ripple[:2])
+            c.create_line(*ripple, fill=self._BEACON_EDGE, width=1, joinstyle=tk.ROUND)
+
+        # The pulsing beacon marker at the centre.
+        cx, cy = w2s(ox, oy)
+        halo = 5 + 4 * glow
+        c.create_oval(cx - halo, cy - halo, cx + halo, cy + halo, outline=self._BEACON_EDGE, width=2)
+        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=self._BEACON_EDGE, outline=self._BEACON_HALO)
+
+    def _draw_beacon_obstacle(
+        self, c: tk.Canvas, obstacle: Obstacle, color: str, width: float, fill: bool = False
+    ) -> None:
+        """Mark one blocking/weakening obstacle in the beacon's warning colour."""
+        line_width = max(1, round(width))
+        body = color if fill else ""
+        stipple = "gray50" if fill else ""
+        if obstacle.shape == "polygon" and len(obstacle.points) >= 3:
+            coordinates: list[float] = []
+            for point_x, point_y in obstacle.points:
+                coordinates.extend(self.world_to_screen(point_x, point_y))
+            c.create_polygon(*coordinates, outline=color, width=line_width, fill=body, stipple=stipple)
+            return
+        if obstacle.shape == "brush" and obstacle.points:
+            coordinates = []
+            for point_x, point_y in obstacle.points:
+                coordinates.extend(self.world_to_screen(point_x, point_y))
+            if len(coordinates) == 2:
+                coordinates.extend(coordinates)
+            scale = self._base_scale() * self.zoom
+            brush_width = max(6, obstacle.brush_radius_m * 2 * scale)
+            c.create_line(
+                *coordinates, fill=color, width=brush_width,
+                capstyle=tk.ROUND, joinstyle=tk.ROUND, smooth=True, stipple="gray50",
+            )
+            return
+        x_min, y_min, x_max, y_max = obstacle.normalized()
+        sx1, sy1 = self.world_to_screen(x_min, y_min)
+        sx2, sy2 = self.world_to_screen(x_max, y_max)
+        if obstacle.kind == "Mountain":
+            c.create_polygon(
+                (sx1 + sx2) / 2, sy1, sx2, sy2, sx1, sy2,
+                outline=color, width=line_width, fill=body, stipple=stipple,
+            )
+        else:
+            c.create_rectangle(
+                sx1, sy1, sx2, sy2, outline=color, width=line_width, fill=body, stipple=stipple
             )
 
     def _draw_current_wave(self, c: tk.Canvas) -> None:
@@ -5753,6 +6176,17 @@ class MeshSimulatorApp:
                 self.status_var.set("Node placed in unrestricted workspace · refreshing local terrain")
                 self.load_topography()
             return
+        if self.tool == "beacon":
+            x, y = self.drag_start_world
+            self.add_node(x, y)
+            self.scenario.nodes[-1].name = f"Beacon {len(self.scenario.nodes)}"
+            needs_terrain = not self._terrain_covers(x, y)
+            if needs_terrain:
+                self.load_topography()
+            self.set_tool("select")
+            self.refresh_all()
+            self.start_beacon()
+            return
         if self.tool == "Forest":
             x, y = self.drag_start_world
             self.temp_forest_points = [[x, y]]
@@ -5840,6 +6274,10 @@ class MeshSimulatorApp:
             if isinstance(obj, Node) and not self._terrain_covers(obj.x, obj.y):
                 self.status_var.set("Node moved freely · refreshing terrain around current scene")
                 self.load_topography()
+            # Moving the beacon node should re-pulse its coverage from the new spot.
+            if isinstance(obj, Node) and obj.id == self.beacon_node_id:
+                self.selected_id = obj.id
+                self.start_beacon()
         self.drag_start_screen = None
         self.drag_start_world = None
         self.drag_object_origin = None

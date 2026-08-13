@@ -400,6 +400,30 @@ class LinkResult:
 
 
 @dataclass
+class BeaconRay:
+    """One radial sample of a beacon's signal, from the beacon outwards."""
+
+    angle: float
+    reach_m: float
+    clear_reach_m: float
+    kind: str  # "clear" | "weakened" | "blocked"
+    obstacle_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BeaconProfile:
+    """A full 360° snapshot of where a beacon's signal reaches, fades, or is blocked."""
+
+    source_id: str
+    x: float
+    y: float
+    rays: list[BeaconRay]
+    blocking_obstacle_ids: list[str] = field(default_factory=list)
+    weakening_obstacle_ids: list[str] = field(default_factory=list)
+    max_reach_m: float = 0.0
+
+
+@dataclass
 class SimEvent:
     time_ms: float
     kind: str
@@ -657,6 +681,16 @@ class PropagationModel:
         ax: float, ay: float, bx: float, by: float, rect: tuple[float, float, float, float]
     ) -> tuple[float, float | None, float | None]:
         x_min, y_min, x_max, y_max = rect
+        # Fast reject: if the segment's bounding box sits wholly to one side of the
+        # rectangle it cannot cross it.  This skips the full clip for the many
+        # candidate obstacles that a long ray passes nowhere near.
+        if (
+            (ax < x_min and bx < x_min)
+            or (ax > x_max and bx > x_max)
+            or (ay < y_min and by < y_min)
+            or (ay > y_max and by > y_max)
+        ):
+            return 0.0, None, None
         dx, dy = bx - ax, by - ay
         p = (-dx, dx, -dy, dy)
         q = (ax - x_min, x_max - ax, ay - y_min, y_max - ay)
@@ -960,6 +994,164 @@ class PropagationModel:
             compatible,
             reason,
             obstacles,
+        )
+
+    _MISMATCH_REASONS = frozenset(
+        {
+            "frequency mismatch",
+            "bandwidth mismatch",
+            "spreading factor mismatch",
+            "coding rate mismatch",
+            "offline",
+        }
+    )
+
+    def _ray_probe(self, source: Node, reference: Node) -> Node:
+        """A stand-in receiver used to sample how far a beacon's signal travels."""
+        probe = Node(
+            id=f"beacon-probe-{source.id}",
+            name="Beacon probe",
+            x=source.x,
+            y=source.y,
+            elevation_m=source.elevation_m,
+            antenna_height_m=reference.antenna_height_m,
+            antenna_gain_dbi=reference.antenna_gain_dbi,
+            cable_loss_db=reference.cable_loss_db,
+            noise_figure_db=reference.noise_figure_db,
+            channel=source.channel,
+        )
+        probe.radio = type(source.radio)(**vars(source.radio))
+        return probe
+
+    def _ray_blocking_obstacles(
+        self, source: Node, target: Node, candidates: list[Obstacle]
+    ) -> list[str]:
+        """Obstacle ids whose physical volume intrudes on this beam's line of sight."""
+        hits: list[str] = []
+        for obstacle in candidates:
+            if not obstacle.enabled:
+                continue
+            _inside, midpoint_t, _exit_t = self._obstacle_intersection(obstacle, source, target)
+            if midpoint_t is None:
+                continue
+            los_z = source.antenna_z + (target.antenna_z - source.antenna_z) * midpoint_t
+            top_z = obstacle.base_elevation_m + obstacle.height_m
+            # Count it as a culprit when the beam grazes into the Fresnel zone,
+            # not only on a dead-centre hit, so weakened edges light up too.
+            if los_z <= top_z + 1.0:
+                hits.append(obstacle.id)
+        return hits
+
+    def beacon_profile(
+        self,
+        source: Node,
+        angular_samples: int = 120,
+        weaken_ratio: float = 0.85,
+        weaken_loss_db: float = 4.0,
+        max_range_m: float | None = None,
+        binary_iterations: int = 14,
+    ) -> "BeaconProfile":
+        """Radially probe a beacon: where its signal reaches, fades, or is blocked.
+
+        ``max_range_m`` caps how far each beam is traced.  The unobstructed link
+        budget can be 100+ km, which makes every ray scan a huge slice of the
+        map; callers pass a viewport-sized cap so the sweep stays cheap.
+        """
+        environment = self.scenario.environment
+        compatible_receivers = [
+            node
+            for node in self.scenario.nodes
+            if node.id != source.id and self.radios_compatible(source, node)[0]
+        ]
+        reference = (
+            compatible_receivers[len(compatible_receivers) // 2]
+            if compatible_receivers
+            else source
+        )
+        probe = self._ray_probe(source, reference)
+        clear_range = self.unobstructed_range_m(source, probe)
+        maximum_range = clear_range * 1.08
+        if max_range_m is not None:
+            maximum_range = min(maximum_range, max(500.0, float(max_range_m)))
+        # Everything past the traced range is unknown, so judge "how far it should
+        # have reached" against the capped range too, not the full link budget.
+        clear_reference = max(1.0, min(clear_range, maximum_range))
+
+        def position(dx: float, dy: float, distance: float) -> None:
+            probe.x = source.x + dx * distance
+            probe.y = source.y + dy * distance
+            elevation = environment.terrain_elevation(probe.x, probe.y)
+            probe.elevation_m = source.elevation_m if elevation is None else elevation
+
+        def sample(dx: float, dy: float, distance: float) -> LinkResult:
+            position(dx, dy, distance)
+            return self.link(source, probe, obstacle_candidates=ray_obstacles)
+
+        rays: list[BeaconRay] = []
+        blocking: list[str] = []
+        weakening: list[str] = []
+        samples = max(8, angular_samples)
+        for index in range(samples):
+            angle = math.tau * index / samples
+            dx, dy = math.cos(angle), math.sin(angle)
+            probe.x = source.x + dx * maximum_range
+            probe.y = source.y + dy * maximum_range
+            ray_obstacles = self._candidate_obstacles(source, probe)
+
+            far_link = sample(dx, dy, maximum_range)
+            if far_link.compatible and far_link.margin_db >= 0:
+                reach = maximum_range
+                hard_blocked = False
+            else:
+                low, high = 0.0, maximum_range
+                failed_link = far_link
+                for _iteration in range(binary_iterations):
+                    midpoint = (low + high) / 2.0
+                    midpoint_link = sample(dx, dy, max(1.0, midpoint))
+                    if midpoint_link.compatible and midpoint_link.margin_db >= 0:
+                        low = midpoint
+                    else:
+                        high = midpoint
+                        failed_link = midpoint_link
+                reach = low
+                hard_blocked = (
+                    not failed_link.compatible
+                    and failed_link.reason not in self._MISMATCH_REASONS
+                )
+
+            # Attribute culprit obstacles only up to where the signal actually
+            # reached, plus a tiny fixed margin so the blocker sitting right at the
+            # edge is caught -- never buildings sitting out beyond the coverage.
+            attribution = min(maximum_range, reach + 60.0)
+            position(dx, dy, attribution)
+            obstacle_ids = self._ray_blocking_obstacles(source, probe, ray_obstacles)
+
+            if hard_blocked:
+                kind = "blocked"
+                blocking.extend(obstacle_ids)
+            else:
+                # A beam that falls well short of the open-air range was cut down by
+                # something 3-D in the way -- a building OR the terrain/a mountain --
+                # so it counts as weakened even when no building volume is hit.
+                weakened = reach < weaken_ratio * clear_reference
+                # Otherwise pay for one extra attenuation probe only when the beam
+                # actually grazes a building (e.g. forest that thins but still reaches).
+                if not weakened and obstacle_ids:
+                    mid_link = sample(dx, dy, max(1.0, min(reach, clear_reference) * 0.7))
+                    weakened = mid_link.obstacle_loss_db >= weaken_loss_db
+                kind = "weakened" if weakened else "clear"
+                if weakened:
+                    weakening.extend(obstacle_ids)
+            rays.append(BeaconRay(angle, reach, clear_reference, kind, obstacle_ids))
+
+        return BeaconProfile(
+            source.id,
+            source.x,
+            source.y,
+            rays,
+            list(dict.fromkeys(blocking)),
+            list(dict.fromkeys(weakening)),
+            maximum_range,
         )
 
 

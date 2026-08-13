@@ -19,15 +19,16 @@ The app starts with a map but no nodes. Internet access is needed for new map ti
 5. Select a node and open **Properties** to set its role, radio, power, channel, and height.
 6. Open **Packet**, choose the source and destination, set the hop limit, and select **Send packet**.
 7. Open **Results** for delivery details, RF values, drops, and collisions.
+8. Select **Beacon** (or press **B**) and click the map to drop a beacon that continuously pulses a node’s live coverage.
 
 Use the mouse wheel to zoom, right-drag to pan, and **Fit** to frame the current nodes. **Panels** opens or hides the side tabs.
 
 ## Reading the simulation
 
+- Every send starts with a **coverage heatmap** expanding from the source: strong (green) to weak (red), with obstacles that slow it outlined yellow and those that block it red. It continues into the hop animation if another node is reached, or stays frozen if none is.
 - Broadcasts radiate from every node that receives and rebroadcasts the packet.
 - Hop colors and `H0`–`H7` badges show how far the packet traveled.
 - Nodes not reached by the completed simulation turn gray.
-- If the source reaches nobody, its coverage boundary remains visible to help place another node.
 - Clicking a reached node shows its complete first-arrival path.
 - Starting another simulation automatically clears the previous trace.
 - **Clear hops** removes the trace without running another simulation.
