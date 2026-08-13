@@ -365,7 +365,21 @@ class PacketConfig:
     hop_limit: int = 3
     port: str = "TEXT_MESSAGE_APP"
     want_ack: bool = False
+    want_response: bool = False
     channel: str = "LongFast"
+
+
+@dataclass
+class LiveMeshConfig:
+    duration_minutes: int = 360
+    traffic_profile: str = "FIRMWARE_LIKE"
+    hop_limit: int = 3
+    playback_seconds: int = 30
+    nodeinfo_interval_minutes: float = 180.0
+    telemetry_interval_minutes: float = 60.0
+    router_telemetry_interval_minutes: float = 720.0
+    sensor_interval_minutes: float = 60.0
+    message_interval_minutes: float = 120.0
 
 
 @dataclass
@@ -427,6 +441,7 @@ class Scenario:
     nodes: list[Node] = field(default_factory=list)
     obstacles: list[Obstacle] = field(default_factory=list)
     packet: PacketConfig = field(default_factory=PacketConfig)
+    live_mesh: LiveMeshConfig = field(default_factory=LiveMeshConfig)
     learned_routes: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -490,12 +505,21 @@ class Scenario:
                 env.terrain_height_m = legacy_height
             env.coordinate_space = "CENTERED_MERCATOR"
         packet = PacketConfig(**data.get("packet", {}))
+        live_mesh = LiveMeshConfig(**data.get("live_mesh", {}))
         learned_routes = {
             str(key): [str(node_id) for node_id in route]
             for key, route in data.get("learned_routes", {}).items()
             if isinstance(route, list)
         }
-        return cls(data.get("name", "Untitled scenario"), env, nodes, obstacles, packet, learned_routes)
+        return cls(
+            name=data.get("name", "Untitled scenario"),
+            environment=env,
+            nodes=nodes,
+            obstacles=obstacles,
+            packet=packet,
+            live_mesh=live_mesh,
+            learned_routes=learned_routes,
+        )
 
     @classmethod
     def from_json(cls, text: str) -> "Scenario":
@@ -1337,7 +1361,9 @@ class SimulationEngine:
                     math.hypot(rx.x - source.x, rx.y - source.y),
                 )
 
-                if (not broadcast and rx.id == destination) or hops_left <= 0:
+                # The displayed hop limit is the furthest receiving hop.  A
+                # packet set to 3 therefore reaches through H3, never H4.
+                if (not broadcast and rx.id == destination) or hop + 1 >= packet.hop_limit:
                     continue
                 can_relay, reason = self._can_relay(rx, packet, decoded)
                 if not can_relay:

@@ -34,9 +34,11 @@ from .geography import (
     world_to_latlon,
 )
 from .live_radio import LiveNode, LiveRadioClient, SerialPort, list_serial_ports
+from .live_mesh import LiveMeshEngine, LiveMeshFrame, LiveMeshResult, LiveMeshTestResult, TRAFFIC_COLORS
 from .model import (
     CORE_PORTS,
     HARDWARE_POWER_PROFILE_KEYS,
+    LiveMeshConfig,
     OBSTACLE_DEFAULTS,
     PRESETS,
     REBROADCAST_MODES,
@@ -90,6 +92,32 @@ NODE_LAYER_TAG = "node-layer"
 CURRENT_WAVE_TAG = "current-wave"
 HUD_LAYER_TAG = "hud-layer"
 SELECTED_OBSTACLE_TAG = "selected-obstacle"
+LIVE_TRAFFIC_PRESETS: dict[str, dict[str, Any]] = {
+    "Default / slow": {
+        "profile": "FIRMWARE_LIKE",
+        "nodeinfo_interval_minutes": 180.0,
+        "telemetry_interval_minutes": 60.0,
+        "router_telemetry_interval_minutes": 720.0,
+        "sensor_interval_minutes": 60.0,
+        "message_interval_minutes": 120.0,
+    },
+    "Medium traffic": {
+        "profile": "FIRMWARE_LIKE",
+        "nodeinfo_interval_minutes": 90.0,
+        "telemetry_interval_minutes": 30.0,
+        "router_telemetry_interval_minutes": 360.0,
+        "sensor_interval_minutes": 30.0,
+        "message_interval_minutes": 60.0,
+    },
+    "High traffic": {
+        "profile": "BUSY_10X",
+        "nodeinfo_interval_minutes": 180.0,
+        "telemetry_interval_minutes": 60.0,
+        "router_telemetry_interval_minutes": 720.0,
+        "sensor_interval_minutes": 60.0,
+        "message_interval_minutes": 120.0,
+    },
+}
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -646,8 +674,53 @@ class MeshSimulatorApp:
         self.simulation_updates: queue.Queue[tuple[int, str, Any]] = queue.Queue()
         self.simulation_request_id = 0
         self.simulation_contours_complete = True
+        self.live_mesh_thread: threading.Thread | None = None
+        self.live_mesh_cancel_event = threading.Event()
+        self.live_mesh_updates: queue.Queue[tuple[int, Any, Any]] = queue.Queue()
+        self.live_mesh_injections: queue.Queue[PacketConfig] = queue.Queue()
+        self.live_mesh_enabled = tk.BooleanVar(value=False)
+        self.live_mesh_tests: dict[int, LiveMeshTestResult] = {}
+        self.live_mesh_snapshot: dict[str, Any] = {}
+        self.live_path_test_id: int | None = None
+        self.live_mesh_hidden_test_ids: set[int] = set()
+        self.live_test_display_signature: tuple[Any, ...] | None = None
+        self.live_results_last_refresh = 0.0
+        self.live_mesh_request_id = 0
+        self.live_mesh_result: LiveMeshResult | None = None
+        self.live_mesh_frame_index = 0
+        self.live_mesh_after: str | None = None
+        self.live_mesh_recent_frames: list[LiveMeshFrame] = []
+        self.live_mesh_history_frames: list[LiveMeshFrame] = []
+        self.live_mesh_play_counts = {
+            "tx": 0,
+            "rx": 0,
+            "collisions": 0,
+            "dropped": 0,
+            "throttled": 0,
+        }
+        self.live_mesh_preset_var = tk.StringVar(value="Default / slow")
+        self.live_mesh_nodeinfo_var = tk.StringVar(value=str(self.scenario.live_mesh.nodeinfo_interval_minutes))
+        self.live_mesh_telemetry_var = tk.StringVar(value=str(self.scenario.live_mesh.telemetry_interval_minutes))
+        self.live_mesh_router_telemetry_var = tk.StringVar(value=str(self.scenario.live_mesh.router_telemetry_interval_minutes))
+        self.live_mesh_sensor_var = tk.StringVar(value=str(self.scenario.live_mesh.sensor_interval_minutes))
+        self.live_mesh_message_var = tk.StringVar(value=str(self.scenario.live_mesh.message_interval_minutes))
+        self.live_mesh_status_var = tk.StringVar(value="Idle")
+        self.mesh_graph_window: tk.Toplevel | None = None
+        self.mesh_graph_canvas: tk.Canvas | None = None
+        self.mesh_graph_info_var = tk.StringVar(value="")
+        self.mesh_graph_delivery_var = tk.StringVar(value="")
+        self.mesh_graph_show_nodeinfo = tk.BooleanVar(value=True)
+        self.mesh_graph_show_telemetry = tk.BooleanVar(value=True)
+        self.mesh_graph_show_sensor = tk.BooleanVar(value=True)
+        self.mesh_graph_show_messages = tk.BooleanVar(value=True)
+        self.mesh_graph_show_control = tk.BooleanVar(value=True)
+        self.mesh_graph_show_collisions = tk.BooleanVar(value=True)
+        self.mesh_graph_show_drops = tk.BooleanVar(value=True)
+        self.mesh_graph_show_gated = tk.BooleanVar(value=True)
+        self.mesh_graph_show_utilization = tk.BooleanVar(value=True)
+        self.mesh_graph_refresh_after: str | None = None
+        self.mesh_graph_last_refresh = 0.0
         self.results_populated = True
-        self.probe_links = tk.BooleanVar(value=False)
         self.show_drops = tk.BooleanVar(value=True)
         self.map_visible = tk.BooleanVar(value=True)
         self.terrain_only_view = tk.BooleanVar(value=False)
@@ -829,7 +902,6 @@ class MeshSimulatorApp:
                 label=units, value=units, variable=self.unit_system, command=self._units_changed
             )
         view_menu.add_cascade(label="Units", menu=units_menu)
-        view_menu.add_checkbutton(label="Probe selected node links", variable=self.probe_links, command=self.render_canvas)
         view_menu.add_checkbutton(label="Show failed receptions", variable=self.show_drops, command=self.render_canvas)
         self.view_hop_menu = self._create_hop_lines_menu(view_menu)
         view_menu.add_cascade(label="Hop line visibility", menu=self.view_hop_menu)
@@ -839,6 +911,8 @@ class MeshSimulatorApp:
 
         sim_menu = tk.Menu(menubar, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
         sim_menu.add_command(label="Run packet", accelerator="Ctrl+Enter", command=self.run_simulation)
+        sim_menu.add_command(label="Run live mesh traffic", command=self.start_live_mesh)
+        sim_menu.add_command(label="Stop live mesh traffic", command=self.stop_live_mesh)
         sim_menu.add_command(label="Replay animation", command=self.replay_animation)
         sim_menu.add_command(label="Stop animation", command=self.stop_animation)
         menubar.add_cascade(label="Simulation", menu=sim_menu)
@@ -880,6 +954,9 @@ class MeshSimulatorApp:
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8, pady=8)
         ttk.Button(bar, text="⌫  Delete", style="Tool.TButton", command=self.delete_selected).pack(side="left", padx=2)
         ttk.Button(bar, text="⊙  Fit", style="Tool.TButton", command=self.fit_view).pack(side="left", padx=2)
+        ttk.Button(bar, text="◌  Mesh graph", style="Tool.TButton", command=self.show_mesh_graph).pack(
+            side="left", padx=2
+        )
         self.send_button = ttk.Button(bar, text="▶  Send packet", style="Accent.TButton", command=self.run_simulation)
         self.send_button.pack(side="right", padx=12, pady=6)
         self.clear_hops_button = ttk.Button(
@@ -897,16 +974,29 @@ class MeshSimulatorApp:
         self.toolbar_hop_menu = self._create_hop_lines_menu(hop_button)
         hop_button.configure(menu=self.toolbar_hop_menu)
         hop_button.pack(side="right", padx=2)
-        ttk.Checkbutton(bar, text="Link probe", variable=self.probe_links, command=self.render_canvas).pack(side="right", padx=8)
+        self.live_mesh_toggle = ttk.Checkbutton(
+            bar,
+            text="Live mesh traffic",
+            variable=self.live_mesh_enabled,
+            command=self._live_mesh_toggle_changed,
+        )
+        self.live_mesh_toggle.pack(side="right", padx=8)
         self.set_tool("select")
 
     def _build_layout(self) -> None:
         self.workspace = ttk.Frame(self.root, style="Root.TFrame")
         self.workspace.pack(fill="both", expand=True)
         self.canvas_panel = ttk.Frame(self.workspace)
-        self.canvas_panel.pack(side="left", fill="both", expand=True)
-        self.sidebar = ttk.Frame(self.workspace, width=390)
-        self.sidebar.pack_propagate(False)
+        self.canvas_panel.pack(fill="both", expand=True)
+        self.panel_window = tk.Toplevel(self.root)
+        self.panel_window.title("MeshLab RF — Panels")
+        self.panel_window.geometry("420x760")
+        self.panel_window.minsize(340, 460)
+        self.panel_window.resizable(True, True)
+        self.panel_window.protocol("WM_DELETE_WINDOW", self._hide_panel_window)
+        self.sidebar = ttk.Frame(self.panel_window, width=390)
+        self.sidebar.pack(fill="both", expand=True)
+        self.panel_window.withdraw()
         self.sidebar_tabs = ttk.Notebook(self.sidebar)
         self.sidebar_tabs.pack(fill="both", expand=True)
 
@@ -941,20 +1031,398 @@ class MeshSimulatorApp:
 
     def toggle_sidebar(self) -> None:
         if self.sidebar_visible:
-            self.sidebar.pack_forget()
-            self.sidebar_visible = False
+            self._hide_panel_window()
         else:
-            self.sidebar.pack(side="right", fill="y")
-            self.sidebar_visible = True
-        self.root.after_idle(self.render_canvas)
+            self._show_panel_window()
 
     def show_sidebar_tab(self, name: str) -> None:
         if not self.sidebar_visible:
-            self.sidebar.pack(side="right", fill="y")
-            self.sidebar_visible = True
+            self._show_panel_window()
         tabs = {"Scene": 0, "Properties": 1, "World": 2, "Packet": 3, "Live Radio": 4, "Results": 5}
         self.sidebar_tabs.select(tabs[name])
-        self.root.after_idle(self.render_canvas)
+        self.panel_window.lift()
+
+    def _show_panel_window(self) -> None:
+        self.panel_window.deiconify()
+        self.panel_window.lift()
+        self.panel_window.focus_set()
+        self.sidebar_visible = True
+
+    def _hide_panel_window(self) -> None:
+        self.panel_window.withdraw()
+        self.sidebar_visible = False
+
+    def show_mesh_graph(self) -> None:
+        """Open a separate time-series view of the shared mesh channel."""
+        if self.mesh_graph_window is not None and self.mesh_graph_window.winfo_exists():
+            self.mesh_graph_window.deiconify()
+            self.mesh_graph_window.lift()
+            self._refresh_mesh_graph()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.mesh_graph_window = window
+        window.title("MeshLab RF — Mesh traffic graph")
+        window.geometry("1180x780")
+        window.minsize(720, 520)
+        window.configure(bg=BG)
+        window.protocol("WM_DELETE_WINDOW", self._close_mesh_graph)
+
+        controls = ttk.Frame(window, style="Toolbar.TFrame")
+        controls.pack(fill="x")
+        ttk.Button(controls, text="Refresh", style="Tool.TButton", command=self._refresh_mesh_graph).pack(
+            side="left", padx=(8, 6), pady=6
+        )
+        packet_toggles = [
+            ("NodeInfo", self.mesh_graph_show_nodeinfo),
+            ("Telemetry", self.mesh_graph_show_telemetry),
+            ("Sensor", self.mesh_graph_show_sensor),
+            ("Messages", self.mesh_graph_show_messages),
+            ("Tests / replies", self.mesh_graph_show_control),
+        ]
+        for label, variable in packet_toggles:
+            ttk.Checkbutton(controls, text=label, variable=variable, command=self._refresh_mesh_graph).pack(
+                side="left", padx=5
+            )
+
+        impact_controls = ttk.Frame(window, style="Toolbar.TFrame")
+        impact_controls.pack(fill="x")
+        ttk.Label(impact_controls, text="Delivery impact", style="Muted.TLabel").pack(
+            side="left", padx=(10, 8), pady=4
+        )
+        impact_toggles = [
+            ("Collisions", self.mesh_graph_show_collisions),
+            ("RF drops", self.mesh_graph_show_drops),
+            ("Channel-gated", self.mesh_graph_show_gated),
+            ("Channel utilization", self.mesh_graph_show_utilization),
+        ]
+        for label, variable in impact_toggles:
+            ttk.Checkbutton(impact_controls, text=label, variable=variable, command=self._refresh_mesh_graph).pack(
+                side="left", padx=5
+            )
+
+        ttk.Label(
+            window,
+            textvariable=self.mesh_graph_info_var,
+            style="Muted.TLabel",
+            anchor="w",
+            wraplength=1100,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(
+            window,
+            textvariable=self.mesh_graph_delivery_var,
+            style="Muted.TLabel",
+            anchor="w",
+            wraplength=1100,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Label(
+            window,
+            text="Packet-type lines are RF transmissions per 2-second live frame. Collision and channel-gated lines identify traffic pressure; RF drops identify the separate link, terrain, or obstacle limitation. The graph retains up to one hour of real-time history.",
+            style="Muted.TLabel",
+            anchor="w",
+            wraplength=1100,
+        ).pack(fill="x", padx=12, pady=(0, 7))
+
+        self.mesh_graph_canvas = tk.Canvas(window, bg=BG, highlightthickness=0, borderwidth=0)
+        self.mesh_graph_canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.mesh_graph_canvas.bind("<Configure>", self._schedule_mesh_graph_refresh)
+        self._refresh_mesh_graph()
+
+    def _close_mesh_graph(self) -> None:
+        if self.mesh_graph_refresh_after is not None:
+            self.root.after_cancel(self.mesh_graph_refresh_after)
+            self.mesh_graph_refresh_after = None
+        if self.mesh_graph_window is not None and self.mesh_graph_window.winfo_exists():
+            self.mesh_graph_window.destroy()
+        self.mesh_graph_window = None
+        self.mesh_graph_canvas = None
+
+    def _schedule_mesh_graph_refresh(self, _event: tk.Event | None = None) -> None:
+        if self.mesh_graph_refresh_after is not None:
+            self.root.after_cancel(self.mesh_graph_refresh_after)
+        # Recreating thousands of Canvas coordinates for a full history at
+        # every live heartbeat eventually starves the map.  Half-second graph
+        # updates are visually live while keeping the RF worker independent.
+        wait_ms = max(0, int(500 - (time.monotonic() - self.mesh_graph_last_refresh) * 1000))
+        self.mesh_graph_refresh_after = self.root.after(wait_ms, self._refresh_mesh_graph)
+
+    def _refresh_mesh_graph(self) -> None:
+        self.mesh_graph_refresh_after = None
+        canvas = self.mesh_graph_canvas
+        if (
+            canvas is None
+            or self.mesh_graph_window is None
+            or not self.mesh_graph_window.winfo_exists()
+        ):
+            return
+        self.mesh_graph_last_refresh = time.monotonic()
+        canvas.delete("all")
+        width, height = max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
+        self._render_mesh_traffic_chart(canvas, width, height)
+        return
+        nodes = list(self.scenario.nodes)
+        if not nodes:
+            canvas.create_text(width / 2, height / 2, text="Add nodes to view the mesh graph", fill=MUTED, font=("Segoe UI", 13))
+            self.mesh_graph_info_var.set("No nodes in this scenario.")
+            return
+
+        positions = self._graph_node_positions(nodes, width, height)
+        viable, weak = self._mesh_graph_links()
+        if self.mesh_graph_show_weak_links.get():
+            for source, target, _link in weak:
+                x1, y1 = positions[source.id]
+                x2, y2 = positions[target.id]
+                canvas.create_line(x1, y1, x2, y2, fill="#8b3b4b", width=1, dash=(3, 4), tags="graph-weak")
+        if self.mesh_graph_show_links.get():
+            for source, target, link in viable:
+                x1, y1 = positions[source.id]
+                x2, y2 = positions[target.id]
+                shade = "#177d5d" if link.margin_db >= 8.0 else "#b58a34"
+                canvas.create_line(x1, y1, x2, y2, fill=shade, width=1, tags="graph-link")
+
+        if self.mesh_graph_show_routes.get():
+            for route in self.scenario.learned_routes.values():
+                for source_id, target_id in zip(route, route[1:]):
+                    if source_id in positions and target_id in positions:
+                        x1, y1 = positions[source_id]
+                        x2, y2 = positions[target_id]
+                        canvas.create_line(x1, y1, x2, y2, fill="#c084fc", width=3, dash=(7, 3), tags="graph-route")
+
+        if self.mesh_graph_show_packet.get() and self.last_result is not None:
+            for node_id, arrival in self.last_result.reached.items():
+                via_id = str(arrival.get("via", ""))
+                if not via_id or via_id not in positions or node_id not in positions:
+                    continue
+                x1, y1 = positions[via_id]
+                x2, y2 = positions[node_id]
+                canvas.create_line(
+                    x1, y1, x2, y2,
+                    fill=HOP_COLORS.get(int(arrival.get("hop", 0)), ACCENT), width=4,
+                    tags="graph-packet",
+                )
+
+        live_load = self.live_mesh_snapshot.get("node_utilization", {}) if self.mesh_graph_show_live_load.get() else {}
+        reached = self.last_result.reached if self.last_result is not None else {}
+        for node in nodes:
+            x, y = positions[node.id]
+            fill = ROLE_COLORS.get(node.role, ACCENT) if node.online else "#667085"
+            outline = TEXT if node.id == self.selected_id else "#06101b"
+            if node.online and self.last_result is not None and node.id not in reached:
+                fill = "#64748b"
+            utilization = float(live_load.get(node.id, 0.0))
+            if utilization > 0.0:
+                ring = RED if utilization >= 40.0 else AMBER if utilization >= 25.0 else GREEN
+                canvas.create_oval(x - 14, y - 14, x + 14, y + 14, outline=ring, width=3, tags=("graph-load", f"graph-node:{node.id}"))
+            canvas.create_oval(
+                x - 8, y - 8, x + 8, y + 8,
+                fill=fill, outline=outline, width=3 if node.id == self.selected_id else 1,
+                tags=("graph-node", f"graph-node:{node.id}"),
+            )
+            if self.mesh_graph_show_labels.get():
+                label = node.name or node.id
+                if self.mesh_graph_show_roles.get():
+                    label = f"{label}\n{node.role}"
+                if utilization > 0.0 and self.mesh_graph_show_live_load.get():
+                    label = f"{label}\n{utilization:.1f}% ch util"
+                canvas.create_text(
+                    x, y + 13, text=label, fill=TEXT if node.online else MUTED,
+                    font=("Segoe UI", 9, "bold"), anchor="n", justify="center",
+                    tags=("graph-label", f"graph-node:{node.id}"),
+                )
+
+        online_count = sum(node.online for node in nodes)
+        self.mesh_graph_info_var.set(
+            f"{len(nodes):,} nodes · {online_count:,} online · {len(viable):,} decodable RF links"
+            + (f" · {len(weak):,} weak/blocked nearby links" if self.mesh_graph_show_weak_links.get() else "")
+            + (f" · {len(self.scenario.learned_routes):,} learned DM routes" if self.scenario.learned_routes else "")
+        )
+
+    def _render_mesh_traffic_chart(self, canvas: tk.Canvas, width: float, height: float) -> None:
+        frames = list(self.live_mesh_history_frames)
+        if not frames and self.live_mesh_result is not None:
+            frames = list(self.live_mesh_result.frames)
+        if not frames and self.last_result is not None:
+            buckets: dict[int, LiveMeshFrame] = {}
+            for event in self.last_result.events:
+                index = int(max(0.0, event.time_ms) // 1_000.0)
+                frame = buckets.setdefault(index, LiveMeshFrame(time_ms=index * 1_000.0))
+                if event.kind == "TX":
+                    frame.transmission_count += 1
+                elif event.kind == "RX":
+                    frame.reception_count += 1
+                elif event.kind == "COLLISION":
+                    frame.collision_count += 1
+                elif event.kind in {"DROP", "RF DROP"}:
+                    frame.drop_count += 1
+            frames = [buckets[index] for index in sorted(buckets)]
+        if not frames:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Start Live mesh traffic to plot mesh activity over time",
+                fill=MUTED,
+                font=("Segoe UI", 13),
+            )
+            self.mesh_graph_info_var.set("No live-mesh history yet.")
+            self.mesh_graph_delivery_var.set(
+                "Send a test packet while Live mesh traffic is on to see whether traffic, rather than RF coverage, prevented delivery."
+            )
+            return
+
+        # Preserve the full one-hour accounting history, but aggregate it to
+        # fewer than a screenful of samples before asking Tk to redraw lines.
+        # This keeps an open graph from becoming progressively more expensive.
+        max_chart_frames = max(160, int(width * 0.65))
+        if len(frames) > max_chart_frames:
+            bucket_size = math.ceil(len(frames) / max_chart_frames)
+            reduced: list[LiveMeshFrame] = []
+            for start in range(0, len(frames), bucket_size):
+                group = frames[start:start + bucket_size]
+                aggregate = LiveMeshFrame(time_ms=group[-1].time_ms)
+                for frame in group:
+                    aggregate.transmission_count += frame.transmission_count
+                    aggregate.reception_count += frame.reception_count
+                    aggregate.collision_count += frame.collision_count
+                    aggregate.drop_count += frame.drop_count
+                    aggregate.throttle_count += frame.throttle_count
+                    aggregate.peak_channel_utilization = max(
+                        aggregate.peak_channel_utilization, frame.peak_channel_utilization
+                    )
+                    for target, source in (
+                        (aggregate.traffic_transmissions, frame.traffic_transmissions),
+                        (aggregate.traffic_collisions, frame.traffic_collisions),
+                        (aggregate.traffic_drops, frame.traffic_drops),
+                        (aggregate.traffic_throttles, frame.traffic_throttles),
+                    ):
+                        for kind, count in source.items():
+                            target[kind] = target.get(kind, 0) + count
+                reduced.append(aggregate)
+            frames = reduced
+
+        def packet_total(frame: LiveMeshFrame, kinds: tuple[str, ...]) -> int:
+            return sum(frame.traffic_transmissions.get(kind, 0) for kind in kinds)
+
+        # Animation lists are capped for smooth drawing.  These dictionaries
+        # retain the complete packet accounting needed for traffic diagnosis.
+        series = [
+            ("NodeInfo", TRAFFIC_COLORS["NODEINFO"], self.mesh_graph_show_nodeinfo.get(), lambda frame: packet_total(frame, ("NODEINFO",)), "count"),
+            ("Telemetry", TRAFFIC_COLORS["TELEMETRY"], self.mesh_graph_show_telemetry.get(), lambda frame: packet_total(frame, ("TELEMETRY",)), "count"),
+            ("Sensor", TRAFFIC_COLORS["SENSOR"], self.mesh_graph_show_sensor.get(), lambda frame: packet_total(frame, ("SENSOR",)), "count"),
+            ("Messages", TRAFFIC_COLORS["MESSAGE"], self.mesh_graph_show_messages.get(), lambda frame: packet_total(frame, ("MESSAGE",)), "count"),
+            ("Tests / replies", "#f8fafc", self.mesh_graph_show_control.get(), lambda frame: packet_total(frame, ("TEST", "ACK", "RESPONSE", "NAK")), "count"),
+            ("Collisions", "#fb6376", self.mesh_graph_show_collisions.get(), lambda frame: frame.collision_count, "count"),
+            ("RF drops", "#ffbd4a", self.mesh_graph_show_drops.get(), lambda frame: frame.drop_count, "count"),
+            ("Channel-gated", "#c084fc", self.mesh_graph_show_gated.get(), lambda frame: frame.throttle_count, "count"),
+            ("Channel utility", "#f8fafc", self.mesh_graph_show_utilization.get(), lambda frame: frame.peak_channel_utilization, "percent"),
+        ]
+        left, right, top, bottom = 66.0, width - 66.0, 54.0, height - 56.0
+        chart_width, chart_height = max(1.0, right - left), max(1.0, bottom - top)
+        count_max = max(
+            1,
+            *(max(float(value_for(frame)) for frame in frames) for _label, _color, _visible, value_for, kind in series if kind == "count"),
+        )
+        for step in range(5):
+            y = top + chart_height * step / 4.0
+            value = count_max * (4 - step) / 4.0
+            canvas.create_line(left, y, right, y, fill="#20334b", width=1)
+            canvas.create_text(left - 8, y, text=f"{value:.0f}", fill=MUTED, anchor="e", font=("Segoe UI", 8))
+            canvas.create_text(right + 8, y, text=f"{(4 - step) * 25:.0f}%", fill=MUTED, anchor="w", font=("Segoe UI", 8))
+
+        for percent, color, label in ((25.0, "#d6a442", "25% polite"), (40.0, "#ef6a75", "40% max")):
+            y = bottom - percent / 100.0 * chart_height
+            canvas.create_line(left, y, right, y, fill=color, width=1, dash=(4, 4))
+            canvas.create_text(right - 4, y - 3, text=label, fill=color, anchor="se", font=("Segoe UI", 8, "bold"))
+
+        canvas.create_text(left, top - 19, text="RF transmissions / 2 s frame", fill=MUTED, anchor="w", font=("Segoe UI", 8))
+        canvas.create_text(right, top - 19, text="channel utilization", fill=MUTED, anchor="e", font=("Segoe UI", 8))
+
+        start_ms, end_ms = frames[0].time_ms, frames[-1].time_ms
+        span_ms = max(1.0, end_ms - start_ms)
+        for step in range(5):
+            x = left + chart_width * step / 4.0
+            time_ms = start_ms + span_ms * step / 4.0
+            if time_ms >= 3_600_000:
+                label = f"{time_ms / 3_600_000:.1f}h"
+            elif time_ms >= 60_000:
+                label = f"{time_ms / 60_000:.1f}m"
+            else:
+                label = f"{time_ms / 1000:.0f}s"
+            canvas.create_line(x, top, x, bottom, fill="#172a41", width=1)
+            canvas.create_text(x, bottom + 18, text=label, fill=MUTED, anchor="n", font=("Segoe UI", 8))
+
+        legend_x = left
+        legend_y = 16.0
+        for label, color, visible, value_for, scale_kind in series:
+            if not visible:
+                continue
+            legend_width = max(84.0, 32.0 + len(label) * 6.2)
+            if legend_x + legend_width > right:
+                legend_x = left
+                legend_y += 18.0
+            coordinates: list[float] = []
+            for frame in frames:
+                x = left + (frame.time_ms - start_ms) / span_ms * chart_width
+                value = float(value_for(frame))
+                scale = 100.0 if scale_kind == "percent" else float(count_max)
+                y = bottom - clamp(value / scale, 0.0, 1.0) * chart_height
+                coordinates.extend((x, y))
+            if len(coordinates) >= 4:
+                canvas.create_line(*coordinates, fill=color, width=2, dash=(5, 3) if scale_kind == "percent" else ())
+            elif coordinates:
+                x, y = coordinates
+                canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=color, outline="")
+            canvas.create_line(legend_x, legend_y, legend_x + 16, legend_y, fill=color, width=3)
+            canvas.create_text(legend_x + 20, legend_y, text=label, fill=TEXT, anchor="w", font=("Segoe UI", 9))
+            legend_x += legend_width
+
+        snapshot = self.live_mesh_snapshot
+        type_totals = {
+            "NodeInfo": sum(packet_total(frame, ("NODEINFO",)) for frame in frames),
+            "Telemetry": sum(packet_total(frame, ("TELEMETRY",)) for frame in frames),
+            "Sensor": sum(packet_total(frame, ("SENSOR",)) for frame in frames),
+            "Messages": sum(packet_total(frame, ("MESSAGE",)) for frame in frames),
+            "Tests/replies": sum(packet_total(frame, ("TEST", "ACK", "RESPONSE", "NAK")) for frame in frames),
+        }
+        self.mesh_graph_info_var.set(
+            f"{len(frames):,} frames · T+{end_ms / 1000:.1f}s · "
+            f"{snapshot.get('transmissions', self.live_mesh_play_counts['tx']):,} total TX · "
+            f"{snapshot.get('receptions', self.live_mesh_play_counts['rx']):,} total RX · "
+            f"{snapshot.get('collisions', self.live_mesh_play_counts['collisions']):,} collisions · "
+            f"{snapshot.get('dropped', self.live_mesh_play_counts['dropped']):,} RF drops"
+        )
+        self.mesh_graph_info_var.set(
+            f"{len(frames):,} frames | T+{end_ms / 1000:.1f}s | "
+            + " | ".join(f"{label} {count:,}" for label, count in type_totals.items())
+            + f" | {sum(frame.collision_count for frame in frames):,} collisions"
+            + f" | {sum(frame.throttle_count for frame in frames):,} channel-gated"
+            + f" | {sum(frame.drop_count for frame in frames):,} RF drops"
+        )
+        selected_test = self.live_mesh_tests.get(self.live_path_test_id or -1)
+        if selected_test is None and self.live_mesh_tests:
+            selected_test = self.live_mesh_tests[max(self.live_mesh_tests)]
+        if selected_test is None:
+            self.mesh_graph_delivery_var.set(
+                "Traffic diagnosis: collisions and channel-gated attempts are load-related. RF drops are link, terrain, or obstacle losses and are shown separately."
+            )
+        else:
+            waits = sum(1 for event in selected_test.events if event.kind == "CHANNEL WAIT")
+            collision_events = sum(1 for event in selected_test.events if event.kind.endswith("COLLISION"))
+            rf_events = sum(1 for event in selected_test.events if event.kind.endswith("RF DROP"))
+            failure = next(
+                (event.detail for event in reversed(selected_test.events)
+                 if event.kind in {"RESULT", "ACK FAILED", "RESPONSE FAILED", "HOP LIMIT", "NO RELAY"} and event.detail),
+                "",
+            )
+            diagnosis = (
+                f"Test #{selected_test.test_id}: {selected_test.status}. "
+                f"Traffic impact: {collision_events} collision(s), {waits} channel wait(s). "
+                f"RF impact: {rf_events} link/terrain drop(s)."
+            )
+            if failure:
+                diagnosis += f" Outcome: {failure}"
+            self.mesh_graph_delivery_var.set(diagnosis)
 
     def _build_scene_panel(self) -> None:
         header = ttk.Frame(self.scene_panel)
@@ -2208,12 +2676,35 @@ class MeshSimulatorApp:
 
         notebook = ttk.Notebook(body)
         notebook.pack(fill="both", expand=True)
-        events_frame = ttk.Frame(notebook)
-        nodes_frame = ttk.Frame(notebook)
-        links_frame = ttk.Frame(notebook)
-        notebook.add(events_frame, text="Event timeline")
-        notebook.add(nodes_frame, text="Node delivery")
-        notebook.add(links_frame, text="Link attempts")
+        self.results_notebook = notebook
+        packet_frame = ttk.Frame(notebook)
+        details_bar = ttk.Frame(packet_frame)
+        details_bar.pack(fill="x", padx=5, pady=(5, 2))
+        ttk.Label(details_bar, text="Show", style="Muted.TLabel").pack(side="left", padx=(2, 5))
+        self.packet_results_view = tk.StringVar(value="Timeline")
+        view_picker = ttk.Combobox(
+            details_bar,
+            textvariable=self.packet_results_view,
+            values=["Timeline", "Delivery", "Links"],
+            state="readonly",
+            width=13,
+        )
+        view_picker.pack(side="left")
+        view_picker.bind("<<ComboboxSelected>>", self._select_packet_results_view)
+        details_stack = ttk.Frame(packet_frame)
+        details_stack.pack(fill="both", expand=True)
+        events_frame = ttk.Frame(details_stack)
+        nodes_frame = ttk.Frame(details_stack)
+        links_frame = ttk.Frame(details_stack)
+        self.packet_result_frames = {
+            "Timeline": events_frame,
+            "Delivery": nodes_frame,
+            "Links": links_frame,
+        }
+        live_frame = ttk.Frame(notebook)
+        self.live_results_frame = live_frame
+        notebook.add(packet_frame, text="Packet results")
+        notebook.add(live_frame, text="Live traffic")
 
         self.events_tree = self._tree(
             events_frame,
@@ -2256,6 +2747,32 @@ class MeshSimulatorApp:
                 ("reason", "Compatibility", 180),
             ],
         )
+        self._select_packet_results_view()
+        self.live_summary_var = tk.StringVar(value="Start Live mesh traffic to model background packets.")
+        ttk.Label(live_frame, textvariable=self.live_summary_var, style="Muted.TLabel", wraplength=350, justify="left").pack(
+            anchor="w", padx=8, pady=(7, 4)
+        )
+        live_tests_frame = ttk.LabelFrame(live_frame, text="Injected tests")
+        live_tests_frame.pack(fill="both", expand=True, padx=6, pady=(2, 4))
+        live_detail_frame = ttk.LabelFrame(live_frame, text="Selected test: why / event detail")
+        live_detail_frame.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        self.live_tests_tree = self._tree(
+            live_tests_frame,
+            [
+                ("id", "Test", 48), ("status", "Result", 150), ("source", "Source", 105),
+                ("destination", "Destination", 105), ("reached", "Received", 70), ("tx", "TX", 50),
+                ("collisions", "Collisions", 70), ("drops", "RF drops", 65),
+            ],
+        )
+        self.live_tests_tree.bind("<<TreeviewSelect>>", self._live_test_selected)
+        self.live_detail_tree = self._tree(
+            live_detail_frame,
+            [
+                ("time", "Time", 65), ("event", "Outcome", 95), ("node", "Node", 115),
+                ("via", "Via", 110), ("hop", "Hop", 42), ("rssi", "RSSI", 60),
+                ("margin", "Margin", 65), ("detail", "Why", 350),
+            ],
+        )
 
     def _tree(self, parent: ttk.Frame, columns: list[tuple[str, str, int]]) -> ttk.Treeview:
         frame = ttk.Frame(parent)
@@ -2273,6 +2790,202 @@ class MeshSimulatorApp:
             tree.heading(key, text=title)
             tree.column(key, width=width, minwidth=40, stretch=key in {"detail", "reason", "obstacles"})
         return tree
+
+    def _select_packet_results_view(self, _event: tk.Event | None = None) -> None:
+        if not hasattr(self, "packet_result_frames"):
+            return
+        selected = self.packet_results_view.get()
+        for name, frame in self.packet_result_frames.items():
+            frame.pack_forget()
+            if name == selected:
+                frame.pack(fill="both", expand=True)
+
+    def _refresh_live_results(self) -> None:
+        if not hasattr(self, "live_tests_tree"):
+            return
+        now = time.monotonic()
+        if now - self.live_results_last_refresh < 0.25:
+            return
+        self.live_results_last_refresh = now
+        snapshot = self.live_mesh_snapshot
+        if snapshot:
+            self.live_summary_var.set(
+                f"Live background: {snapshot.get('transmissions', 0):,} TX · "
+                f"{snapshot.get('collisions', 0):,} collisions · {snapshot.get('dropped', 0):,} RF drops · "
+                f"{snapshot.get('throttled', 0):,} channel-gated · peak {snapshot.get('peak', 0.0):.1f}%"
+            )
+        # Rebuilding this small summary table is cheap, but rebuilding the
+        # selected test's full event log and map overlay on every 250 ms live
+        # update is not.  Preserve the selected test and only refresh its
+        # detail/map when its result has actually changed.
+        selected = self.live_tests_tree.selection()
+        selected_item = selected[0] if selected else ""
+        self.live_tests_tree.delete(*self.live_tests_tree.get_children())
+        names = {node.id: node.name for node in self.scenario.nodes}
+        visible_tests = [
+            (test_id, test)
+            for test_id, test in sorted(self.live_mesh_tests.items(), reverse=True)
+            if test_id not in self.live_mesh_hidden_test_ids
+        ]
+        for test_id, test in visible_tests:
+            self.live_tests_tree.insert(
+                "", "end", iid=f"live-test-{test_id}", values=(
+                    f"#{test_id}", test.status, names.get(test.packet.source_id, test.packet.source_id),
+                    "BROADCAST" if test.packet.destination_id == "BROADCAST" else names.get(test.packet.destination_id, test.packet.destination_id),
+                    max(0, len(test.reached) - 1), test.transmissions, test.collisions, test.dropped,
+                )
+            )
+        children = self.live_tests_tree.get_children()
+        if not children:
+            self.live_test_display_signature = None
+            return
+
+        if not selected_item or not self.live_tests_tree.exists(selected_item):
+            preferred = (
+                f"live-test-{self.live_path_test_id}"
+                if self.live_path_test_id is not None else ""
+            )
+            selected_item = preferred if preferred and self.live_tests_tree.exists(preferred) else children[0]
+        self.live_tests_tree.selection_set(selected_item)
+        try:
+            selected_test_id = int(str(selected_item).rsplit("-", 1)[-1])
+        except ValueError:
+            return
+        selected_test = self.live_mesh_tests.get(selected_test_id)
+        if selected_test is not None and self._live_test_signature(selected_test) != self.live_test_display_signature:
+            self._live_test_selected()
+
+    def _live_test_selected(self, _event: tk.Event | None = None) -> None:
+        if not hasattr(self, "live_detail_tree"):
+            return
+        self.live_detail_tree.delete(*self.live_detail_tree.get_children())
+        selected = self.live_tests_tree.selection() if hasattr(self, "live_tests_tree") else ()
+        if not selected:
+            return
+        try:
+            test_id = int(str(selected[0]).rsplit("-", 1)[-1])
+        except ValueError:
+            return
+        test = self.live_mesh_tests.get(test_id)
+        if test is None:
+            return
+        # _refresh_live_results rebuilds the compact summary table.  Tk emits
+        # <<TreeviewSelect>> when that code restores the same selection, so
+        # do not rebuild hundreds of canvas labels and detail rows unless the
+        # user picked another test or this test actually received new data.
+        signature = self._live_test_signature(test)
+        if test_id == self.live_path_test_id and signature == self.live_test_display_signature:
+            return
+        self.live_path_test_id = test_id
+        self._present_live_test_as_packet_result(test)
+        names = {node.id: node.name for node in self.scenario.nodes}
+        events = test.events
+        if len(events) > 500:
+            events = [*events[:100], *events[-400:]]
+            self.live_detail_tree.insert(
+                "", "end", values=("…", "DETAIL CAPPED", "", "", "", "", "", f"Showing 500 of {len(test.events):,} events"),
+            )
+        for event in events:
+            self.live_detail_tree.insert(
+                "", "end", values=(
+                    f"{event.time_ms / 1000:.1f}s", event.kind, names.get(event.node_id, event.node_id),
+                    names.get(event.peer_id, event.peer_id), event.hop,
+                    f"{event.rssi_dbm:.1f}" if event.rssi_dbm else "—",
+                    f"{event.margin_db:.1f}" if event.rssi_dbm else "—", event.detail,
+                )
+            )
+        self.live_test_display_signature = signature
+        # The geographic map and obstacle raster have not changed.  Redraw
+        # just the packet/node layers; composing tiles again here made an
+        # in-flight dense test stall the UI every live refresh.
+        self._render_simulation_layers()
+
+    @staticmethod
+    def _live_test_signature(test: LiveMeshTestResult) -> tuple[Any, ...]:
+        return (
+            test.test_id, test.status, len(test.events), len(test.reached), test.transmissions,
+            test.receptions, test.collisions, test.dropped, test.complete, test.routing_mode,
+            tuple(test.learned_route), test.acknowledged,
+        )
+
+    def _present_live_test_as_packet_result(self, test: LiveMeshTestResult) -> None:
+        """Use the established packet renderer for a live-injected message."""
+        result = SimulationResult(
+            reached={node_id: dict(arrival) for node_id, arrival in test.reached.items()},
+            transmissions=test.transmissions,
+            receptions=test.receptions,
+            decoded=test.receptions,
+            collisions=test.collisions,
+            dropped=test.dropped,
+            routing_mode=test.routing_mode,
+            route_key=test.route_key,
+            learned_route=list(test.learned_route),
+            invalidated_route_key=test.invalidated_route_key,
+            acknowledged=test.acknowledged,
+        )
+        source = next((node for node in self.scenario.nodes if node.id == test.packet.source_id), None)
+        # The live engine retains every duplicate/collision for accounting, but
+        # the map should match the normal simulator: one first-arrival edge per
+        # reached node.  This stays responsive for dense, high-hop floods.
+        for node_id, arrival in result.reached.items():
+            via_id = str(arrival.get("via", ""))
+            if not via_id:
+                continue
+            result.events.append(SimEvent(
+                float(arrival.get("time_ms", 0.0)), "RX", node_id, via_id,
+                int(arrival.get("hop", 0)), detail="first live arrival",
+            ))
+        if source is not None:
+            result.max_distance_m = max(
+                (math.hypot(node.x - source.x, node.y - source.y) for node in self.scenario.nodes if node.id in result.reached),
+                default=0.0,
+            )
+        result.duration_ms = max((event.time_ms for event in result.events), default=0.0)
+        self.last_result = result
+        self.animation_seen_edges = [
+            (event.peer_id, event.node_id, event.kind, event.hop)
+            for event in result.events
+            if event.kind == "RX" and event.peer_id
+        ]
+        self.animation_revealed_nodes = set(result.reached)
+        self.results_populated = False
+        self.results_stale = False
+        self._update_result_metrics()
+        if hasattr(self, "result_status"):
+            self.result_status.configure(text=f"Live test #{test.test_id}: {test.status}")
+        if hasattr(self, "clear_hops_button"):
+            self.clear_hops_button.configure(state="normal")
+
+    def _append_live_event_log(self, frame: LiveMeshFrame | None = None, detail: str = "") -> None:
+        """Mirror bounded live activity into the familiar Event timeline."""
+        if not hasattr(self, "events_tree"):
+            return
+        names = {node.id: node.name for node in self.scenario.nodes}
+        time_text = (
+            f"{frame.time_ms / 1000:.1f}s" if frame is not None else
+            f"{float(self.live_mesh_snapshot.get('time_ms', 0.0)) / 1000:.1f}s"
+        )
+        rows: list[tuple[str, str, str, int, str]] = []
+        if detail:
+            rows.append(("LIVE", "", "", 0, detail))
+        if frame is not None:
+            rows.extend(("LIVE TX", source_id, "", 0, kind.title()) for source_id, kind in frame.transmitters)
+            rows.extend(
+                ("LIVE RX", target_id, source_id, hop, f"{kind.title()} received")
+                for source_id, target_id, kind, hop in frame.receptions
+            )
+            rows.extend(("COLLISION", node_id, "", 0, "overlapping live traffic") for node_id in frame.collisions)
+            rows.extend(("CHANNEL GATED", node_id, "", 0, "local channel utilization gate") for node_id in frame.throttled)
+        for event, node_id, peer_id, hop, reason in rows:
+            self.events_tree.insert(
+                "", "end",
+                values=(time_text, event, names.get(node_id, node_id), names.get(peer_id, peer_id), hop, "—", "—", "—", reason),
+            )
+        children = self.events_tree.get_children()
+        for item in children[:-500]:
+            self.events_tree.delete(item)
+        if rows:
+            self.events_tree.see(self.events_tree.get_children()[-1])
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-n>", lambda _e: self.new_scenario())
@@ -2718,6 +3431,7 @@ class MeshSimulatorApp:
             "hop_limit": packet.hop_limit,
             "port": packet.port,
             "want_ack": packet.want_ack,
+            "want_response": packet.want_response,
             "channel": packet.channel,
         }
         for key, value in values.items():
@@ -2739,6 +3453,7 @@ class MeshSimulatorApp:
         destination_widget.bind("<<ComboboxSelected>>", self._destination_preview)
         self._field(section, 2, "Hop limit (0–7)", self.packet_vars["hop_limit"], [str(i) for i in range(8)])
         self._check(section, 3, "Request ACK (direct only)", self.packet_vars["want_ack"])
+        self._check(section, 4, "Request module response (direct only)", self.packet_vars["want_response"])
         section = self._section(body, "Payload")
         self._field(
             section,
@@ -2750,14 +3465,61 @@ class MeshSimulatorApp:
         self._field(section, 1, "Channel / PSK", self.packet_vars["channel"])
         self._field(section, 2, "Payload bytes", self.packet_vars["payload_bytes"])
         self._field(section, 3, "Message", self.packet_vars["payload"])
-        ttk.Button(body, text="▶  Run packet simulation", style="Accent.TButton", command=self.run_simulation).pack(
-            fill="x", padx=12, pady=(16, 5)
+        self.packet_run_button = ttk.Button(
+            body,
+            text="▶  Send into live mesh" if self._live_mesh_running() else "▶  Run packet simulation",
+            style="Accent.TButton",
+            command=self.run_simulation,
         )
+        self.packet_run_button.pack(fill="x", padx=12, pady=(16, 5))
         ttk.Label(
             body,
             text=(
-                "Broadcasts use managed flooding and never request an ACK. A direct message without a known route "
-                "discovers one by flooding; request an ACK to learn it. Later DMs reuse the learned next-hop path."
+                "Broadcasts use managed flooding and never request an ACK. Direct ACKs, NAKs, and requested module "
+                "replies are simulated as their own RF packets, so they can collide or be blocked on the return path."
+            ),
+            style="Muted.TLabel",
+            wraplength=295,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 15))
+
+        section = self._section(body, "Live mesh traffic")
+        self._field(
+            section,
+            0,
+            "Traffic preset",
+            self.live_mesh_preset_var,
+            [*LIVE_TRAFFIC_PRESETS, "Custom"],
+        )
+        preset_widget = next(
+            widget for widget in section.grid_slaves(row=0, column=1)
+            if isinstance(widget, ttk.Combobox)
+        )
+        preset_widget.bind("<<ComboboxSelected>>", self._apply_live_mesh_preset)
+        self._field(section, 1, "NodeInfo every (min)", self.live_mesh_nodeinfo_var)
+        self._field(section, 2, "Client telemetry every (min)", self.live_mesh_telemetry_var)
+        self._field(section, 3, "Router telemetry every (min)", self.live_mesh_router_telemetry_var)
+        self._field(section, 4, "Sensor data every (min)", self.live_mesh_sensor_var)
+        self._field(section, 5, "Message average (min)", self.live_mesh_message_var)
+        self.live_mesh_button = ttk.Button(
+            body,
+            text="■  Stop live mesh" if self._live_mesh_running() else "▶  Start live mesh",
+            style="Danger.TButton" if self._live_mesh_running() else "Accent.TButton",
+            command=self.toggle_live_mesh,
+        )
+        self.live_mesh_button.pack(fill="x", padx=12, pady=(12, 5))
+        ttk.Label(
+            body,
+            textvariable=self.live_mesh_status_var,
+            style="Muted.TLabel",
+            wraplength=295,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+        ttk.Label(
+            body,
+            text=(
+                "Runs in wall-clock time: one configured minute is one real minute. NodeInfo, telemetry, sensor "
+                "data, and messages share the same RF channel with 25%/40% channel-utility gates."
             ),
             style="Muted.TLabel",
             wraplength=295,
@@ -2767,6 +3529,31 @@ class MeshSimulatorApp:
     def _destination_preview(self, _event: tk.Event | None = None) -> None:
         if str(self.packet_vars["destination_name"].get()) != "BROADCAST":
             self.packet_vars["want_ack"].set(True)
+
+    def _apply_live_mesh_preset(self, _event: tk.Event | None = None) -> None:
+        preset = LIVE_TRAFFIC_PRESETS.get(self.live_mesh_preset_var.get())
+        if preset is None:
+            return
+        self.live_mesh_nodeinfo_var.set(str(preset["nodeinfo_interval_minutes"]))
+        self.live_mesh_telemetry_var.set(str(preset["telemetry_interval_minutes"]))
+        self.live_mesh_router_telemetry_var.set(str(preset["router_telemetry_interval_minutes"]))
+        self.live_mesh_sensor_var.set(str(preset["sensor_interval_minutes"]))
+        self.live_mesh_message_var.set(str(preset["message_interval_minutes"]))
+
+    def _sync_live_mesh_preset(self) -> None:
+        config = self.scenario.live_mesh
+        for name, preset in LIVE_TRAFFIC_PRESETS.items():
+            if (
+                config.traffic_profile == preset["profile"]
+                and config.nodeinfo_interval_minutes == preset["nodeinfo_interval_minutes"]
+                and config.telemetry_interval_minutes == preset["telemetry_interval_minutes"]
+                and config.router_telemetry_interval_minutes == preset["router_telemetry_interval_minutes"]
+                and config.sensor_interval_minutes == preset["sensor_interval_minutes"]
+                and config.message_interval_minutes == preset["message_interval_minutes"]
+            ):
+                self.live_mesh_preset_var.set(name)
+                return
+        self.live_mesh_preset_var.set("Custom")
 
     def apply_object(self) -> None:
         obj = self.get_selected()
@@ -2869,6 +3656,371 @@ class MeshSimulatorApp:
         self._mark_results_stale()
         self.refresh_all()
 
+    def _live_mesh_running(self) -> bool:
+        return bool(
+            self.live_mesh_after is not None
+            or (self.live_mesh_thread is not None and self.live_mesh_thread.is_alive())
+        )
+
+    def _update_live_mesh_controls(self) -> None:
+        running = self._live_mesh_running()
+        self._refresh_packet_run_button()
+        if hasattr(self, "live_mesh_button"):
+            self.live_mesh_button.configure(
+                text="■  Stop live mesh" if running else "▶  Start live mesh",
+                style="Danger.TButton" if running else "Accent.TButton",
+            )
+        if hasattr(self, "send_button"):
+            self.send_button.configure(
+                state="normal",
+                text="Live mesh active…" if running else "▶  Send packet",
+            )
+
+        if hasattr(self, "send_button"):
+            self.send_button.configure(text="▶  Send test packet" if running else "▶  Send packet")
+
+    def _refresh_packet_run_button(self) -> None:
+        if hasattr(self, "packet_run_button"):
+            self.packet_run_button.configure(
+                text="▶  Send into live mesh" if self._live_mesh_running() else "▶  Run packet simulation"
+            )
+
+    def _live_mesh_toggle_changed(self) -> None:
+        if self.live_mesh_enabled.get():
+            self.start_live_mesh()
+        else:
+            self.stop_live_mesh()
+
+    def toggle_live_mesh(self) -> None:
+        self.live_mesh_enabled.set(not self._live_mesh_running())
+        self._live_mesh_toggle_changed()
+
+    def start_live_mesh(self) -> None:
+        if self._live_mesh_running():
+            return
+        if not any(node.online for node in self.scenario.nodes):
+            self.live_mesh_enabled.set(False)
+            messagebox.showinfo(
+                "Add an online node",
+                "Place at least one online node before starting live mesh traffic.",
+                parent=self.root,
+            )
+            return
+        try:
+            hop_limit = max(0, min(7, int(self.packet_vars["hop_limit"].get())))
+            intervals = {
+                "nodeinfo_interval_minutes": max(1.0, float(self.live_mesh_nodeinfo_var.get())),
+                "telemetry_interval_minutes": max(1.0, float(self.live_mesh_telemetry_var.get())),
+                "router_telemetry_interval_minutes": max(1.0, float(self.live_mesh_router_telemetry_var.get())),
+                "sensor_interval_minutes": max(1.0, float(self.live_mesh_sensor_var.get())),
+                "message_interval_minutes": max(1.0, float(self.live_mesh_message_var.get())),
+            }
+        except (TypeError, ValueError):
+            self.live_mesh_enabled.set(False)
+            messagebox.showerror(
+                "Invalid live mesh setting",
+                "Choose 1–24 simulated hours and a hop limit from 0–7.",
+                parent=self.root,
+            )
+            return
+        preset = LIVE_TRAFFIC_PRESETS.get(self.live_mesh_preset_var.get(), {})
+        profile = str(preset.get("profile", self.scenario.live_mesh.traffic_profile))
+        self._start_live_mesh_runtime(hop_limit, profile, intervals)
+        return
+        self.clear_results()
+        self.scenario.live_mesh = LiveMeshConfig(
+            duration_minutes=self.scenario.live_mesh.duration_minutes,
+            traffic_profile=profile,
+            hop_limit=hop_limit,
+            playback_seconds=30,
+        )
+        self.mark_dirty()
+        snapshot = Scenario.from_dict(self.scenario.to_dict())
+        self.live_mesh_cancel_event = threading.Event()
+        cancel_event = self.live_mesh_cancel_event
+        self.live_mesh_request_id += 1
+        request_id = self.live_mesh_request_id
+        while True:
+            try:
+                self.live_mesh_updates.get_nowait()
+            except queue.Empty:
+                break
+        self.live_mesh_result = None
+        self.live_mesh_recent_frames = []
+        self.live_mesh_frame_index = 0
+        self.live_mesh_status_var.set("Preparing RF links and concurrent traffic…")
+        self.status_var.set("Preparing live mesh traffic in the background…")
+
+        def worker() -> None:
+            try:
+                result = LiveMeshEngine(snapshot).run(snapshot.live_mesh, cancelled=cancel_event.is_set)
+                self.live_mesh_updates.put((request_id, result))
+            except Exception as error:
+                self.live_mesh_updates.put((request_id, error))
+
+        self.live_mesh_thread = threading.Thread(target=worker, name="LiveMeshSimulation", daemon=True)
+        self.live_mesh_thread.start()
+        self._update_live_mesh_controls()
+        self.root.after(25, self._poll_live_mesh)
+
+    def _start_live_mesh_runtime(
+        self, hop_limit: int, profile: str, intervals: dict[str, float]
+    ) -> None:
+        """Keep one event timeline alive so test packets meet routine mesh traffic."""
+        self.scenario.live_mesh = LiveMeshConfig(
+            duration_minutes=self.scenario.live_mesh.duration_minutes,
+            traffic_profile=profile,
+            hop_limit=hop_limit,
+            playback_seconds=30,
+            **intervals,
+        )
+        self.mark_dirty()
+        snapshot = Scenario.from_dict(self.scenario.to_dict())
+        self.live_mesh_cancel_event = threading.Event()
+        cancel_event = self.live_mesh_cancel_event
+        self.live_mesh_request_id += 1
+        request_id = self.live_mesh_request_id
+        self.live_mesh_tests = {}
+        self.live_mesh_snapshot = {}
+        self.live_path_test_id = None
+        self.live_mesh_hidden_test_ids = set()
+        self.live_mesh_recent_frames = []
+        self.live_mesh_history_frames = []
+        self.live_mesh_status_var.set("Preparing live RF links…")
+        self.status_var.set("Preparing continuous live mesh traffic…")
+        while not self.live_mesh_updates.empty():
+            try:
+                self.live_mesh_updates.get_nowait()
+            except queue.Empty:
+                break
+        while not self.live_mesh_injections.empty():
+            try:
+                self.live_mesh_injections.get_nowait()
+            except queue.Empty:
+                break
+
+        def worker() -> None:
+            try:
+                engine = LiveMeshEngine(snapshot)
+                if not engine.prepare_runtime(snapshot.live_mesh, cancelled=cancel_event.is_set):
+                    return
+                self.live_mesh_updates.put((request_id, "ready", engine.runtime_snapshot()))
+                simulated_time = 0.0
+                previous_wall_time = time.monotonic()
+                last_heartbeat = previous_wall_time
+                while not cancel_event.wait(0.05):
+                    while True:
+                        try:
+                            packet = self.live_mesh_injections.get_nowait()
+                        except queue.Empty:
+                            break
+                        self.live_mesh_updates.put((request_id, "test", engine.inject_packet(packet)))
+                    current_wall_time = time.monotonic()
+                    simulated_time += max(0.0, (current_wall_time - previous_wall_time) * 1000.0)
+                    previous_wall_time = current_wall_time
+                    frames = engine.advance_runtime(simulated_time, cancelled=cancel_event.is_set)
+                    if frames:
+                        # An injected packet is normally near the beginning of this
+                        # live time slice. Keep that frame instead of losing it to
+                        # a later routine-traffic frame.
+                        test_frames = [
+                            frame for frame in frames
+                            if any(kind == "TEST" for _node_id, kind in frame.transmitters)
+                            or any(kind == "TEST" for _source, _target, kind, _hop in frame.receptions)
+                        ]
+                        visible_frames = (frames[-1:] + test_frames)[-4:]
+                    else:
+                        visible_frames = []
+                    if visible_frames or current_wall_time - last_heartbeat >= 0.25:
+                        self.live_mesh_updates.put((request_id, "frame", (visible_frames, engine.runtime_snapshot())))
+                        last_heartbeat = current_wall_time
+            except Exception as error:
+                self.live_mesh_updates.put((request_id, "error", error))
+
+        self.live_mesh_thread = threading.Thread(target=worker, name="LiveMeshRuntime", daemon=True)
+        self.live_mesh_thread.start()
+        self._update_live_mesh_controls()
+        self.root.after(25, self._poll_live_mesh_runtime)
+
+    def _poll_live_mesh_runtime(self) -> None:
+        alive = bool(self.live_mesh_thread and self.live_mesh_thread.is_alive())
+        while True:
+            try:
+                request_id, operation, payload = self.live_mesh_updates.get_nowait()
+            except queue.Empty:
+                break
+            if request_id != self.live_mesh_request_id:
+                continue
+            if operation == "error":
+                self.live_mesh_status_var.set(f"Live mesh failed: {payload}")
+                self.status_var.set("Live mesh simulation failed")
+                self.live_mesh_enabled.set(False)
+                messagebox.showerror("Live mesh failed", str(payload), parent=self.root)
+                continue
+            if operation == "ready":
+                self.live_mesh_snapshot = payload
+                self._append_live_event_log(detail="Live mesh started in real time; waiting for configured traffic intervals")
+                self.show_sidebar_tab("Results")
+                if hasattr(self, "results_notebook"):
+                    self.results_notebook.select(self.live_results_frame)
+                self.live_mesh_status_var.set("Live mesh traffic running · send a packet to test it")
+                self.status_var.set("Live mesh active · test packets share its channel load and collisions")
+            elif operation == "test":
+                self.live_mesh_tests[payload.test_id] = payload
+                self.status_var.set(f"Test packet #{payload.test_id} queued in the live mesh")
+            elif operation == "frame":
+                frames, snapshot = payload
+                visual_changed = bool(frames)
+                if frames:
+                    self.live_mesh_recent_frames = (self.live_mesh_recent_frames + frames)[-8:]
+                    self.live_mesh_history_frames = (self.live_mesh_history_frames + frames)[-1800:]
+                elif self.live_mesh_recent_frames:
+                    # Quiet periods are real at 1:1 time; fade the prior burst
+                    # instead of freezing it on the map.
+                    self.live_mesh_recent_frames = self.live_mesh_recent_frames[1:]
+                    visual_changed = True
+                self.live_mesh_snapshot = snapshot
+                self.live_mesh_tests = {test.test_id: test for test in snapshot["tests"]}
+                learned_routes = {
+                    str(key): list(route)
+                    for key, route in snapshot.get("learned_routes", {}).items()
+                }
+                if learned_routes != self.scenario.learned_routes:
+                    self.scenario.learned_routes = learned_routes
+                    self.mark_dirty()
+                self.live_mesh_play_counts.update({
+                    "tx": snapshot["transmissions"], "rx": snapshot["receptions"],
+                    "collisions": snapshot["collisions"], "dropped": snapshot["dropped"],
+                    "throttled": snapshot["throttled"],
+                })
+                self.live_mesh_status_var.set(
+                    f"T+{snapshot['time_ms'] / 3_600_000:.2f} h · {snapshot['transmissions']:,} TX · "
+                    f"{snapshot['collisions']:,} collisions · {snapshot['dropped']:,} RF drops · "
+                    f"{snapshot['throttled']:,} channel-gated"
+                )
+                if frames:
+                    for live_frame in frames:
+                        self._append_live_event_log(live_frame)
+                if visual_changed:
+                    self._render_live_mesh_frame()
+                    if self.mesh_graph_canvas is not None:
+                        self._schedule_mesh_graph_refresh()
+            self._refresh_live_results()
+        if alive and not self.live_mesh_cancel_event.is_set():
+            self.root.after(25, self._poll_live_mesh_runtime)
+        else:
+            self._update_live_mesh_controls()
+
+    def _poll_live_mesh(self) -> None:
+        received = False
+        while True:
+            try:
+                request_id, payload = self.live_mesh_updates.get_nowait()
+            except queue.Empty:
+                break
+            if request_id != self.live_mesh_request_id:
+                continue
+            received = True
+            if isinstance(payload, Exception):
+                self.live_mesh_thread = None
+                self.live_mesh_status_var.set(f"Live mesh failed: {payload}")
+                self.status_var.set("Live mesh simulation failed")
+                self._update_live_mesh_controls()
+                messagebox.showerror("Live mesh failed", str(payload), parent=self.root)
+            else:
+                self.live_mesh_thread = None
+                self._begin_live_mesh_playback(payload)
+        if self.live_mesh_thread is not None and self.live_mesh_thread.is_alive():
+            self.root.after(25, self._poll_live_mesh)
+        elif not received:
+            self._update_live_mesh_controls()
+
+    def _begin_live_mesh_playback(self, result: LiveMeshResult) -> None:
+        self.live_mesh_result = result
+        self.live_mesh_frame_index = 0
+        self.live_mesh_recent_frames = []
+        self.live_mesh_history_frames = []
+        self.live_mesh_play_counts = {
+            "tx": 0,
+            "rx": 0,
+            "collisions": 0,
+            "dropped": 0,
+            "throttled": 0,
+        }
+        self.live_mesh_status_var.set(
+            f"{result.originated_packets:,} packets scheduled · playing 30-second traffic view"
+        )
+        self.status_var.set("Live mesh traffic active · blue NodeInfo · green telemetry · amber sensor · purple message")
+        self.live_mesh_after = self.root.after(10, self._live_mesh_tick)
+        self._update_live_mesh_controls()
+
+    def _live_mesh_tick(self) -> None:
+        result = self.live_mesh_result
+        if result is None or self.live_mesh_frame_index >= len(result.frames):
+            self.live_mesh_after = None
+            self.live_mesh_recent_frames = []
+            if result is not None:
+                suffix = " · safety cap reached" if result.truncated else ""
+                self.live_mesh_status_var.set(
+                    f"Complete · {result.transmissions:,} TX · {result.collisions:,} collisions · "
+                    f"{result.dropped:,} RF drops · {result.throttled:,} channel-gated · "
+                    f"peak {result.peak_channel_utilization:.1f}%{suffix}"
+                )
+                self.status_var.set("Live mesh traffic complete")
+            self._update_live_mesh_controls()
+            self._render_live_mesh_frame()
+            return
+
+        frame = result.frames[self.live_mesh_frame_index]
+        self.live_mesh_recent_frames.append(frame)
+        self.live_mesh_recent_frames = self.live_mesh_recent_frames[-4:]
+        self.live_mesh_history_frames = (self.live_mesh_history_frames + [frame])[-1800:]
+        self.live_mesh_play_counts["tx"] += frame.transmission_count
+        self.live_mesh_play_counts["rx"] += frame.reception_count
+        self.live_mesh_play_counts["collisions"] += frame.collision_count
+        self.live_mesh_play_counts["dropped"] += frame.drop_count
+        self.live_mesh_play_counts["throttled"] += frame.throttle_count
+        if self.live_mesh_frame_index % 10 == 0:
+            simulated_minutes = frame.time_ms / 60_000.0
+            self.live_mesh_status_var.set(
+                f"T+{simulated_minutes / 60.0:.1f} h · {self.live_mesh_play_counts['tx']:,} TX · "
+                f"{self.live_mesh_play_counts['collisions']:,} collisions · "
+                f"{self.live_mesh_play_counts['dropped']:,} RF drops · "
+                f"{self.live_mesh_play_counts['throttled']:,} channel-gated"
+            )
+        self._render_live_mesh_frame()
+        self.live_mesh_frame_index += 1
+        interval_ms = max(20, round(self.scenario.live_mesh.playback_seconds * 1000 / len(result.frames)))
+        self.live_mesh_after = self.root.after(interval_ms, self._live_mesh_tick)
+
+    def stop_live_mesh(self, clear_visuals: bool = False) -> None:
+        was_running = self._live_mesh_running()
+        self.live_mesh_cancel_event.set()
+        self.live_mesh_request_id += 1
+        if self.live_mesh_after is not None:
+            try:
+                self.root.after_cancel(self.live_mesh_after)
+            except tk.TclError:
+                pass
+        self.live_mesh_after = None
+        self.live_mesh_thread = None
+        self.live_mesh_recent_frames = []
+        self.live_mesh_enabled.set(False)
+        if clear_visuals:
+            self.live_mesh_result = None
+            self.live_mesh_tests = {}
+            self.live_mesh_snapshot = {}
+            self.live_mesh_history_frames = []
+            self.live_path_test_id = None
+            self.live_mesh_hidden_test_ids = set()
+            self.live_mesh_status_var.set("Idle")
+        elif was_running:
+            self.live_mesh_status_var.set("Stopped")
+            self.status_var.set("Live mesh traffic stopped")
+        self._update_live_mesh_controls()
+        if hasattr(self, "canvas"):
+            self._render_live_mesh_frame()
+
     def _read_packet_form(self) -> PacketConfig | None:
         source = self._id_for_name(str(self.packet_vars["source_name"].get()))
         destination_name = str(self.packet_vars["destination_name"].get())
@@ -2888,6 +4040,7 @@ class MeshSimulatorApp:
                 hop_limit=max(0, min(7, int(self.packet_vars["hop_limit"].get()))),
                 port=str(self.packet_vars["port"].get()),
                 want_ack=bool(self.packet_vars["want_ack"].get()) and destination != "BROADCAST",
+                want_response=bool(self.packet_vars["want_response"].get()) and destination != "BROADCAST",
                 channel=str(self.packet_vars["channel"].get()),
             )
         except ValueError as error:
@@ -2897,6 +4050,15 @@ class MeshSimulatorApp:
         return packet
 
     def run_simulation(self) -> None:
+        if self._live_mesh_running():
+            packet = self._read_packet_form()
+            if packet is not None:
+                # Replace only the displayed packet trace.  The background
+                # mesh stays active and keeps its RF/channel state.
+                self.clear_results()
+                self.live_mesh_injections.put(packet)
+                self.status_var.set("Packet queued for injection into the live mesh…")
+            return
         if self.simulation_thread and self.simulation_thread.is_alive():
             self.status_var.set("Simulation is already running…")
             return
@@ -3270,6 +4432,9 @@ class MeshSimulatorApp:
             self.root.after_idle(self._populate_results_once)
 
     def clear_results(self) -> None:
+        if self._live_mesh_running():
+            self.live_mesh_hidden_test_ids.update(self.live_mesh_tests)
+            self.live_path_test_id = None
         self.stop_animation()
         self.last_result = None
         self.results_populated = True
@@ -3287,6 +4452,9 @@ class MeshSimulatorApp:
         if hasattr(self, "events_tree"):
             for tree in (self.events_tree, self.nodes_tree, self.links_tree):
                 tree.delete(*tree.get_children())
+            if hasattr(self, "live_tests_tree"):
+                self.live_tests_tree.delete(*self.live_tests_tree.get_children())
+                self.live_detail_tree.delete(*self.live_detail_tree.get_children())
             for variable in self.metric_vars.values():
                 variable.set("—")
             self.result_status.configure(text="No packet sent")
@@ -3294,7 +4462,10 @@ class MeshSimulatorApp:
             self.send_button.configure(state="normal", text="▶  Send packet")
         if hasattr(self, "clear_hops_button"):
             self.clear_hops_button.configure(state="disabled")
-        self.status_var.set("Packet traces cleared · ready to send")
+        self.status_var.set(
+            "Packet traces cleared · live mesh traffic continues"
+            if self._live_mesh_running() else "Packet traces cleared · ready to send"
+        )
         self.render_canvas()
 
     def _mark_results_stale(self) -> None:
@@ -3413,8 +4584,6 @@ class MeshSimulatorApp:
             if self._bounds_overlap(obstacle.normalized(), visible_bounds)
         ]
         self._draw_obstacle_layer(c, visible_obstacles)
-        if self.probe_links.get():
-            self._draw_probe_links(c)
         packet_start = len(c.find_all())
         self._draw_packet_links(c)
         self._draw_retained_coverage(c)
@@ -3450,6 +4619,7 @@ class MeshSimulatorApp:
         self._tag_items_created_since(c, scale_start, HUD_LAYER_TAG)
         wave_start = len(c.find_all())
         self._draw_current_wave(c)
+        self._draw_live_mesh_overlay(c)
         self._tag_items_created_since(c, wave_start, CURRENT_WAVE_TAG)
         if self.map_visible.get():
             attribution_start = len(c.find_all())
@@ -3481,6 +4651,17 @@ class MeshSimulatorApp:
         c.delete(CURRENT_WAVE_TAG)
         starting_count = len(c.find_all())
         self._draw_current_wave(c)
+        self._draw_live_mesh_overlay(c)
+        self._tag_items_created_since(c, starting_count, CURRENT_WAVE_TAG)
+
+    def _render_live_mesh_frame(self) -> None:
+        if not hasattr(self, "canvas"):
+            return
+        c = self.canvas
+        c.delete(CURRENT_WAVE_TAG)
+        starting_count = len(c.find_all())
+        self._draw_current_wave(c)
+        self._draw_live_mesh_overlay(c)
         self._tag_items_created_since(c, starting_count, CURRENT_WAVE_TAG)
 
     def _render_simulation_layers(self) -> None:
@@ -3505,6 +4686,7 @@ class MeshSimulatorApp:
 
         wave_start = len(c.find_all())
         self._draw_current_wave(c)
+        self._draw_live_mesh_overlay(c)
         self._tag_items_created_since(c, wave_start, CURRENT_WAVE_TAG)
 
     def _compose_map_layer(self, c: tk.Canvas) -> Image.Image:
@@ -3998,12 +5180,20 @@ class MeshSimulatorApp:
             visible.append((node.id, node.name, x, y, infrastructure))
         self.node_label_layout = layout_node_labels(visible, canvas_width, canvas_height)
 
+    def _active_packet_reached(self) -> dict[str, dict[str, Any]] | None:
+        if self.live_path_test_id is not None:
+            test = self.live_mesh_tests.get(self.live_path_test_id)
+            if test is not None:
+                return test.reached
+        return self.last_result.reached if self.last_result is not None else None
+
     def _draw_node(self, c: tk.Canvas, node: Node) -> None:
         x, y = self.world_to_screen(node.x, node.y)
         color = ROLE_COLORS.get(node.role, ACCENT)
         if not node.online:
             color = "#526175"
-        unreached = self.last_result is not None and node.id not in self.last_result.reached
+        active_reached = self._active_packet_reached()
+        unreached = active_reached is not None and node.id not in active_reached
         if unreached and node.online:
             color = "#77818d"
         selected = node.id == self.selected_id
@@ -4012,16 +5202,14 @@ class MeshSimulatorApp:
         on_selected_path = not path_focus or node.id in selected_path or selected
         if not on_selected_path:
             color = "#4b5664"
-        reached = (
-            self.last_result
-            and node.id in self.last_result.reached
-            and node.id in self.animation_revealed_nodes
+        reached = active_reached is not None and node.id in active_reached and (
+            self.live_path_test_id is not None or node.id in self.animation_revealed_nodes
         )
         show_delivery = reached and on_selected_path
         infrastructure = node.role in {"ROUTER", "ROUTER_LATE", "REPEATER", "CLIENT_BASE", "ROUTER_CLIENT"}
         marker_radius = 11 if infrastructure else 7
         if show_delivery:
-            info = self.last_result.reached[node.id]
+            info = active_reached[node.id]
             hop = int(info.get("hop", 0))
             ring = HOP_COLORS.get(hop, TEXT)
             ring_radius = 21 if infrastructure else 13
@@ -4063,7 +5251,7 @@ class MeshSimulatorApp:
             c.create_text(x + (13 if infrastructure else 9), y - (12 if infrastructure else 8), text="★", fill="#ffe08a",
                           font=("Segoe UI Symbol", 8))
         if show_delivery:
-            hop = int(self.last_result.reached[node.id].get("hop", 0))
+            hop = int(active_reached[node.id].get("hop", 0))
             badge_color = HOP_COLORS.get(hop, TEXT)
             badge_x = x + (23 if infrastructure else 16)
             badge_y = y - (19 if infrastructure else 14)
@@ -4178,9 +5366,19 @@ class MeshSimulatorApp:
             c.create_line(x1, y1, x2, y2, fill=color, width=width, dash=dash, arrow="last", arrowshape=(7, 9, 3))
 
     def _selected_packet_path(self) -> list[str] | None:
-        if not self.path_focus_id or self.last_result is None:
+        if not self.path_focus_id:
             return None
-        return packet_path_node_ids(self.last_result, self.path_focus_id)
+        reached = self._active_packet_reached()
+        if reached is None or self.path_focus_id not in reached:
+            return None
+        path: list[str] = []
+        seen: set[str] = set()
+        current = self.path_focus_id
+        while current and current not in seen:
+            seen.add(current)
+            path.append(current)
+            current = str(reached.get(current, {}).get("via", ""))
+        return list(reversed(path))
 
     def _draw_retained_coverage(self, c: tk.Canvas) -> None:
         if not self.retained_coverage_transmitters:
@@ -4215,6 +5413,140 @@ class MeshSimulatorApp:
             )
             if self.show_drops.get():
                 self._draw_contour_stop_segments(c, contour, width=3)
+
+    def _draw_live_mesh_overlay(self, c: tk.Canvas) -> None:
+        result = self.live_mesh_result
+        if result is None and not self.live_mesh_recent_frames and not self._live_mesh_running():
+            return
+        nodes = {node.id: node for node in self.scenario.nodes}
+        recent = self.live_mesh_recent_frames
+        for age, frame in enumerate(reversed(recent)):
+            width = max(1, 4 - age)
+            dash = None if age <= 1 else (3, 4)
+            for source_id, target_id, traffic_kind, _hop in frame.receptions:
+                if traffic_kind == "TEST":
+                    continue
+                source, target = nodes.get(source_id), nodes.get(target_id)
+                if source is None or target is None:
+                    continue
+                color = TRAFFIC_COLORS.get(traffic_kind, ACCENT)
+                x1, y1 = self.world_to_screen(source.x, source.y)
+                x2, y2 = self.world_to_screen(target.x, target.y)
+                c.create_line(x1, y1, x2, y2, fill="#05080d", width=width + 3, dash=dash)
+                c.create_line(x1, y1, x2, y2, fill=color, width=width, dash=dash)
+                if age == 0:
+                    c.create_oval(x2 - 4, y2 - 4, x2 + 4, y2 + 4, fill=color, outline="#05080d")
+
+            for node_id, traffic_kind in frame.transmitters:
+                if traffic_kind == "TEST":
+                    continue
+                node = nodes.get(node_id)
+                if node is None:
+                    continue
+                color = TRAFFIC_COLORS.get(traffic_kind, ACCENT)
+                x, y = self.world_to_screen(node.x, node.y)
+                radius = 14 + age * 7
+                c.create_oval(
+                    x - radius,
+                    y - radius,
+                    x + radius,
+                    y + radius,
+                    outline="#05080d",
+                    width=width + 3,
+                    dash=dash,
+                )
+                c.create_oval(
+                    x - radius,
+                    y - radius,
+                    x + radius,
+                    y + radius,
+                    outline=color,
+                    width=width,
+                    dash=dash,
+                )
+
+            for node_id in frame.throttled:
+                node = nodes.get(node_id)
+                if node is None:
+                    continue
+                x, y = self.world_to_screen(node.x, node.y)
+                radius = 18 + age * 3
+                c.create_oval(
+                    x - radius,
+                    y - radius,
+                    x + radius,
+                    y + radius,
+                    outline="#a7b0bd",
+                    width=2,
+                    dash=(3, 3),
+                )
+
+        current_index = min(self.live_mesh_frame_index, max(0, len(result.frames) - 1)) if result else 0
+        simulated_hours = (
+            result.frames[current_index].time_ms / 3_600_000.0
+            if result and result.frames
+            else float(self.live_mesh_snapshot.get("time_ms", 0.0)) / 3_600_000.0
+        )
+        active = self._live_mesh_running()
+        title = (
+            f"LIVE MESH  T+{simulated_hours:.1f} h"
+            if active
+            else "LIVE MESH COMPLETE"
+        )
+        stats = (
+            f"{self.live_mesh_play_counts['tx']:,} TX  ·  "
+            f"{self.live_mesh_play_counts['collisions']:,} collisions  ·  "
+            f"{self.live_mesh_play_counts['dropped']:,} RF drops  ·  "
+            f"{self.live_mesh_play_counts['throttled']:,} channel-gated"
+        )
+        self._draw_outlined_text(
+            c,
+            c.winfo_width() / 2,
+            26,
+            title,
+            fill="#f4f8fc",
+            font=("Segoe UI Semibold", 11),
+        )
+        self._draw_outlined_text(
+            c,
+            c.winfo_width() / 2,
+            45,
+            stats,
+            fill="#b8c7d9",
+            font=("Segoe UI Semibold", 9),
+        )
+
+    def _draw_live_test_paths(self, c: tk.Canvas, nodes: dict[str, Node]) -> None:
+        """Retain the selected live test's first-arrival mesh links and hop badges."""
+        if self.live_path_test_id is None:
+            return
+        test = self.live_mesh_tests.get(self.live_path_test_id)
+        if test is None:
+            return
+        for receiver_id, arrival in test.reached.items():
+            via_id = str(arrival.get("via", ""))
+            hop = int(arrival.get("hop", 0))
+            if not via_id or hop <= 0 or not self.hop_line_vars.get(hop, tk.BooleanVar(value=True)).get():
+                continue
+            source = nodes.get(via_id)
+            receiver = nodes.get(receiver_id)
+            if source is None or receiver is None:
+                continue
+            x1, y1 = self.world_to_screen(source.x, source.y)
+            x2, y2 = self.world_to_screen(receiver.x, receiver.y)
+            color = HOP_COLORS.get(hop, ACCENT)
+            c.create_line(
+                x1, y1, x2, y2, fill="#02060d", width=7, dash=(6, 3),
+                arrow="last", arrowshape=(9, 11, 4),
+            )
+            c.create_line(
+                x1, y1, x2, y2, fill=color, width=3, dash=(6, 3),
+                arrow="last", arrowshape=(7, 9, 3),
+            )
+            self._draw_outlined_text(
+                c, (x1 + x2) / 2, (y1 + y2) / 2 - 9, f"H{hop}",
+                fill=color, font=("Segoe UI Bold", 9),
+            )
 
     def _draw_current_wave(self, c: tk.Canvas) -> None:
         if self.current_wave_hop <= 0:
@@ -4809,13 +6141,17 @@ class MeshSimulatorApp:
         self.selected_id = item_id
         selected_object = self.get_selected()
         self.path_focus_id = (
-            selected_object.id if isinstance(selected_object, Node) and self.last_result is not None else None
+            selected_object.id
+            if isinstance(selected_object, Node) and self._active_packet_reached() is not None
+            else None
         )
         if selection_changed:
             self._build_object_form()
         self.render_canvas()
-        if isinstance(selected_object, Node) and self.last_result is not None:
-            path = packet_path_node_ids(self.last_result, selected_object.id)
+        if selection_changed:
+            self._refresh_mesh_graph()
+        if isinstance(selected_object, Node) and self._active_packet_reached() is not None:
+            path = self._selected_packet_path()
             if path:
                 names = {node.id: node.name for node in self.scenario.nodes}
                 route = " → ".join(names.get(node_id, node_id) for node_id in path)
@@ -4857,6 +6193,7 @@ class MeshSimulatorApp:
         self._build_environment_form()
         self._build_packet_form()
         self.render_canvas()
+        self._refresh_mesh_graph()
         self._update_title()
 
     def _id_for_name(self, name: str) -> str:
@@ -4880,6 +6217,14 @@ class MeshSimulatorApp:
         path = os.path.basename(self.file_path) if self.file_path else self.scenario.name
         self.root.title(f"{path}{marker} — MeshLab RF")
 
+    def _sync_live_mesh_interval_vars(self) -> None:
+        config = self.scenario.live_mesh
+        self.live_mesh_nodeinfo_var.set(str(config.nodeinfo_interval_minutes))
+        self.live_mesh_telemetry_var.set(str(config.telemetry_interval_minutes))
+        self.live_mesh_router_telemetry_var.set(str(config.router_telemetry_interval_minutes))
+        self.live_mesh_sensor_var.set(str(config.sensor_interval_minutes))
+        self.live_mesh_message_var.set(str(config.message_interval_minutes))
+
     def _confirm_discard(self) -> bool:
         if not self.dirty:
             return True
@@ -4898,7 +6243,10 @@ class MeshSimulatorApp:
         if not self._confirm_discard():
             return
         self.stop_animation()
+        self.stop_live_mesh(clear_visuals=True)
         self.scenario = Scenario(name="Untitled scenario")
+        self._sync_live_mesh_interval_vars()
+        self._sync_live_mesh_preset()
         self.file_path = None
         self.selected_id = None
         self.dirty = False
@@ -4920,10 +6268,14 @@ class MeshSimulatorApp:
         if not path:
             return
         try:
-            self.scenario = scenario_from_file(path)
+            loaded_scenario = scenario_from_file(path)
         except (OSError, ValueError, TypeError) as error:
             messagebox.showerror("Could not open scenario", str(error), parent=self.root)
             return
+        self.stop_live_mesh(clear_visuals=True)
+        self.scenario = loaded_scenario
+        self._sync_live_mesh_interval_vars()
+        self._sync_live_mesh_preset()
         self.file_path = path
         self.selected_id = None
         self.dirty = False
@@ -5000,6 +6352,7 @@ class MeshSimulatorApp:
         if not self._confirm_discard():
             return
         self.stop_animation()
+        self.stop_live_mesh(clear_visuals=True)
         if self.live_radio.connected or self.live_radio.connecting:
             self.live_radio.disconnect()
         self.root.destroy()
@@ -5014,7 +6367,9 @@ class MeshSimulatorApp:
             "Broadcasts and first-contact DMs use a managed-flood approximation with hop limits, "
             "role-dependent relay delay, rebroadcast modes, duplicate cancellation, opaque channel relays, "
             "airtime, collisions, and capture. An acknowledged DM can store its first-arrival path. Later "
-            "DMs use directed hop lines; a failed stored path is removed and falls back to flooding.\n\n"
+            "DMs use directed hop lines; a failed stored path is removed and falls back to flooding. The live "
+            "traffic test adds concurrent NodeInfo, telemetry, sensor, and message broadcasts with rolling "
+            "25%/40% channel-utility gates.\n\n"
             "The simulator stores one complete learned path per source/destination pair. It does not import "
             "live firmware next-hop tables, reproduce every retry, enforce regional radio law, ray-trace "
             "multipath, or replace a calibrated site survey. Map and elevation data can be incomplete or "

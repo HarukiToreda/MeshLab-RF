@@ -33,7 +33,11 @@ Use the mouse wheel to zoom, right-drag to pan, and **Fit** to frame the current
 - **Clear hops** removes the trace without running another simulation.
 - **Hop lines** can hide individual hop layers.
 
-Direct messages first use flooding when no route is known. If an ACK confirms the route, later DMs use only directed hop lines. A failed learned route is removed and the simulator falls back to flooding.
+Direct messages first use flooding when no route is known. If an ACK returns through the RF mesh, later DMs use only directed hop lines. A failed learned route is removed and the simulator falls back to flooding.
+
+For ongoing traffic, turn on **Live mesh traffic** in the top bar. It runs in real time: one configured minute is one real minute. Set the NodeInfo, client/router telemetry, sensor, and message intervals in **Packet → Live mesh traffic**; firmware-like values are the defaults. While it is on, **Send packet** injects your packet into that same channel load instead of starting an isolated test. Open **Results → Live traffic**, select an injected test, and see every receive, RF drop, collision, relay decision, hop-limit stop, and channel-utilization gate with its reason.
+
+Live results include direct ACKs, NAKs, and requested module replies as their own return transmissions. The same terrain, obstacles, airtime, collisions, and channel load apply to those replies, so you can see whether the response itself made it back.
 
 ## Terrain, height, and obstacles
 

@@ -14,11 +14,19 @@ The implementation follows these local firmware areas:
 
 Broadcasts and unknown direct routes use managed flooding. The simulator applies hop limits, role-based relay delay, duplicate cancellation, rebroadcast-mode filtering, radio compatibility, channel decoding, opaque relays, airtime, collisions, and capture.
 
-A DM with **Request ACK** can learn its first-arrival path when the reverse links also work. Later DMs use that stored path. If a node, channel, relay rule, RF link, or ACK path fails, the route is removed and the same run falls back to flooding.
+A DM with **Request ACK** generates a separate high-priority `ROUTING_APP` ACK when its destination decodes the request. That ACK is flooded back through the same RF timeline, so its airtime, terrain/obstructions, collisions, and channel load determine whether it reaches the sender. Only a returned ACK/reply learns a directed path. Later DMs use that stored path; a failed directed hop removes it and falls back to flooding.
 
 MeshLab RF stores one complete path per source/destination pair. It does not reproduce every node’s firmware next-hop table or full retry state machine.
 
+## Live mesh traffic
+
+The live test runs continuously in one shared event queue, so unrelated packets can overlap and collide. Leave the toolbar toggle enabled and send a test packet to inject it into that exact traffic timeline. Results records the concrete receive, RF-margin drop, collision, duplicate cancellation, relay refusal, hop-limit, and channel-gate reasons. The firmware-like profile uses 3-hour NodeInfo, 1-hour client telemetry, 12-hour router telemetry, extra hourly sensor-role telemetry, and occasional messages. Large meshes increase ordinary telemetry intervals. The busy profile shortens those intervals by 10×.
+
+Each node tracks audible airtime over a rolling minute. Ordinary metadata is suppressed at 25% utilization; NodeInfo, messages, and priority sensor/router traffic can continue to 40%. Links are calculated once and reused, while reception probability, relay timing, duplicate cancellation, collision, and capture remain event-specific. The display retains only recent activity frames, so continuous traffic does not grow the canvas workload.
+
 ## RF calculation
+
+Routine NodeInfo, telemetry, sensor, and broadcast message traffic is one-way, matching the firmware's normal periodic packets. A direct **Request ACK** adds a `ROUTING_APP` ACK/NAK transaction. A direct **Request module response** adds either the matching module reply (`NODEINFO_APP`, `POSITION_APP`, `TELEMETRY_APP`, `NEIGHBORINFO_APP`, `TRACEROUTE_APP`, or `ADMIN_APP`) or a routing NAK. Every return packet is visible in the live event timeline and can independently be dropped or collide.
 
 Three-dimensional path loss is:
 
