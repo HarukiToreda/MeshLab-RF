@@ -4642,13 +4642,26 @@ class MeshSimulatorApp:
         if self.static_coverage_grow >= 1.0:
             self.static_coverage_after = None
             if self.static_coverage_then_animate:
-                # Zero hop shown -- clear it and continue the normal hop animation.
+                # Zero hop shown -- clear it and continue with the later hops only.
                 self.static_coverage_then_animate = False
                 self.clear_static_coverage()
-                self._animate_next()
+                self._continue_after_zero_hop()
             return
         self.static_coverage_grow = min(1.0, self.static_coverage_grow + 0.06)
         self.static_coverage_after = self.root.after(30, self._animate_static_coverage)
+
+    def _continue_after_zero_hop(self) -> None:
+        """The heatmap already showed the source's own (hop-1) coverage, so reveal
+        the nodes it reached directly and animate only the later relay hops -- no
+        second ripple of the same zero-hop coverage."""
+        if self.animation_waves:
+            for event in self.animation_waves[0]:
+                self.animation_revealed_nodes.add(event.node_id)
+                edge = (event.peer_id, event.node_id, event.kind, event.hop)
+                if edge not in self.animation_seen_edges:
+                    self.animation_seen_edges.append(edge)
+            self.animation_index = 1  # skip hop 1 (already shown as the heatmap)
+        self._animate_next()
 
     def _render_static_coverage_layer(self) -> None:
         if not hasattr(self, "canvas"):
