@@ -15,7 +15,7 @@ The app starts with a map but no nodes. Internet access is needed for new map ti
 1. Search for the location you want to study.
 2. Select **Node**, then click the map to place as many nodes as needed. The tool stays selected.
 3. To add many nodes, choose **Random nodes**. They will be spread across the visible area.
-4. Zoom in and choose **Import obstacles** to load buildings and forests. Imports are limited to 12 km² (4.63 mi²) at a time.
+4. Choose **Import obstacles** to load buildings and forests. Wider views are covered by tiling them into complete 12 km² (4.63 mi²) imports and merging the results — no gaps and no zoom-in prompt (very wide views map their central region).
 5. Select a node and open **Properties** to set its role, radio, power, channel, and height.
 6. Open **Packet**, choose the source and destination, set the hop limit, and select **Send packet**.
 7. Open **Results** for delivery details, RF values, drops, and collisions.

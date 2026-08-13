@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import csv
 import io
 import math
@@ -93,6 +94,10 @@ NODE_LAYER_TAG = "node-layer"
 CURRENT_WAVE_TAG = "current-wave"
 BEACON_TAG = "beacon-pulse"
 STATIC_COVERAGE_TAG = "static-coverage"
+# How many obstacle-import tiles to fetch at once.  Each tile already fans its
+# own cells across a small thread pool, so this multiplies overall throughput
+# without overwhelming the Overture endpoint.
+TILE_IMPORT_CONCURRENCY = 3
 HUD_LAYER_TAG = "hud-layer"
 SELECTED_OBSTACLE_TAG = "selected-obstacle"
 LIVE_TRAFFIC_PRESETS: dict[str, dict[str, Any]] = {
@@ -2379,119 +2384,154 @@ class MeshSimulatorApp:
         right, bottom = self.screen_to_world(self.canvas.winfo_width(), self.canvas.winfo_height())
         left, right = min(left, right), max(left, right)
         top, bottom = min(top, bottom), max(top, bottom)
-        area_m2 = max(0.0, right - left) * max(0.0, bottom - top)
-        if area_m2 <= 0:
+        full_width_m = max(1.0, right - left)
+        full_height_m = max(1.0, bottom - top)
+        full_area_m2 = full_width_m * full_height_m
+        if full_area_m2 <= 0:
             return
-        if area_m2 > OBSTACLE_IMPORT_MAX_AREA_M2:
-            messagebox.showinfo(
-                "Zoom in before importing",
-                (
-                    f"The visible area is {self.format_area(area_m2)}. "
-                    "Zoom in until the visible area is "
-                    f"{self.format_area(OBSTACLE_IMPORT_MAX_AREA_M2)} or less, "
-                    "then import obstacles again.\n\n"
-                    "This limit applies only to obstacle imports; the map and "
-                    "terrain can remain zoomed out farther."
-                ),
-                parent=self.root,
+        cap = OBSTACLE_IMPORT_MAX_AREA_M2
+
+        # Cover the whole view by tiling it into complete <=cap imports and merging
+        # them -- no dead spots and no "zoom in" prompt.  Bounded to a 3x3 grid so a
+        # very wide view maps its central region rather than downloading endlessly.
+        if full_area_m2 <= cap:
+            tiles = [(left, top, right, bottom)]
+        else:
+            tile_side = math.sqrt(cap)
+            max_axis = 3
+            columns = min(max_axis, max(1, math.ceil(full_width_m / tile_side)))
+            rows_axis = min(max_axis, max(1, math.ceil(full_height_m / tile_side)))
+            covered_width = min(full_width_m, columns * tile_side)
+            covered_height = min(full_height_m, rows_axis * tile_side)
+            center_x, center_y = (left + right) / 2.0, (top + bottom) / 2.0
+            base_left = center_x - covered_width / 2.0
+            base_top = center_y - covered_height / 2.0
+            tile_w = covered_width / columns
+            tile_h = covered_height / rows_axis
+            tiles = [
+                (base_left + i * tile_w, base_top + j * tile_h,
+                 base_left + (i + 1) * tile_w, base_top + (j + 1) * tile_h)
+                for i in range(columns)
+                for j in range(rows_axis)
+            ]
+
+        covered_left = min(t[0] for t in tiles)
+        covered_top = min(t[1] for t in tiles)
+        covered_right = max(t[2] for t in tiles)
+        covered_bottom = max(t[3] for t in tiles)
+        covered_area_m2 = (covered_right - covered_left) * (covered_bottom - covered_top)
+
+        # Each tile is a complete import with its own query plan and budget.
+        tile_jobs: list[tuple[float, float, float, float, int, int, int]] = []
+        total_building_limit = 0
+        for tile_left, tile_top, tile_right, tile_bottom in tiles:
+            columns_c, rows_c, tile_limit, _sampled = obstacle_import_plan(
+                max(1.0, tile_right - tile_left), max(1.0, tile_bottom - tile_top)
             )
-            return
-        visible_width_m = max(1.0, right - left)
-        visible_height_m = max(1.0, bottom - top)
-        import_columns, import_rows, building_limit, spatially_sampled = obstacle_import_plan(
-            visible_width_m, visible_height_m
-        )
-        north, west = world_to_latlon(left, top, env.map_center_lat, env.map_center_lon)
-        south, east = world_to_latlon(
-            right, bottom, env.map_center_lat, env.map_center_lon
-        )
+            total_building_limit += tile_limit
+            north, west = world_to_latlon(tile_left, tile_top, env.map_center_lat, env.map_center_lon)
+            south, east = world_to_latlon(tile_right, tile_bottom, env.map_center_lat, env.map_center_lon)
+            tile_jobs.append((south, west, north, east, columns_c, rows_c, tile_limit))
+
+        forest_north, forest_west = world_to_latlon(covered_left, covered_top, env.map_center_lat, env.map_center_lon)
+        forest_south, forest_east = world_to_latlon(covered_right, covered_bottom, env.map_center_lat, env.map_center_lon)
+
         self.osm_import_button.configure(state="disabled")
         self._set_obstacle_progress("Preparing geographic cells…", 2.0)
-        self.status_var.set(
-            f"Importing the full visible {self.format_area(area_m2)} in "
-            f"{import_columns}×{import_rows} geographic cells…"
-        )
+        if len(tile_jobs) > 1:
+            self.status_var.set(
+                f"Importing {self.format_area(covered_area_m2)} across {len(tile_jobs)} tiles…"
+            )
+        else:
+            self.status_var.set(f"Importing the full visible {self.format_area(covered_area_m2)}…")
 
         def worker() -> None:
-            warnings: list[str] = []
-            def building_progress(completed: int, total: int, phase: str) -> None:
-                coverage_percent = 100.0 * completed / max(1, total)
-                percent = 5.0 + 78.0 * completed / max(1, total)
-                self.geo_results.put(
-                    (
-                        "obstacle_progress",
-                        {
-                            "value": percent,
-                            "text": f"{phase} · coverage {coverage_percent:.0f}%",
-                        },
-                    )
-                )
-
             try:
-                try:
-                    buildings = self.map_service.fetch_overture_buildings_for_viewport(
-                        south,
-                        west,
-                        north,
-                        east,
-                        limit=building_limit,
-                        columns=import_columns,
-                        rows=import_rows,
-                        progress_callback=building_progress,
-                    )
-                    building_source = "Overture"
-                    if spatially_sampled:
-                        warnings.append(
-                            "Very large view: building footprints were spatially sampled across the complete area"
+                warnings: list[str] = []
+                combined: dict[str, dict[str, Any]] = {}
+                building_source = "Overture"
+                total = len(tile_jobs)
+                lock = threading.Lock()
+                completed = [0]
+
+                def fetch_tile(job: tuple[float, float, float, float, int, int, int]):
+                    south, west, north, east, columns_c, rows_c, tile_limit = job
+                    source = "Overture"
+                    try:
+                        elements = self.map_service.fetch_overture_buildings_for_viewport(
+                            south, west, north, east,
+                            limit=tile_limit, columns=columns_c, rows=rows_c,
                         )
-                except Exception as overture_error:
+                    except Exception as overture_error:
+                        try:
+                            elements = self.map_service.fetch_osm_obstacles(south, west, north, east)
+                            source = "OSM fallback"
+                            with lock:
+                                warnings.append(f"Overture unavailable for a tile: {overture_error}")
+                        except Exception as osm_error:
+                            with lock:
+                                warnings.append(f"A tile failed to import: {osm_error}")
+                            elements = []
+                    with lock:
+                        completed[0] += 1
+                        self.geo_results.put(
+                            (
+                                "obstacle_progress",
+                                {
+                                    "value": 5.0 + 78.0 * completed[0] / max(1, total),
+                                    "text": (
+                                        f"Loaded tile {completed[0]}/{total} · "
+                                        f"{len(elements):,} buildings"
+                                    ),
+                                },
+                            )
+                        )
+                    return elements, source
+
+                # Fetch tiles concurrently; each tile still fans its own cells out
+                # across a small pool, so this multiplies overall throughput.
+                if total <= 1:
+                    tile_results = [fetch_tile(job) for job in tile_jobs]
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(TILE_IMPORT_CONCURRENCY, total)
+                    ) as executor:
+                        tile_results = list(executor.map(fetch_tile, tile_jobs))
+                for elements, source in tile_results:
+                    if source == "OSM fallback":
+                        building_source = "OSM fallback"
+                    for element in elements:
+                        key = f"{element.get('type', 'overture')}/{element.get('id', '')}"
+                        combined.setdefault(key, element)
+
+                try:
                     self.geo_results.put(
                         (
                             "obstacle_progress",
                             {
                                 "value": 0,
-                                "text": "Overture unavailable; trying OpenStreetMap…",
+                                "text": f"Loaded {len(combined):,} buildings · fetching forests…",
                                 "indeterminate": True,
                             },
                         )
                     )
-                    buildings = self.map_service.fetch_osm_obstacles(south, west, north, east)
-                    warnings.append(f"Overture unavailable: {overture_error}")
-                    self.geo_results.put(
-                        (
-                            "obstacles",
-                            {
-                                "elements": buildings,
-                                "building_source": "OSM fallback",
-                                "warnings": warnings,
-                                "building_limit": building_limit,
-                            },
-                        )
+                    forests = self.map_service.fetch_osm_forests(
+                        forest_south, forest_west, forest_north, forest_east
                     )
-                    return
-                try:
-                    self.geo_results.put(
-                        (
-                            "obstacle_progress",
-                            {
-                                "value": 0,
-                                "text": f"Loaded {len(buildings):,} buildings · fetching forests…",
-                                "indeterminate": True,
-                            },
-                        )
-                    )
-                    forests = self.map_service.fetch_osm_forests(south, west, north, east)
                 except Exception as forest_error:
                     forests = []
                     warnings.append(f"OSM forests unavailable: {forest_error}")
+
                 self.geo_results.put(
                     (
                         "obstacles",
                         {
-                            "elements": buildings + forests,
+                            "elements": list(combined.values()) + forests,
                             "building_source": building_source,
                             "warnings": warnings,
-                            "building_limit": building_limit,
+                            # Keep every merged building -- the per-tile caps already
+                            # bounded the totals.
+                            "building_limit": max(total_building_limit, len(combined)),
                         },
                     )
                 )
@@ -5350,12 +5390,25 @@ class MeshSimulatorApp:
                 ((point[0] - view_x) * scale, (point[1] - view_y) * scale)
                 for point in obstacle.points
             ]
-            fill_rgb = ImageColor.getrgb(obstacle.color)
-            outline_rgb = ImageColor.getrgb(self._lighten(obstacle.color))
+            is_building = obstacle.kind == "Building"
+            color = obstacle.color
+            if is_building and color in {"#8b5e4a", "#5a4636", "#3f3c37"}:
+                color = "#33302b"
+            fill_rgb = ImageColor.getrgb(color)
+            if is_building:
+                # Buildings are solid dark like the basemap's own footprints.
+                fill_alpha = 255 if obstacle.enabled else 120
+                outline_rgb = fill_rgb
+                outline_alpha = fill_alpha
+            else:
+                # Other obstacles (e.g. forests) stay translucent so the map reads.
+                fill_alpha = 86 if obstacle.enabled else 42
+                outline_rgb = ImageColor.getrgb(self._lighten(color))
+                outline_alpha = 180 if obstacle.enabled else 100
             drawing.polygon(
                 coordinates,
-                fill=(*fill_rgb, 86 if obstacle.enabled else 42),
-                outline=(*outline_rgb, 180 if obstacle.enabled else 100),
+                fill=(*fill_rgb, fill_alpha),
+                outline=(*outline_rgb, outline_alpha),
                 width=1,
             )
         self.obstacle_layer_image = ImageTk.PhotoImage(layer)
@@ -5377,7 +5430,21 @@ class MeshSimulatorApp:
 
     def _draw_obstacle(self, c: tk.Canvas, obstacle: Obstacle) -> None:
         selected = obstacle.id == self.selected_id
-        outline = "#78ddff" if selected else self._lighten(obstacle.color)
+        # Buildings render as solid dark footprints (like the basemap's own
+        # buildings); other obstacles keep the translucent stipple.  Older imports
+        # that still carry the light-tan default are shown in the new dark colour.
+        is_building = obstacle.kind == "Building"
+        fill = obstacle.color
+        if is_building and obstacle.color in {"#8b5e4a", "#5a4636", "#3f3c37"}:
+            fill = "#33302b"
+        # Buildings use a solid dark outline matching the fill (a lightened border
+        # made small footprints read pale); other obstacles keep the light edge.
+        if selected:
+            outline = "#78ddff"
+        elif is_building:
+            outline = fill
+        else:
+            outline = self._lighten(fill)
         stipple = "gray50" if obstacle.enabled else "gray75"
         if obstacle.shape == "polygon" and len(obstacle.points) >= 3:
             coordinates: list[float] = []
@@ -5386,10 +5453,10 @@ class MeshSimulatorApp:
                 coordinates.extend((screen_x, screen_y))
             c.create_polygon(
                 *coordinates,
-                fill=obstacle.color,
+                fill=fill,
                 outline=outline,
                 width=3 if selected else 1,
-                stipple="gray75" if obstacle.enabled else "gray50",
+                stipple="" if is_building else ("gray75" if obstacle.enabled else "gray50"),
             )
             return
         if obstacle.kind == "Forest" and obstacle.shape == "brush" and obstacle.points:
@@ -5451,7 +5518,10 @@ class MeshSimulatorApp:
             return
         sx1, sy1 = self.world_to_screen(obstacle.x1, obstacle.y1)
         sx2, sy2 = self.world_to_screen(obstacle.x2, obstacle.y2)
-        c.create_rectangle(sx1, sy1, sx2, sy2, fill=obstacle.color, outline=outline, width=3 if selected else 1, stipple=stipple)
+        c.create_rectangle(
+            sx1, sy1, sx2, sy2, fill=fill, outline=outline,
+            width=3 if selected else 1, stipple="" if is_building else stipple,
+        )
         center_x, center_y = (sx1 + sx2) / 2, (sy1 + sy2) / 2
         symbol = {"Building": "▣", "Wall": "━", "Forest": "♣", "Mountain": "▲", "Water": "≈"}.get(obstacle.kind, "◆")
         c.create_text(center_x, center_y - 7, text=symbol, fill="#f3f7fb", font=("Segoe UI Symbol", 15))

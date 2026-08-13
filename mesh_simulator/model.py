@@ -74,7 +74,7 @@ ROLE_COLORS = {
 
 OBSTACLE_DEFAULTS = {
     # color, penetration dB, height m, loss/100m dB, behavior, max distance beyond obstacle m
-    "Building": ("#8b5e4a", 18.0, 12.0, 0.3, "LIMIT_AFTER", 482.803),
+    "Building": ("#33302b", 18.0, 12.0, 0.3, "LIMIT_AFTER", 482.803),
     "Wall": ("#ef4444", 25.0, 4.0, 0.0, "ATTENUATE", 0.0),
     "Forest": ("#166534", 2.0, 18.0, 10.0, "ATTENUATE", 0.0),
     "Mountain": ("#64748b", 35.0, 180.0, 0.08, "BLOCK", 0.0),
@@ -279,7 +279,7 @@ class Obstacle:
     brush_radius_m: float = 150.0
     osm_id: str = ""
     enabled: bool = True
-    color: str = "#8b5e4a"
+    color: str = "#33302b"
 
     def normalized(self) -> tuple[float, float, float, float]:
         if self.points:
