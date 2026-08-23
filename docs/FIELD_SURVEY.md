@@ -1,51 +1,74 @@
-# T114 building-loss field survey
+# Standalone T114 building-loss survey
 
-This survey uses two Heltec Mesh Node T114 radios. The **mobile** radio sends a zero-hop probe after each new GPS fix, no faster than once every five seconds. The fixed **base** radio records the probe's RSSI and SNR and immediately broadcasts a reply. The mobile radio records the reply's RSSI and SNR.
+This project includes a purpose-built signal tester for two Heltec Mesh Node T114 radios. It is not Meshtastic firmware and does not contain a mesh stack, routing, Bluetooth, telemetry, a node database, or Meshtastic background traffic.
 
-Both radios append their records to `/static/meshlab-survey.csv`. The log is not cleared on reboot. A random session ID separates each power-on session.
+The source is in [`t114_signal_tester`](../t114_signal_tester). Two builds are produced from the same code:
 
-## What the display shows
+- `heltec-t114-signal-mobile.uf2` sends a direct LoRa probe after each fresh GPS location, no faster than every five seconds.
+- `heltec-t114-signal-base.uf2` listens at a fixed location and immediately returns a direct LoRa reply.
 
-- Mobile: each probe sent, each reply received with the outward and return RSSI/SNR, and each reply timeout.
-- Base: each probe received with RSSI/SNR and confirmation that its reply was sent.
+Both radios log every relevant event to a reserved 1 MB region of their external QSPI flash. The compact records are protected by CRC-32 and survive reboots. At the five-second interval, the region holds roughly 4,000 complete probe/reply exchanges per radio, or more than five hours of continuous walking.
 
-The separate logs matter. A mobile timeout alone cannot tell whether the probe failed on the outward path or the reply failed on the return path. The base log resolves that ambiguity and also preserves complete packet-loss observations.
+## Radio profile
 
-## Before the walk
+The checked-in build matches MeshLab RF's current US915 LongFast default:
 
-1. Configure the two radios with the same primary channel, channel key, modem preset, frequency slot, and legal LoRa region. The region must not be `UNSET`.
-2. Flash `heltec-t114-survey-mobile.uf2` on the walking radio and `heltec-t114-survey-base.uf2` on the fixed radio using the normal T114 UF2 bootloader process. Do not perform a full erase, because that would remove existing configuration and stored survey data.
-3. Put the base at a fixed, accurately known location with a clear view of the sky. Wait for both radios to obtain GPS locks.
-4. Use comparable antennas and keep antenna orientation, radio height, and body placement consistent. Record any antenna or installation differences separately.
+- 906.875 MHz
+- 250 kHz bandwidth
+- spreading factor 11
+- coding rate 4/5
+- 22 dBm SX1262 output
+- private LoRa sync word `0x12`
 
-The firmware records GPS validity, coordinates, altitude, satellite count, PDOP, radio region/preset/frequency/power, channel utilization, packet IDs, and bidirectional RSSI/SNR. Rows with an invalid base GPS position remain useful for RF diagnostics but should not be used for geographic calibration.
+These are standalone tester packets, not Meshtastic packets. Do not transmit this build outside a region where this profile is legal. For another region, change the constants in `t114_signal_tester/include/survey_config.h` and rebuild both roles.
+
+On its first standalone boot, the tester initializes only the final 1 MB of the T114's 2 MB external QSPI flash for survey records. It does not repeatedly erase that area. Reflashing or rebooting does not clear a valid survey log.
+
+## Display behavior
+
+The mobile display reports every successful probe transmission, every reply with outward and return RSSI/SNR, and every reply timeout. The base display reports every received probe with RSSI/SNR, whether its reply was sent, and whether the base had a GPS lock.
+
+The separate logs are essential. A mobile timeout alone cannot distinguish an outward probe loss from a return-reply loss. The base log resolves that ambiguity, and a total loss remains a useful censored measurement rather than disappearing from the dataset.
+
+## Build and flash
+
+Build both images from the project root:
+
+```powershell
+cd t114_signal_tester
+python -m platformio run
+```
+
+The ready-to-flash UF2 files are also copied to `artifacts/t114-signal-tester`. Put each T114 into its UF2 bootloader, then copy the correctly labeled image to that board. Flash one mobile and one base.
 
 ## Collect useful calibration data
 
-Include open line-of-sight paths as a reference, then paths whose direct lines cross the neighborhood's buildings. Walk multiple directions and distances, and repeat routes at least three times. Consistent mounting is important because body shadowing can otherwise look like building loss.
+1. Put the base at a fixed, accurately known point with a clear view of the sky and wait for its GPS lock.
+2. Wait for the mobile GPS lock before beginning the route.
+3. Keep both antennas in a consistent orientation and height. Keep the walking radio in a consistent position relative to your body.
+4. Record open line-of-sight paths first. These establish the radio, antenna, and local-noise baseline.
+5. Walk paths whose direct lines cross the neighborhood's buildings at several distances and angles. Repeat routes in both directions at least three times.
 
-This produces a local effective building-loss calibration, not one universal physical value. Wall material, windows, foliage, antenna placement, moving vehicles, multipath, weather, and local noise all affect the result. The open-path samples let us estimate the radio/antenna baseline before assigning the residual loss to buildings.
+This measures local effective excess loss, not a universal loss for every building. Wall materials, windows, foliage, antenna placement, vehicles, multipath, weather, and local noise all contribute. The later calibration will fit the clear-path bias first, then compare measured link loss with the simulator's building intersections.
 
 ## Extract both radios
 
-After the walk, connect **both T114s by USB at the same time**. From the project root run:
+After the walk, connect **both T114s by USB**. From the repository root run:
 
 ```powershell
 python tools\extract_survey.py
 ```
 
-If automatic port detection does not find exactly two T114s, name both ports explicitly:
+If automatic USB detection does not find exactly two testers, specify both ports:
 
 ```powershell
 python tools\extract_survey.py --ports COM7 COM8
 ```
 
-The extractor opens the ports one at a time, downloads both device logs, and writes a timestamped folder under `survey-data`. Keep the whole folder. It contains:
+The extractor verifies that one board is mobile and one is base, downloads each QSPI log with an end-to-end CRC, validates every individual record, and writes a timestamped folder under `survey-data`. Keep the entire folder. It contains:
 
-- one untouched CSV from each radio;
-- `combined-device-log.csv`, containing every device event;
-- `measurements.csv`, containing one joined calibration record per probe and base.
+- an untouched binary dump and decoded CSV from each radio;
+- `combined-device-log.csv`, containing every valid device event;
+- `measurements.csv`, containing one joined calibration record per probe.
 
-`measurements.csv` explicitly distinguishes `forward_received` from `reply_received`. Missing RSSI is retained as packet-loss evidence instead of being discarded.
-
-Once the two logs are available, the calibration step will compare measured link loss with MeshLab RF's prediction, fit the clear-path bias first, and then estimate robust local excess loss for the building intersections. The simulator's building values should only be changed after that comparison.
+`measurements.csv` explicitly separates `forward_received` from `reply_received` and contains GPS lock/position, HDOP, satellites, RSSI, SNR, radio parameters, and packet-loss outcomes for the two directions.

@@ -3,132 +3,138 @@ from __future__ import annotations
 import argparse
 import binascii
 import csv
-import queue
 import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from pubsub import pub
+from serial import Serial
 from serial.tools import list_ports
-
-from meshtastic.protobuf import mesh_pb2, xmodem_pb2
-from meshtastic.serial_interface import SerialInterface
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mesh_simulator.survey import merge_survey_rows, read_survey_log, write_rows
+from mesh_simulator.survey import (
+    SURVEY_RECORD_SIZE,
+    decode_survey_records,
+    merge_survey_rows,
+    write_rows,
+)
 
-SURVEY_DEVICE_PATH = "/static/meshlab-survey.csv"
 T114_USB_IDS = {(0x239A, 0x4405), (0x239A, 0x0029), (0x239A, 0x002A), (0x2886, 0x1667)}
+INFO_PATTERN = re.compile(r"^MESHLAB_INFO,1,(MOBILE|BASE),([0-9A-Fa-f]{16}),(\d+),(\d+)$")
+BEGIN_PATTERN = re.compile(r"^MESHLAB_BEGIN,1,(MOBILE|BASE),([0-9A-Fa-f]{16}),(\d+),(\d+)$")
+END_PATTERN = re.compile(r"^MESHLAB_END,([0-9A-Fa-f]{8})$")
 
 
-def crc16_ccitt(data: bytes) -> int:
-    return binascii.crc_hqx(data, 0)
+@dataclass(frozen=True)
+class DeviceInfo:
+    port: str
+    role: str
+    node_id: int
+    slots: int
+    record_size: int
 
 
-def discover_t114_ports() -> list[str]:
+def candidate_ports() -> list[str]:
     matches = []
     for port in list_ports.comports():
-        identity = (port.vid, port.pid)
         description = " ".join(filter(None, (port.product, port.description, port.manufacturer))).lower()
-        if identity in T114_USB_IDS or "t114" in description or "ht-n5262" in description:
+        if (port.vid, port.pid) in T114_USB_IDS or "t114 signal tester" in description:
             matches.append(port.device)
     return matches
 
 
-class FileDownload:
-    def __init__(self, interface: SerialInterface, timeout: float = 15.0) -> None:
-        self.interface = interface
-        self.timeout = timeout
-        self.incoming: queue.Queue[xmodem_pb2.XModem] = queue.Queue()
-
-    def _on_packet(self, packet: xmodem_pb2.XModem, interface: SerialInterface) -> None:
-        if interface is self.interface:
-            copy = xmodem_pb2.XModem()
-            copy.CopyFrom(packet)
-            self.incoming.put(copy)
-
-    def _send(self, packet: xmodem_pb2.XModem) -> None:
-        envelope = mesh_pb2.ToRadio()
-        envelope.xmodemPacket.CopyFrom(packet)
-        self.interface._sendToRadio(envelope)
-
-    def download(self, remote_path: str) -> bytes:
-        pub.subscribe(self._on_packet, "meshtastic.xmodempacket")
-        try:
-            request = xmodem_pb2.XModem(control=xmodem_pb2.XModem.STX, seq=0, buffer=remote_path.encode())
-            self._send(request)
-            expected_sequence = 1
-            output = bytearray()
-            deadline = time.monotonic() + self.timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(f"timed out downloading {remote_path}")
-                try:
-                    packet = self.incoming.get(timeout=remaining)
-                except queue.Empty as error:
-                    raise TimeoutError(f"timed out downloading {remote_path}") from error
-                if packet.control == xmodem_pb2.XModem.NAK:
-                    raise FileNotFoundError(f"device could not open {remote_path}")
-                if packet.control == xmodem_pb2.XModem.CAN:
-                    raise OSError(f"device cancelled transfer of {remote_path}")
-                if packet.control == xmodem_pb2.XModem.EOT:
-                    return bytes(output)
-                if packet.control != xmodem_pb2.XModem.SOH:
-                    continue
-                data = bytes(packet.buffer)
-                if packet.seq != expected_sequence or crc16_ccitt(data) != packet.crc16:
-                    self._send(xmodem_pb2.XModem(control=xmodem_pb2.XModem.NAK, seq=expected_sequence))
-                    deadline = time.monotonic() + self.timeout
-                    continue
-                output.extend(data)
-                self._send(xmodem_pb2.XModem(control=xmodem_pb2.XModem.ACK, seq=packet.seq))
-                expected_sequence += 1
-                deadline = time.monotonic() + self.timeout
-        finally:
-            pub.unsubscribe(self._on_packet, "meshtastic.xmodempacket")
+def read_matching_line(serial: Serial, pattern: re.Pattern[str], timeout: float = 8.0) -> re.Match[str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        line = serial.readline().decode("ascii", errors="ignore").strip()
+        match = pattern.match(line)
+        if match:
+            return match
+    raise TimeoutError(f"no standalone MeshLab response from {serial.port}")
 
 
-def safe_port_name(port: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", port).strip("_") or "device"
+def query_device(port: str) -> DeviceInfo:
+    with Serial(port, 115200, timeout=0.25, write_timeout=3) as serial:
+        time.sleep(0.4)
+        serial.reset_input_buffer()
+        serial.write(b"MESHLAB_INFO\n")
+        match = read_matching_line(serial, INFO_PATTERN)
+    role, node_hex, slots, record_size = match.groups()
+    if int(record_size) != SURVEY_RECORD_SIZE:
+        raise RuntimeError(f"{port} uses unsupported record size {record_size}")
+    return DeviceInfo(port, role.lower(), int(node_hex, 16), int(slots), int(record_size))
 
 
-def extract_port(port: str, destination: Path) -> Path:
-    print(f"Connecting to {port}...", flush=True)
-    interface = SerialInterface(devPath=port, noNodes=True, timeout=60)
-    try:
-        node_num = int(interface.myInfo.my_node_num)
-        data = FileDownload(interface).download(SURVEY_DEVICE_PATH)
-    finally:
-        interface.close()
-    output = destination / f"{safe_port_name(port)}-node-{node_num:08x}.csv"
-    output.write_bytes(data)
-    print(f"  downloaded {len(data):,} bytes to {output}")
-    return output
+def read_exact(serial: Serial, size: int, timeout: float = 60.0) -> bytes:
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    while len(output) < size:
+        chunk = serial.read(min(4096, size - len(output)))
+        if chunk:
+            output.extend(chunk)
+            deadline = time.monotonic() + timeout
+        elif time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out after {len(output):,} of {size:,} bytes from {serial.port}")
+    return bytes(output)
+
+
+def download_device(info: DeviceInfo, destination: Path) -> tuple[Path, list[dict[str, str]]]:
+    print(f"Downloading {info.role} log from {info.port}...", flush=True)
+    with Serial(info.port, 115200, timeout=0.25, write_timeout=3) as serial:
+        time.sleep(0.4)
+        serial.reset_input_buffer()
+        serial.write(b"MESHLAB_DUMP\n")
+        match = read_matching_line(serial, BEGIN_PATTERN)
+        role, node_hex, slots, record_size = match.groups()
+        if role.lower() != info.role or int(node_hex, 16) != info.node_id:
+            raise RuntimeError(f"{info.port} identity changed during download")
+        byte_count = int(slots) * int(record_size)
+        raw = read_exact(serial, byte_count)
+        end = read_matching_line(serial, END_PATTERN)
+        expected_crc = int(end.group(1), 16)
+        actual_crc = binascii.crc32(raw) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            raise RuntimeError(
+                f"{info.port} dump CRC mismatch: expected {expected_crc:08X}, received {actual_crc:08X}"
+            )
+
+    stem = f"{info.role}-node-{info.node_id:016x}"
+    binary_path = destination / f"{stem}.bin"
+    binary_path.write_bytes(raw)
+    rows, invalid = decode_survey_records(raw)
+    csv_path = destination / f"{stem}.csv"
+    write_rows(csv_path, rows)
+    print(f"  {len(rows):,} valid records, {invalid:,} damaged slots -> {csv_path}")
+    return binary_path, rows
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Download and merge MeshLab RF survey logs from two T114 nodes.")
+    parser = argparse.ArgumentParser(
+        description="Download and merge logs from two standalone MeshLab T114 signal testers."
+    )
     parser.add_argument("--ports", nargs="+", help="Both serial ports, for example --ports COM7 COM8")
     parser.add_argument("--output-dir", type=Path, help="Destination directory (default: survey-data/<timestamp>)")
     args = parser.parse_args()
 
-    ports = args.ports or discover_t114_ports()
+    ports = args.ports or candidate_ports()
     if len(ports) != 2:
         parser.error(f"expected exactly two T114 ports; found {len(ports)} ({', '.join(ports) or 'none'})")
+    devices = [query_device(port) for port in ports]
+    roles = sorted(device.role for device in devices)
+    if roles != ["base", "mobile"]:
+        parser.error(f"expected one base and one mobile firmware; found {', '.join(roles)}")
+
     destination = args.output_dir or Path("survey-data") / datetime.now().strftime("%Y%m%d-%H%M%S")
     destination.mkdir(parents=True, exist_ok=True)
-
-    raw_paths = [extract_port(port, destination) for port in ports]
-    raw_rows = []
-    for path in raw_paths:
-        raw_rows.extend(read_survey_log(path))
-
+    raw_rows: list[dict[str, str]] = []
+    for device in devices:
+        _, rows = download_device(device, destination)
+        raw_rows.extend(rows)
     if not raw_rows:
-        raise RuntimeError("the two survey logs contain no rows")
+        raise RuntimeError("the two survey logs contain no valid records")
 
     combined_path = destination / "combined-device-log.csv"
     with open(combined_path, "w", newline="", encoding="utf-8-sig") as handle:

@@ -1,14 +1,20 @@
+import binascii
 import csv
 import io
 import unittest
 
-from mesh_simulator.survey import merge_survey_rows
+from mesh_simulator.survey import (
+    SURVEY_RECORD_MAGIC,
+    SURVEY_RECORD_STRUCT,
+    decode_survey_records,
+    merge_survey_rows,
+)
 
 
 HEADER = (
     "schema,role,event,session_id,sequence,epoch_s,uptime_ms,node_num,peer_num,local_gps_lock,local_latitude_i,"
-    "local_longitude_i,local_altitude_m,local_pdop_centi,local_satellites,remote_gps_lock,remote_latitude_i,"
-    "remote_longitude_i,remote_altitude_m,remote_pdop_centi,remote_satellites,local_rx_valid,local_rx_rssi_dbm,"
+    "local_longitude_i,local_altitude_m,local_hdop_centi,local_satellites,remote_gps_lock,remote_latitude_i,"
+    "remote_longitude_i,remote_altitude_m,remote_hdop_centi,remote_satellites,local_rx_valid,local_rx_rssi_dbm,"
     "local_rx_snr_centi_db,remote_rx_valid,remote_rx_rssi_dbm,remote_rx_snr_centi_db,packet_id,"
     "channel_utilization_centi_pct,tx_utilization_centi_pct,region,modem_preset,frequency_hz,tx_power_dbm"
 )
@@ -55,6 +61,61 @@ def row(role: str, event: str, node: int, peer: int, local_rssi: int = 0, local_
 
 
 class SurveyMergeTests(unittest.TestCase):
+    def test_standalone_binary_record_crc_and_fields_decode(self):
+        values = [
+            SURVEY_RECORD_MAGIC,
+            1,
+            1,
+            4,
+            0x0F,
+            42,
+            7,
+            1_700_000_000,
+            1234,
+            0x11111111,
+            0x22222222,
+            401234567,
+            -751234567,
+            1000,
+            125,
+            9,
+            0,
+            402000000,
+            -752000000,
+            2000,
+            150,
+            8,
+            0,
+            -97,
+            125,
+            -103,
+            -175,
+            99,
+            906875000,
+            250,
+            11,
+            5,
+            22,
+            bytes(31),
+            0,
+        ]
+        encoded = SURVEY_RECORD_STRUCT.pack(*values)
+        values[-1] = binascii.crc32(encoded[:-4]) & 0xFFFFFFFF
+        encoded = SURVEY_RECORD_STRUCT.pack(*values)
+        rows, invalid = decode_survey_records(encoded)
+
+        self.assertEqual(invalid, 0)
+        self.assertEqual(rows[0]["role"], "mobile")
+        self.assertEqual(rows[0]["event"], "REPLY_RX")
+        self.assertEqual(rows[0]["local_rx_rssi_dbm"], "-97")
+        self.assertEqual(rows[0]["remote_rx_snr_centi_db"], "-175")
+
+        damaged = bytearray(encoded)
+        damaged[40] ^= 0x01
+        rows, invalid = decode_survey_records(bytes(damaged))
+        self.assertEqual(rows, [])
+        self.assertEqual(invalid, 1)
+
     def test_base_boot_row_identifies_total_forward_packet_loss(self):
         sent = row("mobile", "SEND", 0x11111111, 0)
         base_boot = row("base", "BOOT", 0x22222222, 0)

@@ -1,11 +1,26 @@
 from __future__ import annotations
 
+import binascii
 import csv
+import struct
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
 SURVEY_SCHEMA = "1"
+SURVEY_RECORD_MAGIC = 0x3152464D
+SURVEY_RECORD_SIZE = 128
+SURVEY_RECORD_STRUCT = struct.Struct("<IBBBBIIIIQQiiiHBBiiiHBBhhhhIIHBBb31sI")
+SURVEY_ROLES = {1: "mobile", 2: "base"}
+SURVEY_EVENTS = {
+    0: "BOOT",
+    1: "SEND",
+    2: "PROBE_RX",
+    3: "REPLY_TX",
+    4: "REPLY_RX",
+    5: "TIMEOUT",
+    6: "STORAGE_FULL",
+}
 SURVEY_REQUIRED_FIELDS = {
     "schema",
     "role",
@@ -21,6 +36,8 @@ SURVEY_REQUIRED_FIELDS = {
     "remote_gps_lock",
     "remote_latitude_i",
     "remote_longitude_i",
+    "local_hdop_centi",
+    "remote_hdop_centi",
     "local_rx_valid",
     "local_rx_rssi_dbm",
     "local_rx_snr_centi_db",
@@ -32,6 +49,108 @@ SURVEY_REQUIRED_FIELDS = {
 
 class SurveyLogError(ValueError):
     pass
+
+
+def decode_survey_records(data: bytes) -> tuple[list[dict[str, str]], int]:
+    if len(data) % SURVEY_RECORD_SIZE:
+        raise SurveyLogError(
+            f"survey dump is {len(data)} bytes; expected a multiple of {SURVEY_RECORD_SIZE}"
+        )
+
+    rows: list[dict[str, str]] = []
+    invalid = 0
+    for offset in range(0, len(data), SURVEY_RECORD_SIZE):
+        raw = data[offset : offset + SURVEY_RECORD_SIZE]
+        values = SURVEY_RECORD_STRUCT.unpack(raw)
+        if values[0] != SURVEY_RECORD_MAGIC or values[1] != 1:
+            invalid += 1
+            continue
+        if (binascii.crc32(raw[:-4]) & 0xFFFFFFFF) != values[-1]:
+            invalid += 1
+            continue
+
+        (
+            _,
+            _,
+            role,
+            event,
+            flags,
+            session_id,
+            sequence,
+            epoch_s,
+            uptime_ms,
+            node_num,
+            peer_num,
+            local_latitude_i,
+            local_longitude_i,
+            local_altitude_cm,
+            local_hdop_centi,
+            local_satellites,
+            _,
+            remote_latitude_i,
+            remote_longitude_i,
+            remote_altitude_cm,
+            remote_hdop_centi,
+            remote_satellites,
+            _,
+            local_rssi_dbm,
+            local_snr_centi_db,
+            remote_rssi_dbm,
+            remote_snr_centi_db,
+            packet_id,
+            frequency_hz,
+            bandwidth_khz,
+            spreading_factor,
+            coding_rate,
+            tx_power_dbm,
+            _,
+            _,
+        ) = values
+        if role not in SURVEY_ROLES or event not in SURVEY_EVENTS:
+            invalid += 1
+            continue
+        rows.append(
+            {
+                "schema": SURVEY_SCHEMA,
+                "role": SURVEY_ROLES[role],
+                "event": SURVEY_EVENTS[event],
+                "session_id": str(session_id),
+                "sequence": str(sequence),
+                "epoch_s": str(epoch_s),
+                "uptime_ms": str(uptime_ms),
+                "node_num": str(node_num),
+                "peer_num": str(peer_num),
+                "local_gps_lock": str(int(bool(flags & 0x01))),
+                "local_latitude_i": str(local_latitude_i),
+                "local_longitude_i": str(local_longitude_i),
+                "local_altitude_m": str(round(local_altitude_cm / 100)),
+                "local_hdop_centi": str(local_hdop_centi),
+                "local_satellites": str(local_satellites),
+                "remote_gps_lock": str(int(bool(flags & 0x02))),
+                "remote_latitude_i": str(remote_latitude_i),
+                "remote_longitude_i": str(remote_longitude_i),
+                "remote_altitude_m": str(round(remote_altitude_cm / 100)),
+                "remote_hdop_centi": str(remote_hdop_centi),
+                "remote_satellites": str(remote_satellites),
+                "local_rx_valid": str(int(bool(flags & 0x04))),
+                "local_rx_rssi_dbm": str(local_rssi_dbm),
+                "local_rx_snr_centi_db": str(local_snr_centi_db),
+                "remote_rx_valid": str(int(bool(flags & 0x08))),
+                "remote_rx_rssi_dbm": str(remote_rssi_dbm),
+                "remote_rx_snr_centi_db": str(remote_snr_centi_db),
+                "packet_id": str(packet_id),
+                "channel_utilization_centi_pct": "0",
+                "tx_utilization_centi_pct": "0",
+                "region": "1",
+                "modem_preset": "0",
+                "frequency_hz": str(frequency_hz),
+                "tx_power_dbm": str(tx_power_dbm),
+                "bandwidth_khz": str(bandwidth_khz),
+                "spreading_factor": str(spreading_factor),
+                "coding_rate": str(coding_rate),
+            }
+        )
+    return rows, invalid
 
 
 def read_survey_log(path: str | Path) -> list[dict[str, str]]:
@@ -114,7 +233,7 @@ def merge_survey_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, object]]
                 "mobile_latitude": _gps_degrees(send, "local", "latitude"),
                 "mobile_longitude": _gps_degrees(send, "local", "longitude"),
                 "mobile_altitude_m": _integer(send, "local_altitude_m"),
-                "mobile_pdop": _integer(send, "local_pdop_centi") / 100.0,
+                "mobile_hdop": _integer(send, "local_hdop_centi") / 100.0,
                 "mobile_satellites": _integer(send, "local_satellites"),
                 "base_latitude": _gps_degrees(base_source, "remote" if base_source is mobile_reply else "local", "latitude"),
                 "base_longitude": _gps_degrees(base_source, "remote" if base_source is mobile_reply else "local", "longitude"),
@@ -124,8 +243,8 @@ def merge_survey_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, object]]
                 "base_altitude_m": _integer(
                     base_source, "remote_altitude_m" if base_source is mobile_reply else "local_altitude_m"
                 ),
-                "base_pdop": _integer(
-                    base_source, "remote_pdop_centi" if base_source is mobile_reply else "local_pdop_centi"
+                "base_hdop": _integer(
+                    base_source, "remote_hdop_centi" if base_source is mobile_reply else "local_hdop_centi"
                 )
                 / 100.0,
                 "base_satellites": _integer(
