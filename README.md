@@ -65,6 +65,8 @@ The connection is read-only. It does not transmit packets or change radio settin
 
 Results depend on terrain and map quality, actual radio power, antennas, cable loss, local noise, building materials, foliage, and the selected path-loss settings. Verify important placements with real measurements.
 
+For local building-loss calibration with two Heltec T114 radios, use the paired [T114 field survey](docs/FIELD_SURVEY.md). Both the walking and fixed radios retain logs for later USB extraction, including bidirectional RSSI/SNR and packet loss.
+
 Technical details:
 
 - [Firmware and RF model](docs/FIRMWARE_MODEL.md)
