@@ -14,6 +14,8 @@ constexpr float SURVEY_TCXO_VOLTAGE = 1.8F;
 
 constexpr uint32_t SURVEY_SEND_INTERVAL_MS = 5000;
 constexpr uint32_t SURVEY_REPLY_TIMEOUT_MS = 12000;
+constexpr uint32_t BASE_PACKET_SCREEN_HOLD_MS = 10000;
+constexpr uint32_t BASE_STATUS_REFRESH_MS = 10000;
 
 constexpr uint8_t LORA_CS = 24;
 constexpr uint8_t LORA_DIO1 = 20;

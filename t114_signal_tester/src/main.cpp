@@ -45,6 +45,9 @@ uint32_t sessionId = 0;
 uint32_t nextSequence = 0;
 uint32_t lastSendMs = 0;
 uint32_t lastGpsNoticeMs = 0;
+#else
+uint32_t lastBasePacketMs = 0;
+uint32_t lastBaseStatusMs = 0;
 #endif
 
 struct PendingProbe {
@@ -247,6 +250,16 @@ SurveyPosition currentPosition()
     return position;
 }
 
+void formatCoordinates(char *output, size_t outputSize, const SurveyPosition &position)
+{
+    if (!position.valid) {
+        snprintf(output, outputSize, "GPS NO LOCK");
+        return;
+    }
+    snprintf(output, outputSize, "GPS %.6f, %.6f", position.latitudeE7 / 10000000.0,
+             position.longitudeE7 / 10000000.0);
+}
+
 void fillPosition(SurveyRecord &record, const SurveyPosition &local, const SurveyPosition &remote)
 {
     record.localLatitudeE7 = local.latitudeE7;
@@ -393,11 +406,14 @@ void handleProbe(const ProbePacket &probe, int16_t rssi, int16_t snrCenti)
     char first[32];
     char second[32];
     char third[40];
-    snprintf(first, sizeof(first), "Probe #%lu RX", static_cast<unsigned long>(probe.sequence));
-    snprintf(second, sizeof(second), "%d dBm / %.2f dB", rssi, snrCenti / 100.0F);
-    snprintf(third, sizeof(third), "%s | base GPS %s", state == RADIOLIB_ERR_NONE ? "Reply sent" : "REPLY FAILED",
-             local.valid ? "OK" : "NO LOCK");
+    snprintf(first, sizeof(first), "#%lu RX %d dBm", static_cast<unsigned long>(probe.sequence), rssi);
+    snprintf(second, sizeof(second), "SNR %.2f %s", snrCenti / 100.0F,
+             state == RADIOLIB_ERR_NONE ? "REPLY OK" : "FAIL");
+    formatCoordinates(third, sizeof(third), local);
     showScreen("PACKET RECEIVED", first, second, third);
+#if defined(SURVEY_ROLE_BASE)
+    lastBasePacketMs = millis();
+#endif
 }
 
 void handleReply(const ReplyPacket &reply, int16_t reverseRssi, int16_t reverseSnrCenti)
@@ -622,6 +638,22 @@ void loop()
         static_cast<uint32_t>(millis() - lastGpsNoticeMs) >= 10000) {
         lastGpsNoticeMs = millis();
         showScreen("WAITING FOR GPS", "No location lock", "Move into open sky");
+    }
+#else
+    const uint32_t now = millis();
+    if (static_cast<uint32_t>(now - lastBaseStatusMs) >= BASE_STATUS_REFRESH_MS &&
+        (!lastBasePacketMs || static_cast<uint32_t>(now - lastBasePacketMs) >= BASE_PACKET_SCREEN_HOLD_MS)) {
+        lastBaseStatusMs = now;
+        const SurveyPosition position = currentPosition();
+        char quality[32];
+        char coordinates[40];
+        if (position.valid)
+            snprintf(quality, sizeof(quality), "%u sat HDOP %.2f", position.satellites,
+                     position.hdopCenti / 100.0F);
+        else
+            snprintf(quality, sizeof(quality), "GPS has no lock");
+        formatCoordinates(coordinates, sizeof(coordinates), position);
+        showScreen(position.valid ? "BASE GPS LOCK" : "BASE READY", "Listening for probes", quality, coordinates);
     }
 #endif
     delay(2);
