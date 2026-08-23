@@ -4,6 +4,10 @@ MeshLab RF is an unreleased Windows desktop tool for planning Meshtastic network
 
 Use it to explore coverage, find likely dead spots, compare node locations and heights, and understand how hop limits and node roles affect a mesh. It is a planning aid, not a replacement for an RF site survey.
 
+## Heltec T114 signal tester firmware
+
+The complete editable C++ firmware is in [`t114_signal_tester/`](t114_signal_tester/), not in `artifacts/`. Follow [Build and modify the Heltec T114 signal tester](BUILD_T114_FIRMWARE.md) to change its radio settings or behavior and compile the mobile and base UF2 files yourself.
+
 ## Run it
 
 Open [MeshLabRF.exe](dist/MeshLabRF.exe).
