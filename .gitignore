@@ -5,4 +5,6 @@ build/
 dist/
 *.spec
 survey-data/
-artifacts/
+artifacts/*
+!artifacts/t114-signal-tester/
+!artifacts/t114-signal-tester/*.uf2
