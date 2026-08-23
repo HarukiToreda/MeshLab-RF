@@ -27,6 +27,9 @@ constexpr uint8_t TFT_SCK = 40;
 constexpr uint8_t TFT_RESET = 2;
 constexpr uint8_t TFT_POWER = 3;
 constexpr uint8_t TFT_BACKLIGHT = 15;
+// Landscape orientation with the USB/controls at the expected bottom edge.
+// Use 1 to rotate the display back by 180 degrees.
+constexpr uint8_t TFT_ROTATION = 3;
 
 constexpr uint8_t GPS_CPU_RX = 39;
 constexpr uint8_t GPS_CPU_TX = 37;

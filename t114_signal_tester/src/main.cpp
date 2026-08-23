@@ -546,7 +546,7 @@ void setupDisplay()
     delay(50);
     SPI1.setPins(255, TFT_SCK, TFT_MOSI);
     display.init(135, 240);
-    display.setRotation(1);
+    display.setRotation(TFT_ROTATION);
     display.invertDisplay(true);
     showScreen("MESHLAB RF", "Starting...", ROLE_NAME);
 }
