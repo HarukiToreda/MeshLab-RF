@@ -7,6 +7,9 @@ from PIL import Image
 from shapely.geometry import MultiPolygon, Polygon
 
 from mesh_simulator.model import (
+    BeaconProfile,
+    BeaconRadialSample,
+    BeaconRay,
     Environment,
     MIN_DECODE_MARGIN_DB,
     Node,
@@ -129,6 +132,122 @@ class ModelTests(unittest.TestCase):
         )
 
         self.assertEqual(app.canvas.coordinates, [(17, 0, 0)])
+
+    def test_wheel_events_coalesce_expensive_zoom_previews(self):
+        class Root:
+            def __init__(self) -> None:
+                self.callbacks: list[tuple[int, object]] = []
+
+            def after(self, delay: int, callback):
+                token = f"after-{len(self.callbacks)}"
+                self.callbacks.append((delay, callback))
+                return token
+
+            @staticmethod
+            def after_cancel(_token: str) -> None:
+                return None
+
+        class Canvas:
+            @staticmethod
+            def scale(*_args: object) -> None:
+                return None
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.root = Root()
+        app.canvas = Canvas()
+        app.zoom = 1.0
+        app.view_x = 0.0
+        app.view_y = 0.0
+        app.zoom_preview_after = None
+        app.zoom_render_after = None
+        app.render_after = None
+        app.beacon_profile = None
+        app.screen_to_world = lambda x, y: (
+            app.view_x + x / app.zoom,
+            app.view_y + y / app.zoom,
+        )
+        event = type("WheelEvent", (), {"x": 500, "y": 300, "delta": 120})()
+
+        app._canvas_wheel(event)
+        app._canvas_wheel(event)
+
+        preview_callbacks = [
+            callback
+            for delay, callback in app.root.callbacks
+            if delay == 16 and callback == app._render_zoom_preview
+        ]
+        self.assertEqual(len(preview_callbacks), 1)
+
+    def test_active_beacon_zoom_refreshes_preview_without_anchor_delay(self):
+        class Root:
+            def __init__(self) -> None:
+                self.callbacks: list[tuple[int, object]] = []
+
+            def after(self, delay: int, callback):
+                token = f"after-{len(self.callbacks)}"
+                self.callbacks.append((delay, callback))
+                return token
+
+            @staticmethod
+            def after_cancel(_token: str) -> None:
+                return None
+
+        class Canvas:
+            @staticmethod
+            def scale(*_args: object) -> None:
+                return None
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.root = Root()
+        app.canvas = Canvas()
+        app.zoom = 1.0
+        app.view_x = 0.0
+        app.view_y = 0.0
+        app.zoom_preview_after = None
+        app.zoom_render_after = None
+        app.render_after = None
+        app.beacon_profile = object()
+        app.screen_to_world = lambda x, y: (
+            app.view_x + x / app.zoom,
+            app.view_y + y / app.zoom,
+        )
+        preview_calls: list[str] = []
+        app._render_zoom_preview = lambda: preview_calls.append("preview")
+        event = type("WheelEvent", (), {"x": 500, "y": 300, "delta": 120})()
+
+        app._canvas_wheel(event)
+
+        self.assertEqual(preview_calls, ["preview"])
+        self.assertFalse(any(delay == 16 for delay, _callback in app.root.callbacks))
+
+    def test_segmented_beacon_warnings_do_not_create_canvas_obstacle_items(self):
+        rays = [
+            BeaconRay(
+                angle=angle,
+                reach_m=100.0,
+                clear_reach_m=100.0,
+                kind="clear",
+                samples=[
+                    BeaconRadialSample(0.0, 20.0, True),
+                    BeaconRadialSample(100.0, 5.0, True),
+                ],
+            )
+            for angle in (0.0, 2.1, 4.2)
+        ]
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.beacon_profile = BeaconProfile("source", 0.0, 0.0, rays)
+        app.beacon_phase = 0.5
+        app.beacon_weakening_obstacles = [Obstacle(kind="Building")]
+        app.beacon_blocking_obstacles = [Obstacle(kind="Building")]
+        app._draw_segmented_coverage = lambda *_args, **_kwargs: True
+        canvas_warning_calls: list[Obstacle] = []
+        app._draw_beacon_obstacle = lambda _canvas, obstacle, *_args, **_kwargs: (
+            canvas_warning_calls.append(obstacle)
+        )
+
+        app._draw_beacon(object(), draw_animation=False)
+
+        self.assertEqual(canvas_warning_calls, [])
 
     def test_scene_change_restarts_beacon_like_a_fresh_drop(self):
         app = MeshSimulatorApp.__new__(MeshSimulatorApp)

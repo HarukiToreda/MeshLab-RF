@@ -721,6 +721,7 @@ class MeshSimulatorApp:
         self.sidebar_visible = False
         self.render_after: str | None = None
         self.zoom_render_after: str | None = None
+        self.zoom_preview_after: str | None = None
         self.zoom_composite_source: Image.Image | None = None
         self.zoom_composite_source_key: tuple[int, int] | None = None
         self.zoom_preview_composite_active = False
@@ -4895,6 +4896,12 @@ class MeshSimulatorApp:
             return
         self.beacon_phase = (self.beacon_phase + 0.045) % 1.0
         if hasattr(self, "canvas"):
+            # Wheel input already scales the existing pulse. Avoid rebuilding and
+            # retagging animation items while a coalesced zoom preview is pending;
+            # the normal 45 ms cadence resumes as soon as zoom settles.
+            if self.zoom_render_after is not None or self.zoom_preview_after is not None:
+                self.beacon_after = self.root.after(45, self._beacon_tick)
+                return
             c = self.canvas
             if not c.find_withtag(BEACON_STATIC_TAG):
                 static_start = len(c.find_all())
@@ -5158,6 +5165,27 @@ class MeshSimulatorApp:
                 drawing.line((first, second), fill=(5, 8, 13, 255), width=6)
                 drawing.line((first, second), fill=(255, 255, 255, 255), width=2)
 
+            # Warning footprints used to be individual Tk canvas polygons. Dense
+            # imports could add thousands of animated-layer items, making every
+            # wheel scale and beacon tag_raise proportional to building count.
+            # Paint the identical yellow/red overlay into the cached coverage
+            # bitmap so zoom and pulse animation remain constant-time.
+            if cache_prefix == "beacon":
+                weakening = self.beacon_weakening_obstacles
+                blocking = self.beacon_blocking_obstacles
+            elif grow >= 0.999:
+                weakening = self.static_coverage_weakening
+                blocking = self.static_coverage_blocking
+            else:
+                weakening = []
+                blocking = []
+            self._draw_segmented_warning_obstacles(
+                layer,
+                weakening,
+                blocking,
+                render_scale=render_scale,
+            )
+
             layer = layer.resize((width, height), Image.Resampling.LANCZOS)
             setattr(self, f"{cache_prefix}_segment_source", layer)
             photo = ImageTk.PhotoImage(layer)
@@ -5171,6 +5199,72 @@ class MeshSimulatorApp:
             tags=(f"{cache_prefix}-segment-image",),
         )
         return True
+
+    def _draw_segmented_warning_obstacles(
+        self,
+        layer: Image.Image,
+        weakening: list[Obstacle],
+        blocking: list[Obstacle],
+        *,
+        render_scale: int,
+    ) -> None:
+        """Rasterize beacon warning footprints without creating canvas objects."""
+        if not weakening and not blocking:
+            return
+        scale = self._base_scale() * self.zoom * render_scale
+        view_x = self.view_x
+        view_y = self.view_y
+        viewport = (
+            view_x,
+            view_y,
+            view_x + layer.width / max(scale, 1e-12),
+            view_y + layer.height / max(scale, 1e-12),
+        )
+        overlay = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+        drawing = ImageDraw.Draw(overlay, "RGBA")
+
+        def point(world_x: float, world_y: float) -> tuple[float, float]:
+            return ((world_x - view_x) * scale, (world_y - view_y) * scale)
+
+        def draw_obstacle(obstacle: Obstacle, color: str) -> None:
+            if not self._bounds_overlap(self._obstacle_bounds(obstacle), viewport):
+                return
+            red, green, blue = ImageColor.getrgb(color)
+            fill = (red, green, blue, 128)
+            outline = (red, green, blue, 255)
+            line_width = max(1, 2 * render_scale)
+            if obstacle.shape == "polygon" and len(obstacle.points) >= 3:
+                drawing.polygon(
+                    [point(x, y) for x, y in obstacle.points],
+                    fill=fill,
+                    outline=outline,
+                    width=line_width,
+                )
+                return
+            if obstacle.shape == "brush" and obstacle.points:
+                coordinates = [point(x, y) for x, y in obstacle.points]
+                if len(coordinates) == 1:
+                    coordinates.append(coordinates[0])
+                drawing.line(
+                    coordinates,
+                    fill=fill,
+                    width=max(6 * render_scale, round(obstacle.brush_radius_m * 2 * scale)),
+                    joint="curve",
+                )
+                return
+            x_min, y_min, x_max, y_max = obstacle.normalized()
+            drawing.rectangle(
+                (*point(x_min, y_min), *point(x_max, y_max)),
+                fill=fill,
+                outline=outline,
+                width=line_width,
+            )
+
+        for obstacle in weakening:
+            draw_obstacle(obstacle, self._BEACON_SLOW)
+        for obstacle in blocking:
+            draw_obstacle(obstacle, self._BEACON_BLOCK)
+        layer.alpha_composite(overlay)
 
     def _draw_segmented_ripple(
         self,
@@ -5267,11 +5361,6 @@ class MeshSimulatorApp:
         if grow <= 0.01:
             return
         if self._draw_segmented_coverage(c, profile, cache_prefix="static", grow=grow):
-            if grow >= 0.999:
-                for obstacle in self.static_coverage_weakening:
-                    self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
-                for obstacle in self.static_coverage_blocking:
-                    self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
             return
         w2s = self.world_to_screen
         ox, oy = profile.x, profile.y
@@ -5551,6 +5640,12 @@ class MeshSimulatorApp:
             except tk.TclError:
                 pass
             self.zoom_render_after = None
+        if self.zoom_preview_after is not None:
+            try:
+                self.root.after_cancel(self.zoom_preview_after)
+            except tk.TclError:
+                pass
+            self.zoom_preview_after = None
         self.zoom_preview_composite_active = False
         self.zoom_preview_active_tags.clear()
         self._world_screen_transform = None
@@ -6852,10 +6947,6 @@ class MeshSimulatorApp:
         if segmented:
             if draw_static:
                 self._draw_segmented_coverage(c, profile, cache_prefix="beacon")
-                for obstacle in self.beacon_weakening_obstacles:
-                    self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
-                for obstacle in self.beacon_blocking_obstacles:
-                    self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
             if draw_animation and phase > 0.02:
                 self._draw_segmented_ripple(c, profile, phase)
             if draw_animation:
@@ -7465,24 +7556,20 @@ class MeshSimulatorApp:
 
     def _finish_zoom_render(self) -> None:
         self.zoom_render_after = None
+        if self.zoom_preview_after is not None:
+            try:
+                self.root.after_cancel(self.zoom_preview_after)
+            except tk.TclError:
+                pass
+            self.zoom_preview_after = None
         self.zoom_preview_composite_active = False
         self.render_canvas()
 
-    def _canvas_wheel(self, event: tk.Event) -> None:
-        before = self.screen_to_world(event.x, event.y)
-        factor = 1.15 if event.delta > 0 else 1 / 1.15
-        previous_zoom = self.zoom
-        self.zoom = clamp(previous_zoom * factor, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM)
-        applied_factor = self.zoom / max(previous_zoom, 1e-12)
-        if abs(applied_factor - 1.0) < 1e-12:
-            return
-        after = self.screen_to_world(event.x, event.y)
-        self.view_x += before[0] - after[0]
-        self.view_y += before[1] - after[1]
+    def _render_zoom_preview(self) -> None:
+        """Render one preview for the latest wheel state, capped near 60 FPS."""
+        self.zoom_preview_after = None
         if not hasattr(self, "canvas"):
             return
-        self.canvas.scale("all", event.x, event.y, applied_factor, applied_factor)
-        self.canvas.scale(HUD_LAYER_TAG, event.x, event.y, 1.0 / applied_factor, 1.0 / applied_factor)
         if not self._zoom_preview_composite():
             self._zoom_preview_layer(
                 self.obstacle_layer_source,
@@ -7504,6 +7591,36 @@ class MeshSimulatorApp:
             photo_attribute="zoom_static_photo",
             segmented=True,
         )
+
+    def _canvas_wheel(self, event: tk.Event) -> None:
+        before = self.screen_to_world(event.x, event.y)
+        factor = 1.15 if event.delta > 0 else 1 / 1.15
+        previous_zoom = self.zoom
+        self.zoom = clamp(previous_zoom * factor, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM)
+        applied_factor = self.zoom / max(previous_zoom, 1e-12)
+        if abs(applied_factor - 1.0) < 1e-12:
+            return
+        after = self.screen_to_world(event.x, event.y)
+        self.view_x += before[0] - after[0]
+        self.view_y += before[1] - after[1]
+        if not hasattr(self, "canvas"):
+            return
+        self.canvas.scale("all", event.x, event.y, applied_factor, applied_factor)
+        self.canvas.scale(HUD_LAYER_TAG, event.x, event.y, 1.0 / applied_factor, 1.0 / applied_factor)
+        if self.beacon_profile is not None:
+            # Keep the map, cached coverage, ripple, and center marker on the same
+            # transform for every wheel event. Deferring this preview by one frame
+            # made the vector marker appear to drift over the older raster before
+            # snapping back at the final redraw.
+            if self.zoom_preview_after is not None:
+                try:
+                    self.root.after_cancel(self.zoom_preview_after)
+                except tk.TclError:
+                    pass
+                self.zoom_preview_after = None
+            self._render_zoom_preview()
+        elif self.zoom_preview_after is None:
+            self.zoom_preview_after = self.root.after(16, self._render_zoom_preview)
         if self.render_after is not None:
             try:
                 self.root.after_cancel(self.render_after)
