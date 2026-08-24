@@ -339,22 +339,25 @@ class Environment:
     def ground_elevation(self, x: float, y: float) -> float | None:
         """Interpolate loaded ground height independently of the RF terrain toggle."""
         left, top, right, bottom = self.terrain_bounds()
+        columns = self.terrain_columns
+        rows = self.terrain_rows
+        values = self.terrain_values
         if (
-            self.terrain_columns < 2
-            or self.terrain_rows < 2
-            or len(self.terrain_values) != self.terrain_columns * self.terrain_rows
+            columns < 2
+            or rows < 2
+            or len(values) != columns * rows
             or not (left <= x <= right and top <= y <= bottom)
         ):
             return None
-        grid_x = (x - left) / max(1.0, right - left) * (self.terrain_columns - 1)
-        grid_y = (y - top) / max(1.0, bottom - top) * (self.terrain_rows - 1)
+        grid_x = (x - left) / max(1.0, right - left) * (columns - 1)
+        grid_y = (y - top) / max(1.0, bottom - top) * (rows - 1)
         x0, y0 = math.floor(grid_x), math.floor(grid_y)
-        x1, y1 = min(self.terrain_columns - 1, x0 + 1), min(self.terrain_rows - 1, y0 + 1)
+        x1, y1 = min(columns - 1, x0 + 1), min(rows - 1, y0 + 1)
         fx, fy = grid_x - x0, grid_y - y0
-        def value(column: int, row: int) -> float:
-            return self.terrain_values[row * self.terrain_columns + column]
-        top = value(x0, y0) * (1.0 - fx) + value(x1, y0) * fx
-        bottom = value(x0, y1) * (1.0 - fx) + value(x1, y1) * fx
+        top_offset = y0 * columns
+        bottom_offset = y1 * columns
+        top = values[top_offset + x0] * (1.0 - fx) + values[top_offset + x1] * fx
+        bottom = values[bottom_offset + x0] * (1.0 - fx) + values[bottom_offset + x1] * fx
         return top * (1.0 - fy) + bottom * fy
 
     def terrain_elevation(self, x: float, y: float) -> float | None:
@@ -651,14 +654,28 @@ class PropagationModel:
         self._global_obstacle_indices: list[int] = []
         self._obstacle_bounds: dict[int, tuple[float, float, float, float]] = {}
         self._obstacle_polygons: dict[int, list[tuple[float, float]]] = {}
-        for index, obstacle in enumerate(scenario.obstacles):
-            x1, y1, x2, y2 = obstacle.normalized()
+        self._convex_obstacle_ids: set[int] = set()
+        for index, (obstacle, obstacle_bounds) in enumerate(zip(scenario.obstacles, bounds)):
+            x1, y1, x2, y2 = obstacle_bounds
             obstacle_key = id(obstacle)
             self._obstacle_bounds[obstacle_key] = (x1, y1, x2, y2)
             if obstacle.shape == "polygon" and len(obstacle.points) >= 3:
-                self._obstacle_polygons[obstacle_key] = [
+                polygon = [
                     (point[0], point[1]) for point in obstacle.points
                 ]
+                self._obstacle_polygons[obstacle_key] = polygon
+                if self._polygon_is_convex(polygon):
+                    self._convex_obstacle_ids.add(obstacle_key)
+            elif obstacle.kind == "Mountain":
+                self._obstacle_polygons[obstacle_key] = [
+                    ((x1 + x2) / 2.0, y1),
+                    (x2, y2),
+                    (x1, y2),
+                ]
+                self._convex_obstacle_ids.add(obstacle_key)
+            elif obstacle.shape != "brush":
+                # Rectangles and the generated mountain triangle are convex.
+                self._convex_obstacle_ids.add(obstacle_key)
             cell_x1, cell_y1 = math.floor(x1 / self._obstacle_cell_m), math.floor(y1 / self._obstacle_cell_m)
             cell_x2, cell_y2 = math.floor(x2 / self._obstacle_cell_m), math.floor(y2 / self._obstacle_cell_m)
             cell_count = (cell_x2 - cell_x1 + 1) * (cell_y2 - cell_y1 + 1)
@@ -686,6 +703,89 @@ class PropagationModel:
                 for nearby_y in range(cell_y - 1, cell_y + 2):
                     indices.update(self._obstacle_cells.get((nearby_x, nearby_y), ()))
         return [self.scenario.obstacles[index] for index in sorted(indices)]
+
+    @staticmethod
+    def _polygon_is_convex(polygon: list[tuple[float, float]]) -> bool:
+        """Return true only when one intersection interval represents the polygon."""
+        direction = 0
+        count = len(polygon)
+        for index in range(count):
+            ax, ay = polygon[index - 2]
+            bx, by = polygon[index - 1]
+            cx, cy = polygon[index]
+            cross = (bx - ax) * (cy - by) - (by - ay) * (cx - bx)
+            if cross == 0.0:
+                continue
+            current = 1 if cross > 0.0 else -1
+            if direction and current != direction:
+                return False
+            direction = current
+        return bool(direction)
+
+    def _prepare_ray_obstacles(
+        self,
+        source: Node,
+        target: Node,
+        candidates: list[Obstacle],
+    ) -> tuple[list[Obstacle], dict[int, tuple[float, float]]]:
+        """Narrow a full-ray candidate set to obstacles the ray actually crosses.
+
+        Beacon sampling checks many distances along the same angle.  Any obstacle
+        crossed by a shorter sample must also cross the full ray, so this one-time
+        geometric filter is exact.  Convex obstacle entry/exit distances are also
+        reusable at every shorter radial sample; concave polygons and brush strokes
+        retain their existing per-sample intersection calculation.
+        """
+        intersecting: list[Obstacle] = []
+        intervals: dict[int, tuple[float, float]] = {}
+        ray_length = math.hypot(target.x - source.x, target.y - source.y)
+        for obstacle in candidates:
+            if not obstacle.enabled:
+                continue
+            _inside_length, midpoint_t, exit_t = self._obstacle_intersection(
+                obstacle,
+                source,
+                target,
+            )
+            if midpoint_t is not None:
+                intersecting.append(obstacle)
+                obstacle_key = id(obstacle)
+                if obstacle_key in self._convex_obstacle_ids and exit_t is not None:
+                    entry_t = max(0.0, 2.0 * midpoint_t - exit_t)
+                    intervals[obstacle_key] = (ray_length * entry_t, ray_length * exit_t)
+        return intersecting, intervals
+
+    def _intersecting_ray_obstacles(
+        self,
+        source: Node,
+        target: Node,
+        candidates: list[Obstacle],
+    ) -> list[Obstacle]:
+        """Compatibility wrapper returning only full-ray intersecting obstacles."""
+        return self._prepare_ray_obstacles(source, target, candidates)[0]
+
+    def _ray_obstacle_intersection(
+        self,
+        obstacle: Obstacle,
+        source: Node,
+        target: Node,
+        segment_distance: float,
+        ray_intervals: dict[int, tuple[float, float]] | None,
+    ) -> tuple[float, float | None, float | None]:
+        """Reuse an exact convex full-ray interval for a shorter collinear sample."""
+        interval = ray_intervals.get(id(obstacle)) if ray_intervals is not None else None
+        if interval is None:
+            return self._obstacle_intersection(obstacle, source, target)
+        entry_distance, exit_distance = interval
+        if segment_distance < entry_distance:
+            return 0.0, None, None
+        clipped_exit = min(exit_distance, segment_distance)
+        scale_distance = max(1e-12, segment_distance)
+        return (
+            max(0.0, clipped_exit - entry_distance),
+            (entry_distance + clipped_exit) / (2.0 * scale_distance),
+            clipped_exit / scale_distance,
+        )
 
     @staticmethod
     def noise_floor(node: Node) -> float:
@@ -856,9 +956,13 @@ class PropagationModel:
             polygon = self._obstacle_polygons[id(obstacle)]
             return self._segment_polygon_intersection(source.x, source.y, target.x, target.y, polygon)
         if obstacle.kind == "Mountain":
-            x_min, y_min, x_max, y_max = self._obstacle_bounds[id(obstacle)]
-            triangle = [((x_min + x_max) / 2.0, y_min), (x_max, y_max), (x_min, y_max)]
-            return self._segment_polygon_intersection(source.x, source.y, target.x, target.y, triangle)
+            return self._segment_polygon_intersection(
+                source.x,
+                source.y,
+                target.x,
+                target.y,
+                self._obstacle_polygons[id(obstacle)],
+            )
         return self._segment_rect_intersection(
             source.x,
             source.y,
@@ -872,11 +976,15 @@ class PropagationModel:
         source: Node,
         target: Node,
         obstacle_candidates: list[Obstacle] | None = None,
+        ray_intervals: dict[int, tuple[float, float]] | None = None,
     ) -> tuple[float, list[str], str]:
         total = 0.0
         hit_names: list[str] = []
-        planar_distance = max(1.0, math.hypot(target.x - source.x, target.y - source.y))
+        segment_distance = math.hypot(target.x - source.x, target.y - source.y)
+        planar_distance = max(1.0, segment_distance)
         wavelength = self.SPEED_OF_LIGHT / (source.radio.frequency_mhz * 1_000_000.0)
+        source_z = source.antenna_z
+        target_z = target.antenna_z
         candidates = (
             obstacle_candidates
             if obstacle_candidates is not None
@@ -885,10 +993,16 @@ class PropagationModel:
         for obstacle in candidates:
             if not obstacle.enabled:
                 continue
-            inside_length, midpoint_t, exit_t = self._obstacle_intersection(obstacle, source, target)
+            inside_length, midpoint_t, exit_t = self._ray_obstacle_intersection(
+                obstacle,
+                source,
+                target,
+                segment_distance,
+                ray_intervals,
+            )
             if midpoint_t is None:
                 continue
-            los_z = source.antenna_z + (target.antenna_z - source.antenna_z) * midpoint_t
+            los_z = source_z + (target_z - source_z) * midpoint_t
             top_z = obstacle.base_elevation_m + obstacle.height_m
             if los_z > top_z:
                 d1 = planar_distance * midpoint_t
@@ -938,18 +1052,23 @@ class PropagationModel:
             if target_grid_ground is not None and not target.elevation_override
             else 0.0
         )
+        dx = target.x - source.x
+        dy = target.y - source.y
+        source_z = source.antenna_z
+        target_z = target.antenna_z
+        terrain_elevation = environment.terrain_elevation
         for index in range(1, samples):
             t = index / samples
-            x = source.x + (target.x - source.x) * t
-            y = source.y + (target.y - source.y) * t
-            terrain_z = environment.terrain_elevation(x, y)
+            x = source.x + dx * t
+            y = source.y + dy * t
+            terrain_z = terrain_elevation(x, y)
             if terrain_z is None:
                 continue
             # Exact viewport DEM samples can differ slightly from the bounded RF
             # terrain grid. Blend that endpoint offset through the profile so an
             # automatically grounded antenna is never placed below its own terrain.
             terrain_z += source_ground_offset * (1.0 - t) + target_ground_offset * t
-            los_z = source.antenna_z + (target.antenna_z - source.antenna_z) * t
+            los_z = source_z + (target_z - source_z) * t
             if terrain_z >= los_z:
                 return 0.0, f"Topography blocks line of sight at {terrain_z:.0f} m elevation"
             d1 = planar_distance * t
@@ -988,6 +1107,7 @@ class PropagationModel:
         sample_shadowing: bool = False,
         rng: random.Random | None = None,
         obstacle_candidates: list[Obstacle] | None = None,
+        ray_intervals: dict[int, tuple[float, float]] | None = None,
     ) -> LinkResult:
         compatible, reason = self.radios_compatible(source, target)
         horizontal = math.hypot(target.x - source.x, target.y - source.y)
@@ -999,6 +1119,7 @@ class PropagationModel:
             source,
             target,
             obstacle_candidates,
+            ray_intervals,
         )
         terrain_loss, terrain_blocked_reason = self._terrain_effects(source, target)
         obstacle_loss += terrain_loss
@@ -1074,17 +1195,30 @@ class PropagationModel:
         return probe
 
     def _ray_blocking_obstacles(
-        self, source: Node, target: Node, candidates: list[Obstacle]
+        self,
+        source: Node,
+        target: Node,
+        candidates: list[Obstacle],
+        ray_intervals: dict[int, tuple[float, float]] | None = None,
     ) -> list[str]:
         """Obstacle ids whose physical volume intrudes on this beam's line of sight."""
         hits: list[str] = []
+        segment_distance = math.hypot(target.x - source.x, target.y - source.y)
+        source_z = source.antenna_z
+        target_z = target.antenna_z
         for obstacle in candidates:
             if not obstacle.enabled:
                 continue
-            _inside, midpoint_t, _exit_t = self._obstacle_intersection(obstacle, source, target)
+            _inside, midpoint_t, _exit_t = self._ray_obstacle_intersection(
+                obstacle,
+                source,
+                target,
+                segment_distance,
+                ray_intervals,
+            )
             if midpoint_t is None:
                 continue
-            los_z = source.antenna_z + (target.antenna_z - source.antenna_z) * midpoint_t
+            los_z = source_z + (target_z - source_z) * midpoint_t
             top_z = obstacle.base_elevation_m + obstacle.height_m
             # Count it as a culprit when the beam grazes into the Fresnel zone,
             # not only on a dead-centre hit, so weakened edges light up too.
@@ -1136,7 +1270,12 @@ class PropagationModel:
 
         def sample(dx: float, dy: float, distance: float) -> LinkResult:
             position(dx, dy, distance)
-            return self.link(source, probe, obstacle_candidates=ray_obstacles)
+            return self.link(
+                source,
+                probe,
+                obstacle_candidates=ray_obstacles,
+                ray_intervals=ray_intervals,
+            )
 
         rays: list[BeaconRay] = []
         blocking: list[str] = []
@@ -1147,7 +1286,11 @@ class PropagationModel:
             dx, dy = math.cos(angle), math.sin(angle)
             probe.x = source.x + dx * maximum_range
             probe.y = source.y + dy * maximum_range
-            ray_obstacles = self._candidate_obstacles(source, probe)
+            ray_obstacles, ray_intervals = self._prepare_ray_obstacles(
+                source,
+                probe,
+                self._candidate_obstacles(source, probe),
+            )
 
             far_link = sample(dx, dy, maximum_range)
             if far_link.compatible and far_link.margin_db >= MIN_DECODE_MARGIN_DB:
@@ -1175,7 +1318,12 @@ class PropagationModel:
             # edge is caught -- never buildings sitting out beyond the coverage.
             attribution = min(maximum_range, reach + 60.0)
             position(dx, dy, attribution)
-            obstacle_ids = self._ray_blocking_obstacles(source, probe, ray_obstacles)
+            obstacle_ids = self._ray_blocking_obstacles(
+                source,
+                probe,
+                ray_obstacles,
+                ray_intervals,
+            )
 
             if hard_blocked:
                 kind = "blocked"

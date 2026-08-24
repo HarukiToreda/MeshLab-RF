@@ -208,6 +208,7 @@ class LiveMeshEngine:
         self.rng = random.Random(scenario.environment.seed ^ 0x4C495645)
         self.nodes = {node.id: node for node in scenario.nodes if node.online}
         self._links_by_source: dict[str, list[tuple[Node, LinkResult]]] = {}
+        self._links_by_target: dict[str, dict[str, tuple[Node, LinkResult]]] = {}
         self._channel = _RollingChannel()
         self._active_receptions: dict[str, list[_Reception]] = {node_id: [] for node_id in self.nodes}
         self._events: list[tuple[float, int, str, Any]] = []
@@ -403,13 +404,14 @@ class LiveMeshEngine:
                 if link.compatible and link.margin_db >= MIN_DECODE_MARGIN_DB:
                     neighbors.append((target, link))
             self._links_by_source[source.id] = neighbors
+            self._links_by_target[source.id] = {
+                target.id: (target, link) for target, link in neighbors
+            }
         return True
 
     def _cached_link(self, source_id: str, target_id: str) -> LinkResult | None:
-        for target, link in self._links_by_source.get(source_id, ()):
-            if target.id == target_id:
-                return link
-        return None
+        cached = self._links_by_target.get(source_id, {}).get(target_id)
+        return cached[1] if cached is not None else None
 
     def _valid_directed_route(self, packet: PacketConfig, route: list[str]) -> bool:
         if (
@@ -698,35 +700,41 @@ class LiveMeshEngine:
             if next_index >= len(task.packet.directed_route):
                 return
             next_hop_id = task.packet.directed_route[next_index]
-            receivers = tuple(
-                (receiver, link)
-                for receiver, link in receivers
-                if receiver.id == next_hop_id
-            )
-            if not receivers:
+            next_hop = self._links_by_target.get(transmitter.id, {}).get(next_hop_id)
+            if next_hop is None:
                 self._fallback_directed_test(
                     time_ms,
                     task.packet,
                     "stored next hop is no longer RF-compatible; retrying with managed discovery",
                 )
                 return
+            receivers = (next_hop,)
 
+        stochastic = self.scenario.environment.stochastic
+        shadowing_sigma_db = self.scenario.environment.shadowing_sigma_db
+        capture_threshold_db = self.scenario.environment.capture_threshold_db
         for receiver, link in receivers:
             heard_utilization = self._channel.add(receiver.id, time_ms, airtime)
-            self._record_peak(time_ms, heard_utilization)
+            self._result.peak_channel_utilization = max(
+                self._result.peak_channel_utilization, heard_utilization
+            )
+            frame.peak_channel_utilization = max(
+                frame.peak_channel_utilization, heard_utilization
+            )
             shadow = (
-                self.rng.gauss(0.0, self.scenario.environment.shadowing_sigma_db)
-                if self.scenario.environment.stochastic
+                self.rng.gauss(0.0, shadowing_sigma_db)
+                if stochastic
                 else 0.0
             )
             event_margin = link.margin_db + shadow
-            event_probability = 1.0 / (1.0 + math.exp(-max(-40.0, min(40.0, event_margin)) / 2.0))
             success = link.compatible and event_margin >= MIN_DECODE_MARGIN_DB
-            if self.scenario.environment.stochastic:
+            if stochastic:
+                event_probability = 1.0 / (
+                    1.0 + math.exp(-max(-40.0, min(40.0, event_margin)) / 2.0)
+                )
                 success = success and self.rng.random() <= event_probability
             if not success:
                 self._result.dropped += 1
-                frame = self._frame(time_ms)
                 frame.drop_count += 1
                 frame.traffic_drops[kind] = frame.traffic_drops.get(kind, 0) + 1
                 if task.packet.test_id is not None:
@@ -768,11 +776,10 @@ class LiveMeshEngine:
             active[:] = [old for old in active if old.end_ms > time_ms]
             for old in active:
                 difference = old.rssi_dbm - reception.rssi_dbm
-                threshold = self.scenario.environment.capture_threshold_db
-                if abs(difference) < threshold:
+                if abs(difference) < capture_threshold_db:
                     old.collided = True
                     reception.collided = True
-                elif difference >= threshold:
+                elif difference >= capture_threshold_db:
                     reception.collided = True
                 else:
                     old.collided = True
@@ -782,7 +789,7 @@ class LiveMeshEngine:
         if task.packet.test_id is not None and not task.packet.directed_route:
             # Explain viable-but-not-cached links too. This is intentionally only
             # done for a user test, never for routine traffic.
-            cached = {node.id for node, _link in self._links_by_source.get(transmitter.id, ())}
+            cached = self._links_by_target.get(transmitter.id, {})
             for receiver in self.nodes.values():
                 if receiver.id == transmitter.id or receiver.id in cached:
                     continue

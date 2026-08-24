@@ -11,6 +11,7 @@ import random
 import threading
 import time
 import tkinter as tk
+from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
@@ -111,12 +112,15 @@ PACKET_LAYER_TAG = "packet-layer"
 NODE_LAYER_TAG = "node-layer"
 CURRENT_WAVE_TAG = "current-wave"
 BEACON_TAG = "beacon-pulse"
+BEACON_STATIC_TAG = "beacon-static"
+BEACON_ANIMATION_TAG = "beacon-animation"
 STATIC_COVERAGE_TAG = "static-coverage"
 # How many obstacle-import tiles to fetch at once.  Each tile already fans its
 # own cells across a small thread pool, so this multiplies overall throughput
 # without overwhelming the Overture endpoint.
 TILE_IMPORT_CONCURRENCY = 3
 HUD_LAYER_TAG = "hud-layer"
+GEOGRAPHIC_LAYER_TAG = "geographic-layer"
 SELECTED_OBSTACLE_TAG = "selected-obstacle"
 SURVEY_LAYER_TAG = "survey-layer"
 SURVEY_PORT_NONE = "— Not selected —"
@@ -687,6 +691,7 @@ class MeshSimulatorApp:
         self.beacon_profile: BeaconProfile | None = None
         self.beacon_segment_photo: ImageTk.PhotoImage | None = None
         self.beacon_segment_photo_key: tuple[object, ...] | None = None
+        self.beacon_segment_source: Image.Image | None = None
         self.beacon_after: str | None = None
         self.beacon_phase = 0.0
         self.beacon_request_id = 0
@@ -712,6 +717,20 @@ class MeshSimulatorApp:
         self.animation_frame_count = 1
         self.sidebar_visible = False
         self.render_after: str | None = None
+        self.zoom_render_after: str | None = None
+        self.zoom_composite_source: Image.Image | None = None
+        self.zoom_composite_source_key: tuple[int, int] | None = None
+        self.zoom_preview_composite_active = False
+        self.zoom_geographic_photo: ImageTk.PhotoImage | None = None
+        self.zoom_beacon_photo: ImageTk.PhotoImage | None = None
+        self.zoom_static_photo: ImageTk.PhotoImage | None = None
+        self.zoom_composite_photo: ImageTk.PhotoImage | None = None
+        self.zoom_preview_active_tags: set[str] = set()
+        self._world_screen_transform: tuple[float, float, float, float] | None = None
+        self._beacon_ripple_profile_id: int | None = None
+        self._beacon_ripple_geometry: list[
+            tuple[float, float, float, tuple[float, ...], tuple[bool, ...]]
+        ] = []
         self.simulation_thread: threading.Thread | None = None
         self.simulation_updates: queue.Queue[tuple[int, str, Any]] = queue.Queue()
         self.simulation_request_id = 0
@@ -778,7 +797,18 @@ class MeshSimulatorApp:
         self.map_tile_images: dict[tuple[str, int, int, int, int], Image.Image] = {}
         self.map_tile_failures: set[tuple[str, int, int, int]] = set()
         self.obstacle_layer_image: ImageTk.PhotoImage | None = None
+        self.obstacle_layer_source: Image.Image | None = None
+        self.obstacle_layer_source_key: tuple[object, ...] | None = None
+        self.obstacle_layer_vectors: list[Obstacle] = []
+        self._visible_obstacle_bounds: list[
+            tuple[Obstacle, tuple[float, float, float, float]]
+        ] = []
+        self._obstacle_bounds_cache: dict[
+            int,
+            tuple[tuple[object, ...], tuple[float, float, float, float]],
+        ] = {}
         self.node_label_layout: dict[str, tuple[float, float, float, float, float, float]] = {}
+        self._scene_tree_signatures: dict[str, tuple[object, ...]] = {}
         self.terrain_visual_source: Image.Image | None = None
         self.terrain_visual_key: tuple[Any, ...] | None = None
         self.terrain_tile_elevations: dict[tuple[int, int, int], np.ndarray] = {}
@@ -2044,7 +2074,7 @@ class MeshSimulatorApp:
         )
         self.obstacle_progress_bar.grid(row=1, column=0, sticky="ew")
         self.obstacle_progress_frame.grid_remove()
-        self.canvas.bind("<Configure>", lambda _e: self.schedule_render())
+        self.canvas.bind("<Configure>", self._canvas_configured)
         self.canvas.bind("<ButtonPress-1>", self._canvas_down)
         self.canvas.bind("<B1-Motion>", self._canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._canvas_up)
@@ -2106,6 +2136,7 @@ class MeshSimulatorApp:
                 self.status_var.set(f"{source} failed: {error}")
                 messagebox.showerror(f"{source} failed", str(error), parent=self.root)
         if redraw:
+            self._invalidate_geographic_layer()
             self.schedule_render()
         try:
             self.root.after(100, self._poll_map_services)
@@ -3730,7 +3761,10 @@ class MeshSimulatorApp:
             return
         self.mark_dirty()
         self._mark_results_stale()
-        self.refresh_all()
+        self._refresh_scene_change(
+            packet=isinstance(obj, Node),
+            geographic=isinstance(obj, Obstacle),
+        )
         if isinstance(obj, Node) and not self._terrain_covers(obj.x, obj.y):
             self.status_var.set("Node coordinates updated · refreshing terrain around current scene")
             self.load_topography()
@@ -3760,7 +3794,10 @@ class MeshSimulatorApp:
             return
         self.mark_dirty()
         self._mark_results_stale()
-        self.refresh_all()
+        self._build_environment_form()
+        self.render_canvas()
+        self._refresh_mesh_graph()
+        self._update_title()
 
     def _live_mesh_running(self) -> bool:
         return bool(
@@ -4647,6 +4684,7 @@ class MeshSimulatorApp:
         self._beacon_tick()
 
     def stop_beacon(self, render: bool = True) -> None:
+        needs_full_render = self.zoom_preview_composite_active
         self.beacon_cancel.set()
         self.beacon_request_id += 1
         if self.beacon_after is not None:
@@ -4659,11 +4697,17 @@ class MeshSimulatorApp:
         self.beacon_profile = None
         self.beacon_segment_photo = None
         self.beacon_segment_photo_key = None
+        self.beacon_segment_source = None
+        self._beacon_ripple_profile_id = None
+        self._beacon_ripple_geometry = []
         self.beacon_blocking_obstacles = []
         self.beacon_weakening_obstacles = []
         self.beacon_phase = 0.0
         if render and hasattr(self, "canvas"):
-            self.canvas.delete(BEACON_TAG)
+            if needs_full_render:
+                self.render_canvas()
+            else:
+                self.canvas.delete(BEACON_TAG)
 
     def _beacon_tick(self) -> None:
         # The node may have been deleted or taken offline while pulsing.
@@ -4674,10 +4718,15 @@ class MeshSimulatorApp:
         self.beacon_phase = (self.beacon_phase + 0.045) % 1.0
         if hasattr(self, "canvas"):
             c = self.canvas
-            c.delete(BEACON_TAG)
+            if not c.find_withtag(BEACON_STATIC_TAG):
+                static_start = len(c.find_all())
+                self._draw_beacon(c, draw_animation=False)
+                self._tag_items_created_since(c, static_start, BEACON_STATIC_TAG, BEACON_TAG)
+            c.tag_raise(BEACON_STATIC_TAG)
+            c.delete(BEACON_ANIMATION_TAG)
             starting_count = len(c.find_all())
-            self._draw_beacon(c)
-            self._tag_items_created_since(c, starting_count, BEACON_TAG)
+            self._draw_beacon(c, draw_static=False)
+            self._tag_items_created_since(c, starting_count, BEACON_ANIMATION_TAG, BEACON_TAG)
         self.beacon_after = self.root.after(45, self._beacon_tick)
 
     def clear_static_coverage(self, render: bool = True) -> None:
@@ -4846,32 +4895,53 @@ class MeshSimulatorApp:
             )
             drawing = ImageDraw.Draw(layer, "RGBA")
             ox, oy = profile.x, profile.y
+            world_scale = self._base_scale() * self.zoom
+            screen_ox = (ox - self.view_x) * world_scale * render_scale
+            screen_oy = (oy - self.view_y) * world_scale * render_scale
+            distance_scale = grow * world_scale * render_scale
 
-            def screen_at(angle: float, distance: float) -> tuple[float, float]:
-                screen_x, screen_y = self.world_to_screen(
-                    ox + math.cos(angle) * distance * grow,
-                    oy + math.sin(angle) * distance * grow,
+            def screen_at_vector(
+                cosine: float,
+                sine: float,
+                distance: float,
+            ) -> tuple[float, float]:
+                scaled_distance = distance * distance_scale
+                return (
+                    screen_ox + cosine * scaled_distance,
+                    screen_oy + sine * scaled_distance,
                 )
-                return screen_x * render_scale, screen_y * render_scale
 
             ray_count = len(profile.rays)
             outer_points: list[tuple[float, float] | None] = []
             outer_distances: list[float] = []
+            directions: list[tuple[float, float, float, float]] = []
+            half_step = math.pi / ray_count
             for ray in profile.rays:
                 reachable = [sample.distance_m for sample in ray.samples if sample.reachable]
                 outer = max(reachable) if reachable else 0.0
                 outer_distances.append(outer)
-                outer_points.append(screen_at(ray.angle, outer) if outer > 0 else None)
+                cosine, sine = math.cos(ray.angle), math.sin(ray.angle)
+                left_angle = ray.angle - half_step
+                right_angle = ray.angle + half_step
+                directions.append(
+                    (
+                        math.cos(left_angle),
+                        math.sin(left_angle),
+                        math.cos(right_angle),
+                        math.sin(right_angle),
+                    )
+                )
+                outer_points.append(
+                    screen_at_vector(cosine, sine, outer) if outer > 0 else None
+                )
 
             # Each sampled direction owns its angular wedge. This retains the
             # original bold ray shape instead of eroding it whenever one adjacent
             # direction differs, while every radial section still has to pass its
             # own complete calibrated link-budget check.
-            half_step = math.pi / ray_count
             for ray_index, ray in enumerate(profile.rays):
                 outer = max(1.0, outer_distances[ray_index])
-                left_angle = ray.angle - half_step
-                right_angle = ray.angle + half_step
+                left_cosine, left_sine, right_cosine, right_sine = directions[ray_index]
                 crossed_gap = False
                 for radial_index in range(len(ray.samples) - 1):
                     inner, outer_sample = ray.samples[radial_index : radial_index + 2]
@@ -4893,10 +4963,10 @@ class MeshSimulatorApp:
                     red, green, blue = ImageColor.getrgb(self._strength_color(strength_position))
                     drawing.polygon(
                         (
-                            screen_at(left_angle, inner.distance_m),
-                            screen_at(left_angle, outer_sample.distance_m),
-                            screen_at(right_angle, outer_sample.distance_m),
-                            screen_at(right_angle, inner.distance_m),
+                            screen_at_vector(left_cosine, left_sine, inner.distance_m),
+                            screen_at_vector(left_cosine, left_sine, outer_sample.distance_m),
+                            screen_at_vector(right_cosine, right_sine, outer_sample.distance_m),
+                            screen_at_vector(right_cosine, right_sine, inner.distance_m),
                         ),
                         fill=(red, green, blue, 145),
                     )
@@ -4911,10 +4981,17 @@ class MeshSimulatorApp:
                 drawing.line((first, second), fill=(255, 255, 255, 255), width=2)
 
             layer = layer.resize((width, height), Image.Resampling.LANCZOS)
+            setattr(self, f"{cache_prefix}_segment_source", layer)
             photo = ImageTk.PhotoImage(layer)
             setattr(self, photo_name, photo)
             setattr(self, key_name, key)
-        c.create_image(0, 0, anchor="nw", image=photo)
+        c.create_image(
+            0,
+            0,
+            anchor="nw",
+            image=photo,
+            tags=(f"{cache_prefix}-segment-image",),
+        )
         return True
 
     def _draw_segmented_ripple(
@@ -4928,26 +5005,77 @@ class MeshSimulatorApp:
             return False
         points: list[tuple[float, float] | None] = []
         ox, oy = profile.x, profile.y
-        for ray in profile.rays:
-            outer = max(
-                (sample.distance_m for sample in ray.samples if sample.reachable),
-                default=0.0,
-            )
+        profile_id = id(profile)
+        if self._beacon_ripple_profile_id != profile_id:
+            self._beacon_ripple_profile_id = profile_id
+            self._beacon_ripple_geometry = []
+            for ray in profile.rays:
+                distances = tuple(sample.distance_m for sample in ray.samples)
+                reachable = tuple(sample.reachable for sample in ray.samples)
+                outer = max(
+                    (distance for distance, is_reachable in zip(distances, reachable) if is_reachable),
+                    default=0.0,
+                )
+                self._beacon_ripple_geometry.append(
+                    (math.cos(ray.angle), math.sin(ray.angle), outer, distances, reachable)
+                )
+        scale = self._base_scale() * self.zoom
+        screen_ox = (ox - self.view_x) * scale
+        screen_oy = (oy - self.view_y) * scale
+        for cosine, sine, outer, distances, reachable in self._beacon_ripple_geometry:
             distance = outer * fraction
-            sample = min(ray.samples, key=lambda item: abs(item.distance_m - distance))
-            if not sample.reachable:
+            insertion = bisect_left(distances, distance)
+            if insertion <= 0:
+                nearest = 0
+            elif insertion >= len(distances):
+                nearest = len(distances) - 1
+            else:
+                lower = insertion - 1
+                nearest = (
+                    lower
+                    if distance - distances[lower] <= distances[insertion] - distance
+                    else insertion
+                )
+            if not reachable[nearest]:
                 points.append(None)
                 continue
-            points.append(
-                self.world_to_screen(
-                    ox + math.cos(ray.angle) * distance,
-                    oy + math.sin(ray.angle) * distance,
-                )
+            points.append((screen_ox + cosine * distance * scale, screen_oy + sine * distance * scale))
+        valid_edges = [
+            first is not None and points[(index + 1) % len(points)] is not None
+            for index, first in enumerate(points)
+        ]
+        runs: list[list[tuple[float, float]]] = []
+        if all(valid_edges):
+            closed = [point for point in points if point is not None]
+            closed.append(closed[0])
+            runs.append(closed)
+        elif any(valid_edges):
+            # Start immediately after a broken edge so a run may safely wrap
+            # around angle zero without joining across an unreachable section.
+            broken = valid_edges.index(False)
+            run: list[tuple[float, float]] = []
+            for offset in range(1, len(points) + 1):
+                index = (broken + offset) % len(points)
+                if valid_edges[index]:
+                    first = points[index]
+                    second = points[(index + 1) % len(points)]
+                    assert first is not None and second is not None
+                    if not run:
+                        run.append(first)
+                    run.append(second)
+                elif run:
+                    runs.append(run)
+                    run = []
+            if run:
+                runs.append(run)
+        for run in runs:
+            coordinates = [coordinate for point in run for coordinate in point]
+            c.create_line(
+                *coordinates,
+                fill=self._BEACON_EDGE,
+                width=3,
+                joinstyle=tk.ROUND,
             )
-        for index, first in enumerate(points):
-            second = points[(index + 1) % len(points)]
-            if first is not None and second is not None:
-                c.create_line(*first, *second, fill=self._BEACON_EDGE, width=1)
         return True
 
     def _draw_static_coverage(self, c: tk.Canvas) -> None:
@@ -5065,12 +5193,28 @@ class MeshSimulatorApp:
             self.status_var.set(f"{tool} tool stays active: drag repeatedly to place obstructions")
 
     def world_to_screen(self, x: float, y: float) -> tuple[float, float]:
-        base = self._base_scale() * self.zoom
-        return (x - self.view_x) * base, (y - self.view_y) * base
+        transform = getattr(self, "_world_screen_transform", None)
+        if (
+            transform is None
+            or transform[0] != self.view_x
+            or transform[1] != self.view_y
+            or transform[2] != self.zoom
+        ):
+            transform = (self.view_x, self.view_y, self.zoom, self._base_scale() * self.zoom)
+            self._world_screen_transform = transform
+        return (x - transform[0]) * transform[3], (y - transform[1]) * transform[3]
 
     def screen_to_world(self, x: float, y: float) -> tuple[float, float]:
-        base = self._base_scale() * self.zoom
-        return x / max(1e-9, base) + self.view_x, y / max(1e-9, base) + self.view_y
+        transform = getattr(self, "_world_screen_transform", None)
+        if (
+            transform is None
+            or transform[0] != self.view_x
+            or transform[1] != self.view_y
+            or transform[2] != self.zoom
+        ):
+            transform = (self.view_x, self.view_y, self.zoom, self._base_scale() * self.zoom)
+            self._world_screen_transform = transform
+        return x / max(1e-9, transform[3]) + transform[0], y / max(1e-9, transform[3]) + transform[1]
 
     def _coverage_range_cap(self) -> float:
         """How far coverage/beacon rays should be traced: the visible map plus a
@@ -5096,7 +5240,7 @@ class MeshSimulatorApp:
 
     def _scene_bounds(self) -> tuple[float, float, float, float]:
         """Return object extents, or an origin-centered default for a blank scene."""
-        bounds = [obstacle.normalized() for obstacle in self.scenario.obstacles]
+        bounds = [self._obstacle_bounds(obstacle) for obstacle in self.scenario.obstacles]
         xs = [node.x for node in self.scenario.nodes]
         ys = [node.y for node in self.scenario.nodes]
         for left, top, right, bottom in bounds:
@@ -5218,27 +5362,67 @@ class MeshSimulatorApp:
                 best = (distance, index)
         return best[1] if best else None
 
-    def render_canvas(self) -> None:
+    def render_canvas(self, *, reuse_geographic_layer: bool = False) -> None:
         if not hasattr(self, "canvas"):
             return
+        if self.zoom_render_after is not None:
+            try:
+                self.root.after_cancel(self.zoom_render_after)
+            except tk.TclError:
+                pass
+            self.zoom_render_after = None
+        self.zoom_preview_composite_active = False
+        self.zoom_preview_active_tags.clear()
+        self._world_screen_transform = None
         c = self.canvas
         c.delete("all")
         env = self.scenario.environment
         c.configure(bg=env.background)
-        visible_left, visible_top = self.screen_to_world(0, 0)
-        visible_right, visible_bottom = self.screen_to_world(c.winfo_width(), c.winfo_height())
-        visible_bounds = (
-            min(visible_left, visible_right),
-            min(visible_top, visible_bottom),
-            max(visible_left, visible_right),
-            max(visible_top, visible_bottom),
+        selected = self.get_selected()
+        selected_obstacle_id = selected.id if isinstance(selected, Obstacle) else None
+        geographic_key = (
+            c.winfo_width(),
+            c.winfo_height(),
+            self.view_x,
+            self.view_y,
+            self.zoom,
+            selected_obstacle_id,
+            self.map_visible.get(),
+            self.terrain_only_view.get(),
+            env.map_layer,
         )
-        visible_obstacles = [
-            obstacle
-            for obstacle in self.scenario.obstacles
-            if self._bounds_overlap(obstacle.normalized(), visible_bounds)
-        ]
-        self._draw_obstacle_layer(c, visible_obstacles)
+        can_reuse_geographic = (
+            self.obstacle_layer_image is not None
+            and (
+                reuse_geographic_layer
+                or self.obstacle_layer_source_key == geographic_key
+            )
+        )
+        if can_reuse_geographic:
+            c.create_image(
+                0,
+                0,
+                image=self.obstacle_layer_image,
+                anchor="nw",
+                tags=(GEOGRAPHIC_LAYER_TAG,),
+            )
+            self._draw_vector_obstacles(c, self.obstacle_layer_vectors)
+        else:
+            visible_left, visible_top = self.screen_to_world(0, 0)
+            visible_right, visible_bottom = self.screen_to_world(c.winfo_width(), c.winfo_height())
+            visible_bounds = (
+                min(visible_left, visible_right),
+                min(visible_top, visible_bottom),
+                max(visible_left, visible_right),
+                max(visible_top, visible_bottom),
+            )
+            self._visible_obstacle_bounds = []
+            for obstacle in self.scenario.obstacles:
+                bounds = self._obstacle_bounds(obstacle)
+                if self._bounds_overlap(bounds, visible_bounds):
+                    self._visible_obstacle_bounds.append((obstacle, bounds))
+            visible_obstacles = [obstacle for obstacle, _bounds in self._visible_obstacle_bounds]
+            self._draw_obstacle_layer(c, visible_obstacles)
         packet_start = len(c.find_all())
         self._draw_packet_links(c)
         self._draw_retained_coverage(c)
@@ -5276,9 +5460,7 @@ class MeshSimulatorApp:
         static_start = len(c.find_all())
         self._draw_static_coverage(c)
         self._tag_items_created_since(c, static_start, STATIC_COVERAGE_TAG)
-        beacon_start = len(c.find_all())
-        self._draw_beacon(c)
-        self._tag_items_created_since(c, beacon_start, BEACON_TAG)
+        self._draw_full_beacon_layer(c)
         wave_start = len(c.find_all())
         self._draw_current_wave(c)
         self._draw_live_mesh_overlay(c)
@@ -5414,9 +5596,10 @@ class MeshSimulatorApp:
         )
 
     @staticmethod
-    def _tag_items_created_since(c: tk.Canvas, starting_count: int, tag: str) -> None:
+    def _tag_items_created_since(c: tk.Canvas, starting_count: int, *tags: str) -> None:
         for item_id in c.find_all()[starting_count:]:
-            c.addtag_withtag(tag, item_id)
+            for tag in tags:
+                c.addtag_withtag(tag, item_id)
 
     def _render_current_wave_frame(self) -> None:
         """Refresh only the moving ripple instead of rebuilding the geographic scene."""
@@ -5459,13 +5642,12 @@ class MeshSimulatorApp:
             self._draw_node(c, node)
         self._tag_items_created_since(c, node_start, NODE_LAYER_TAG)
 
-        static_start = len(c.find_all())
-        self._draw_static_coverage(c)
-        self._tag_items_created_since(c, static_start, STATIC_COVERAGE_TAG)
-
-        beacon_start = len(c.find_all())
-        self._draw_beacon(c)
-        self._tag_items_created_since(c, beacon_start, BEACON_TAG)
+        # These layers are independent of packet/node state. Retain their
+        # existing items and restore z-order instead of stacking duplicate
+        # heatmap images on every partial simulation refresh.
+        c.tag_raise(STATIC_COVERAGE_TAG)
+        c.tag_raise(BEACON_STATIC_TAG)
+        c.tag_raise(BEACON_ANIMATION_TAG)
 
         wave_start = len(c.find_all())
         self._draw_current_wave(c)
@@ -5816,10 +5998,15 @@ class MeshSimulatorApp:
         ]
         raster_object_ids = {id(obstacle) for obstacle in raster_obstacles}
         vector_obstacles = [obstacle for obstacle in obstacles if id(obstacle) not in raster_object_ids]
+        self.obstacle_layer_vectors = vector_obstacles
         layer = self._compose_map_layer(c)
         drawing = ImageDraw.Draw(layer, "RGBA")
         scale = self._base_scale() * self.zoom
         view_x, view_y = self.view_x, self.view_y
+        style_cache: dict[
+            tuple[str, str, bool],
+            tuple[tuple[int, int, int], int, tuple[int, int, int], int],
+        ] = {}
         for obstacle in raster_obstacles:
             coordinates = [
                 ((point[0] - view_x) * scale, (point[1] - view_y) * scale)
@@ -5829,30 +6016,91 @@ class MeshSimulatorApp:
             color = obstacle.color
             if is_building and color in {"#8b5e4a", "#5a4636", "#3f3c37"}:
                 color = "#33302b"
-            fill_rgb = ImageColor.getrgb(color)
-            if is_building:
-                # Buildings are solid dark like the basemap's own footprints.
-                fill_alpha = 255 if obstacle.enabled else 120
-                outline_rgb = fill_rgb
-                outline_alpha = fill_alpha
-            else:
-                # Other obstacles (e.g. forests) stay translucent so the map reads.
-                fill_alpha = 86 if obstacle.enabled else 42
-                outline_rgb = ImageColor.getrgb(self._lighten(color))
-                outline_alpha = 180 if obstacle.enabled else 100
+            style_key = (obstacle.kind, color, obstacle.enabled)
+            style = style_cache.get(style_key)
+            if style is None:
+                fill_rgb = ImageColor.getrgb(color)
+                if is_building:
+                    # Buildings are solid dark like the basemap's own footprints.
+                    fill_alpha = 255 if obstacle.enabled else 120
+                    outline_rgb = fill_rgb
+                    outline_alpha = fill_alpha
+                else:
+                    # Other obstacles stay translucent so the map remains readable.
+                    fill_alpha = 86 if obstacle.enabled else 42
+                    outline_rgb = ImageColor.getrgb(self._lighten(color))
+                    outline_alpha = 180 if obstacle.enabled else 100
+                style = (fill_rgb, fill_alpha, outline_rgb, outline_alpha)
+                style_cache[style_key] = style
+            fill_rgb, fill_alpha, outline_rgb, outline_alpha = style
             drawing.polygon(
                 coordinates,
                 fill=(*fill_rgb, fill_alpha),
                 outline=(*outline_rgb, outline_alpha),
                 width=1,
             )
+        self.obstacle_layer_source = layer
+        self.obstacle_layer_source_key = (
+            c.winfo_width(),
+            c.winfo_height(),
+            self.view_x,
+            self.view_y,
+            self.zoom,
+            self.selected_id if isinstance(self.get_selected(), Obstacle) else None,
+            self.map_visible.get(),
+            self.terrain_only_view.get(),
+            self.scenario.environment.map_layer,
+        )
         self.obstacle_layer_image = ImageTk.PhotoImage(layer)
-        c.create_image(0, 0, image=self.obstacle_layer_image, anchor="nw")
-        for obstacle in vector_obstacles:
+        c.create_image(
+            0,
+            0,
+            image=self.obstacle_layer_image,
+            anchor="nw",
+            tags=(GEOGRAPHIC_LAYER_TAG,),
+        )
+        self._draw_vector_obstacles(c, vector_obstacles)
+
+    def _obstacle_bounds(self, obstacle: Obstacle) -> tuple[float, float, float, float]:
+        signature = (
+            id(obstacle.points),
+            len(obstacle.points),
+            obstacle.x1,
+            obstacle.y1,
+            obstacle.x2,
+            obstacle.y2,
+            obstacle.shape,
+            obstacle.brush_radius_m,
+        )
+        cached = self._obstacle_bounds_cache.get(id(obstacle))
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        bounds = obstacle.normalized()
+        self._obstacle_bounds_cache[id(obstacle)] = (signature, bounds)
+        return bounds
+
+    def _draw_vector_obstacles(self, c: tk.Canvas, obstacles: list[Obstacle]) -> None:
+        for obstacle in obstacles:
+            if (
+                obstacle.shape == "polygon"
+                and len(obstacle.points) >= 3
+                and obstacle.id != self.selected_id
+            ):
+                continue
             obstacle_start = len(c.find_all())
             self._draw_obstacle(c, obstacle)
             if obstacle.id == self.selected_id:
                 self._tag_items_created_since(c, obstacle_start, SELECTED_OBSTACLE_TAG)
+
+    def _invalidate_geographic_layer(self) -> None:
+        self.obstacle_layer_image = None
+        self.obstacle_layer_source = None
+        self.obstacle_layer_source_key = None
+        self.obstacle_layer_vectors = []
+        self._visible_obstacle_bounds = []
+        self.zoom_composite_source = None
+        self.zoom_composite_source_key = None
+        self._obstacle_bounds_cache.clear()
 
     def _render_selected_obstacle(self, obstacle: Obstacle) -> None:
         if not hasattr(self, "canvas"):
@@ -5862,6 +6110,11 @@ class MeshSimulatorApp:
         starting_count = len(c.find_all())
         self._draw_obstacle(c, obstacle)
         self._tag_items_created_since(c, starting_count, SELECTED_OBSTACLE_TAG)
+        bounds = self._obstacle_bounds(obstacle)
+        for index, (candidate, _old_bounds) in enumerate(self._visible_obstacle_bounds):
+            if candidate is obstacle:
+                self._visible_obstacle_bounds[index] = (obstacle, bounds)
+                break
 
     def _draw_obstacle(self, c: tk.Canvas, obstacle: Obstacle) -> None:
         selected = obstacle.id == self.selected_id
@@ -6389,7 +6642,21 @@ class MeshSimulatorApp:
         r, g, b = stops[-1][1]
         return f"#{r:02x}{g:02x}{b:02x}"
 
-    def _draw_beacon(self, c: tk.Canvas) -> None:
+    def _draw_full_beacon_layer(self, c: tk.Canvas) -> None:
+        static_start = len(c.find_all())
+        self._draw_beacon(c, draw_animation=False)
+        self._tag_items_created_since(c, static_start, BEACON_STATIC_TAG, BEACON_TAG)
+        animation_start = len(c.find_all())
+        self._draw_beacon(c, draw_static=False)
+        self._tag_items_created_since(c, animation_start, BEACON_ANIMATION_TAG, BEACON_TAG)
+
+    def _draw_beacon(
+        self,
+        c: tk.Canvas,
+        *,
+        draw_static: bool = True,
+        draw_animation: bool = True,
+    ) -> None:
         """Draw the beacon coverage as a filled strong->weak heatmap, with the
         obstacles that SLOW the signal in yellow and those that BLOCK it in red."""
         profile = self.beacon_profile
@@ -6401,31 +6668,35 @@ class MeshSimulatorApp:
         w2s = self.world_to_screen
         ox, oy = profile.x, profile.y
 
-        if self._draw_segmented_coverage(c, profile, cache_prefix="beacon"):
-            for obstacle in self.beacon_weakening_obstacles:
-                self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
-            for obstacle in self.beacon_blocking_obstacles:
-                self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
-            if phase > 0.02:
+        segmented = len(profile.rays) >= 3 and all(len(ray.samples) >= 2 for ray in profile.rays)
+        if segmented:
+            if draw_static:
+                self._draw_segmented_coverage(c, profile, cache_prefix="beacon")
+                for obstacle in self.beacon_weakening_obstacles:
+                    self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
+                for obstacle in self.beacon_blocking_obstacles:
+                    self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
+            if draw_animation and phase > 0.02:
                 self._draw_segmented_ripple(c, profile, phase)
-            cx, cy = w2s(ox, oy)
-            halo = 5 + 4 * glow
-            c.create_oval(
-                cx - halo,
-                cy - halo,
-                cx + halo,
-                cy + halo,
-                outline=self._BEACON_EDGE,
-                width=2,
-            )
-            c.create_oval(
-                cx - 3,
-                cy - 3,
-                cx + 3,
-                cy + 3,
-                fill=self._BEACON_EDGE,
-                outline=self._BEACON_HALO,
-            )
+            if draw_animation:
+                cx, cy = w2s(ox, oy)
+                halo = 5 + 4 * glow
+                c.create_oval(
+                    cx - halo,
+                    cy - halo,
+                    cx + halo,
+                    cy + halo,
+                    outline=self._BEACON_EDGE,
+                    width=2,
+                )
+                c.create_oval(
+                    cx - 3,
+                    cy - 3,
+                    cx + 3,
+                    cy + 3,
+                    fill=self._BEACON_EDGE,
+                    outline=self._BEACON_HALO,
+                )
             return
 
         # Boundary points in world space (where the signal reaches per direction).
@@ -6437,45 +6708,47 @@ class MeshSimulatorApp:
         # Filled coverage heatmap: nested bands from the weak edge inwards to the
         # strong centre, each the coverage shape scaled down, so colour shows how
         # strong the signal is at every point (and the shape shows how far it got).
-        bands = 7
-        for band in range(bands, 0, -1):
-            frac = band / bands
-            color = self._strength_color((band - 0.5) / bands)
-            coords: list[float] = []
+        if draw_static:
+            bands = 7
+            for band in range(bands, 0, -1):
+                frac = band / bands
+                color = self._strength_color((band - 0.5) / bands)
+                coords: list[float] = []
+                for (bx, by) in world:
+                    coords.extend(w2s(ox + (bx - ox) * frac, oy + (by - oy) * frac))
+                if len(coords) >= 6:
+                    c.create_polygon(*coords, fill=color, outline="", stipple="gray50")
+
+            # A crisp edge line marks the outer limit of the range.
+            edge: list[float] = []
             for (bx, by) in world:
-                coords.extend(w2s(ox + (bx - ox) * frac, oy + (by - oy) * frac))
-            if len(coords) >= 6:
-                c.create_polygon(*coords, fill=color, outline="", stipple="gray50")
+                edge.extend(w2s(bx, by))
+            edge.extend(edge[:2])
+            c.create_line(*edge, fill=self._BEACON_HALO, width=3, joinstyle=tk.ROUND)
+            c.create_line(*edge, fill="#ffffff", width=1, joinstyle=tk.ROUND)
 
-        # A crisp edge line marks the outer limit of the range.
-        edge: list[float] = []
-        for (bx, by) in world:
-            edge.extend(w2s(bx, by))
-        edge.extend(edge[:2])
-        c.create_line(*edge, fill=self._BEACON_HALO, width=3, joinstyle=tk.ROUND)
-        c.create_line(*edge, fill="#ffffff", width=1, joinstyle=tk.ROUND)
-
-        # Culprit obstacles (static, no pulsing): yellow slows the signal, red blocks
-        # it.  Only obstacles the signal actually reached are in these lists.
-        for obstacle in self.beacon_weakening_obstacles:
-            self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
-        for obstacle in self.beacon_blocking_obstacles:
-            self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
+            # Culprit obstacles (static, no pulsing): yellow slows the signal, red blocks
+            # it.  Only obstacles the signal actually reached are in these lists.
+            for obstacle in self.beacon_weakening_obstacles:
+                self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
+            for obstacle in self.beacon_blocking_obstacles:
+                self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
 
         # A single outward ripple keeps the "beacon is live" feel without clutter.
-        frac = phase
-        if frac > 0.02:
-            ripple: list[float] = []
-            for (bx, by) in world:
-                ripple.extend(w2s(ox + (bx - ox) * frac, oy + (by - oy) * frac))
-            ripple.extend(ripple[:2])
-            c.create_line(*ripple, fill=self._BEACON_EDGE, width=1, joinstyle=tk.ROUND)
+        if draw_animation:
+            frac = phase
+            if frac > 0.02:
+                ripple: list[float] = []
+                for (bx, by) in world:
+                    ripple.extend(w2s(ox + (bx - ox) * frac, oy + (by - oy) * frac))
+                ripple.extend(ripple[:2])
+                c.create_line(*ripple, fill=self._BEACON_EDGE, width=3, joinstyle=tk.ROUND)
 
-        # The pulsing beacon marker at the centre.
-        cx, cy = w2s(ox, oy)
-        halo = 5 + 4 * glow
-        c.create_oval(cx - halo, cy - halo, cx + halo, cy + halo, outline=self._BEACON_EDGE, width=2)
-        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=self._BEACON_EDGE, outline=self._BEACON_HALO)
+            # The pulsing beacon marker at the centre.
+            cx, cy = w2s(ox, oy)
+            halo = 5 + 4 * glow
+            c.create_oval(cx - halo, cy - halo, cx + halo, cy + halo, outline=self._BEACON_EDGE, width=2)
+            c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=self._BEACON_EDGE, outline=self._BEACON_HALO)
 
     def _draw_beacon_obstacle(
         self, c: tk.Canvas, obstacle: Obstacle, color: str, width: float, fill: bool = False
@@ -6723,19 +6996,17 @@ class MeshSimulatorApp:
             return
         if self.tool == "beacon":
             x, y = self.drag_start_world
-            self.add_node(x, y)
-            self.scenario.nodes[-1].name = f"Beacon {len(self.scenario.nodes)}"
+            node = self.add_node(x, y, name=f"Beacon {len(self.scenario.nodes) + 1}")
             needs_terrain = not self._terrain_covers(x, y)
             if needs_terrain:
                 self.load_topography()
             self.set_tool("select")
-            self.refresh_all()
             self.start_beacon()
             return
         if self.tool == "Forest":
             x, y = self.drag_start_world
             self.temp_forest_points = [[x, y]]
-            self.render_canvas()
+            self.schedule_render()
             return
         if self.tool in OBSTACLE_DEFAULTS:
             x, y = self.drag_start_world
@@ -6766,12 +7037,12 @@ class MeshSimulatorApp:
             last_x, last_y = self.temp_forest_points[-1]
             if math.hypot(wx - last_x, wy - last_y) >= 35.0:
                 self.temp_forest_points.append([wx, wy])
-            self.render_canvas()
+            self.schedule_render()
             return
         if self.tool in OBSTACLE_DEFAULTS:
             x0, y0 = self.drag_start_world
             self.temp_obstacle = (x0, y0, wx, wy)
-            self.render_canvas()
+            self.schedule_render()
             return
         if self.tool != "select" or not self.drag_object_origin:
             return
@@ -6838,6 +7109,10 @@ class MeshSimulatorApp:
         self.pan_origin = (self.view_x, self.view_y)
         self.canvas.configure(cursor="fleur")
 
+    def _canvas_configured(self, _event: tk.Event) -> None:
+        self._world_screen_transform = None
+        self.schedule_render()
+
     def _pan_drag(self, event: tk.Event) -> None:
         if self.pan_start is None or self.pan_origin is None or self.pan_last_screen is None:
             return
@@ -6857,14 +7132,203 @@ class MeshSimulatorApp:
         self.canvas.configure(cursor="arrow" if self.tool == "select" else "crosshair")
         self.schedule_render()
 
+    def _zoom_preview_layer(
+        self,
+        source: Image.Image | None,
+        source_key: tuple[object, ...] | None,
+        *,
+        tag: str,
+        photo_attribute: str,
+        segmented: bool = False,
+    ) -> None:
+        preview = self._transformed_zoom_source(source, source_key, segmented=segmented)
+        if preview is None:
+            return
+        items = self.canvas.find_withtag(tag)
+        if not items:
+            return
+        photo, replaced = self._paste_zoom_photo(photo_attribute, preview)
+        if replaced or tag not in self.zoom_preview_active_tags:
+            for item in items:
+                self.canvas.itemconfigure(item, image=photo, state="normal")
+                self.canvas.coords(item, 0, 0)
+            self.zoom_preview_active_tags.add(tag)
+
+    def _paste_zoom_photo(
+        self,
+        photo_attribute: str,
+        preview: Image.Image,
+    ) -> tuple[ImageTk.PhotoImage, bool]:
+        """Update an already-uploaded Tk image instead of allocating another one."""
+        photo = getattr(self, photo_attribute, None)
+        if (
+            photo is not None
+            and photo.width() == preview.width
+            and photo.height() == preview.height
+        ):
+            try:
+                photo.paste(preview)
+                return photo, False
+            except tk.TclError:
+                pass
+        photo = ImageTk.PhotoImage(preview)
+        setattr(self, photo_attribute, photo)
+        return photo, True
+
+    def _transformed_zoom_source(
+        self,
+        source: Image.Image | None,
+        source_key: tuple[object, ...] | None,
+        *,
+        segmented: bool = False,
+    ) -> Image.Image | None:
+        if source is None or source_key is None:
+            return None
+        if segmented:
+            if len(source_key) < 7:
+                return None
+            source_width = int(source_key[1])
+            source_height = int(source_key[2])
+            source_view_x = float(source_key[-3])
+            source_view_y = float(source_key[-2])
+            source_zoom = float(source_key[-1])
+        else:
+            if len(source_key) < 5:
+                return None
+            source_width = int(source_key[0])
+            source_height = int(source_key[1])
+            source_view_x = float(source_key[2])
+            source_view_y = float(source_key[3])
+            source_zoom = float(source_key[4])
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        env = self.scenario.environment
+        source_base = min(
+            source_width / max(1.0, env.initial_view_width_m),
+            source_height / max(1.0, env.initial_view_height_m),
+        )
+        source_scale = max(1e-12, source_base * source_zoom)
+        destination_scale = max(1e-12, self._base_scale() * self.zoom)
+        scale_ratio = source_scale / destination_scale
+        source_x = (self.view_x - source_view_x) * source_scale
+        source_y = (self.view_y - source_view_y) * source_scale
+        fill = (0, 0, 0, 0) if source.mode == "RGBA" else self.scenario.environment.background
+        return source.transform(
+            (width, height),
+            Image.Transform.AFFINE,
+            (scale_ratio, 0.0, source_x, 0.0, scale_ratio, source_y),
+            # Wheel previews favor interaction latency; the deferred redraw below
+            # restores the exact LANCZOS-rendered map and beacon after 90 ms.
+            resample=Image.Resampling.NEAREST,
+            fillcolor=fill,
+        )
+
+    def _zoom_preview_composite(self) -> bool:
+        geographic = self.obstacle_layer_source
+        beacon = self.beacon_segment_source
+        geographic_key = self.obstacle_layer_source_key
+        beacon_key = self.beacon_segment_photo_key
+        geographic_items = self.canvas.find_withtag(GEOGRAPHIC_LAYER_TAG)
+        beacon_items = self.canvas.find_withtag("beacon-segment-image")
+        if (
+            geographic is None
+            or beacon is None
+            or geographic_key is None
+            or beacon_key is None
+            or len(beacon_key) < 7
+            or not geographic_items
+            or not beacon_items
+            or geographic.size != beacon.size
+        ):
+            return False
+        same_view = (
+            abs(float(geographic_key[2]) - float(beacon_key[-3])) < 1e-6
+            and abs(float(geographic_key[3]) - float(beacon_key[-2])) < 1e-6
+            and abs(float(geographic_key[4]) - float(beacon_key[-1])) < 1e-9
+        )
+        if not same_view:
+            return False
+        composite_key = (id(geographic), id(beacon))
+        if self.zoom_composite_source_key != composite_key or self.zoom_composite_source is None:
+            combined = geographic.convert("RGBA")
+            combined.alpha_composite(beacon)
+            # The geographic layer is opaque, so retaining RGBA here only adds
+            # upload bandwidth; RGB presents the identical composited pixels.
+            self.zoom_composite_source = combined.convert("RGB")
+            self.zoom_composite_source_key = composite_key
+        preview = self._transformed_zoom_source(
+            self.zoom_composite_source,
+            geographic_key,
+        )
+        if preview is None:
+            return False
+        photo, replaced = self._paste_zoom_photo("zoom_composite_photo", preview)
+        if replaced or GEOGRAPHIC_LAYER_TAG not in self.zoom_preview_active_tags:
+            for item in geographic_items:
+                self.canvas.itemconfigure(item, image=photo, state="normal")
+                self.canvas.coords(item, 0, 0)
+            self.zoom_preview_active_tags.add(GEOGRAPHIC_LAYER_TAG)
+        if "beacon-segment-image" not in self.zoom_preview_active_tags:
+            for item in beacon_items:
+                self.canvas.itemconfigure(item, state="hidden")
+                self.canvas.coords(item, 0, 0)
+            self.zoom_preview_active_tags.add("beacon-segment-image")
+        self.zoom_preview_composite_active = True
+        return True
+
+    def _finish_zoom_render(self) -> None:
+        self.zoom_render_after = None
+        self.zoom_preview_composite_active = False
+        self.render_canvas()
+
     def _canvas_wheel(self, event: tk.Event) -> None:
         before = self.screen_to_world(event.x, event.y)
         factor = 1.15 if event.delta > 0 else 1 / 1.15
-        self.zoom = clamp(self.zoom * factor, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM)
+        previous_zoom = self.zoom
+        self.zoom = clamp(previous_zoom * factor, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM)
+        applied_factor = self.zoom / max(previous_zoom, 1e-12)
+        if abs(applied_factor - 1.0) < 1e-12:
+            return
         after = self.screen_to_world(event.x, event.y)
         self.view_x += before[0] - after[0]
         self.view_y += before[1] - after[1]
-        self.render_canvas()
+        if not hasattr(self, "canvas"):
+            return
+        self.canvas.scale("all", event.x, event.y, applied_factor, applied_factor)
+        self.canvas.scale(HUD_LAYER_TAG, event.x, event.y, 1.0 / applied_factor, 1.0 / applied_factor)
+        if not self._zoom_preview_composite():
+            self._zoom_preview_layer(
+                self.obstacle_layer_source,
+                self.obstacle_layer_source_key,
+                tag=GEOGRAPHIC_LAYER_TAG,
+                photo_attribute="zoom_geographic_photo",
+            )
+            self._zoom_preview_layer(
+                self.beacon_segment_source,
+                self.beacon_segment_photo_key,
+                tag="beacon-segment-image",
+                photo_attribute="zoom_beacon_photo",
+                segmented=True,
+            )
+        self._zoom_preview_layer(
+            getattr(self, "static_segment_source", None),
+            self.static_segment_photo_key,
+            tag="static-segment-image",
+            photo_attribute="zoom_static_photo",
+            segmented=True,
+        )
+        if self.render_after is not None:
+            try:
+                self.root.after_cancel(self.render_after)
+            except tk.TclError:
+                pass
+            self.render_after = None
+        if self.zoom_render_after is not None:
+            try:
+                self.root.after_cancel(self.zoom_render_after)
+            except tk.TclError:
+                pass
+        self.zoom_render_after = self.root.after(90, self._finish_zoom_render)
 
     def _canvas_motion(self, event: tk.Event) -> None:
         wx, wy = self.screen_to_world(event.x, event.y)
@@ -6885,15 +7349,20 @@ class MeshSimulatorApp:
             x, y = self.world_to_screen(node.x, node.y)
             if math.hypot(sx - x, sy - y) <= 17:
                 return node
-        for obstacle in reversed(self.scenario.obstacles):
+        world_x, world_y = self.screen_to_world(sx, sy)
+        candidates = self._visible_obstacle_bounds or [
+            (obstacle, self._obstacle_bounds(obstacle))
+            for obstacle in self.scenario.obstacles
+        ]
+        for obstacle, bounds in reversed(candidates):
+            x_min, y_min, x_max, y_max = bounds
+            if not (x_min <= world_x <= x_max and y_min <= world_y <= y_max):
+                continue
             if obstacle.shape == "polygon" and len(obstacle.points) >= 3:
-                world_x, world_y = self.screen_to_world(sx, sy)
-                polygon = [(point[0], point[1]) for point in obstacle.points]
-                if PropagationModel._point_in_polygon(world_x, world_y, polygon):
+                if PropagationModel._point_in_polygon(world_x, world_y, obstacle.points):
                     return obstacle
                 continue
             if obstacle.kind == "Forest" and obstacle.shape == "brush" and obstacle.points:
-                world_x, world_y = self.screen_to_world(sx, sy)
                 segments = list(zip(obstacle.points, obstacle.points[1:])) or [(obstacle.points[0], obstacle.points[0])]
                 if any(
                     PropagationModel._point_segment_distance_sq(
@@ -6905,22 +7374,18 @@ class MeshSimulatorApp:
                     return obstacle
                 continue
             if obstacle.kind == "Mountain":
-                world_x, world_y = self.screen_to_world(sx, sy)
-                x_min, y_min, x_max, y_max = obstacle.normalized()
                 triangle = [((x_min + x_max) / 2, y_min), (x_max, y_max), (x_min, y_max)]
                 if PropagationModel._point_in_polygon(world_x, world_y, triangle):
                     return obstacle
                 continue
-            x1, y1 = self.world_to_screen(obstacle.x1, obstacle.y1)
-            x2, y2 = self.world_to_screen(obstacle.x2, obstacle.y2)
-            if min(x1, x2) <= sx <= max(x1, x2) and min(y1, y2) <= sy <= max(y1, y2):
-                return obstacle
+            return obstacle
         return None
 
-    def add_node(self, x: float, y: float) -> None:
+    def add_node(self, x: float, y: float, *, name: str | None = None) -> Node:
+        previous_selection = self.get_selected()
         number = max([node.node_num for node in self.scenario.nodes] + [0]) + 1
         node = Node(
-            name=f"Node {len(self.scenario.nodes) + 1}",
+            name=name or f"Node {len(self.scenario.nodes) + 1}",
             node_num=number,
             x=x,
             y=y,
@@ -6936,7 +7401,11 @@ class MeshSimulatorApp:
         self.selected_id = node.id
         self.mark_dirty()
         self._mark_results_stale()
-        self.refresh_all()
+        self._refresh_added_node(
+            node,
+            reuse_geographic_layer=not isinstance(previous_selection, Obstacle),
+        )
+        return node
 
     def add_obstacle(self, kind: str, x1: float, y1: float, x2: float, y2: float) -> None:
         color, attenuation, height, per_100, behavior, max_beyond = OBSTACLE_DEFAULTS[kind]
@@ -6960,7 +7429,7 @@ class MeshSimulatorApp:
         self.selected_id = obstacle.id
         self.mark_dirty()
         self._mark_results_stale()
-        self.refresh_all()
+        self._refresh_scene_change(geographic=True)
 
     def add_forest_stroke(self, points: list[list[float]]) -> None:
         color, attenuation, height, per_100, behavior, max_beyond = OBSTACLE_DEFAULTS["Forest"]
@@ -6991,7 +7460,7 @@ class MeshSimulatorApp:
         self.selected_id = obstacle.id
         self.mark_dirty()
         self._mark_results_stale()
-        self.refresh_all()
+        self._refresh_scene_change(geographic=True)
 
     def add_random_nodes(self) -> None:
         count = simpledialog.askinteger(
@@ -7055,7 +7524,7 @@ class MeshSimulatorApp:
             self.selected_id = added[-1].id
         self.mark_dirty()
         self._mark_results_stale()
-        self.refresh_all()
+        self._refresh_scene_change(packet=True)
         if any(not self._terrain_covers(node.x, node.y) for node in added):
             self.status_var.set(
                 f"Spread {count} random nodes across the visible map · refreshing terrain"
@@ -7090,10 +7559,14 @@ class MeshSimulatorApp:
             self.scenario.obstacles.append(copy)
         else:
             return
-        self.select(copy.id)
+        self.selected_id = copy.id
         self.mark_dirty()
         self._mark_results_stale()
-        self.refresh_all()
+        self._refresh_scene_change(
+            packet=isinstance(copy, Node),
+            geographic=isinstance(copy, Obstacle),
+        )
+        self.show_sidebar_tab("Properties")
 
     def delete_selected(self) -> None:
         obj = self.get_selected()
@@ -7115,10 +7588,16 @@ class MeshSimulatorApp:
         self.selected_id = None
         self.mark_dirty()
         self._mark_results_stale()
-        self.refresh_all()
+        self._refresh_scene_change(
+            packet=isinstance(obj, Node),
+            geographic=isinstance(obj, Obstacle),
+        )
 
     def get_selected(self) -> Node | Obstacle | None:
-        for obj in [*self.scenario.nodes, *self.scenario.obstacles]:
+        for obj in self.scenario.nodes:
+            if obj.id == self.selected_id:
+                return obj
+        for obj in self.scenario.obstacles:
             if obj.id == self.selected_id:
                 return obj
         return None
@@ -7154,25 +7633,95 @@ class MeshSimulatorApp:
             self.scene_tree.selection_remove(*self.scene_tree.selection())
 
     def refresh_scene_tree(self) -> None:
-        self.scene_tree.delete(*self.scene_tree.get_children())
-        nodes_root = self.scene_tree.insert("", "end", iid="_nodes", text=f"  Nodes  ({len(self.scenario.nodes)})", open=True)
+        tree = self.scene_tree
+        if not tree.exists("_nodes") or not tree.exists("_obstacles"):
+            tree.delete(*tree.get_children())
+            tree.insert("", "end", iid="_nodes", open=True)
+            tree.insert("", "end", iid="_obstacles", open=True)
+            self._scene_tree_signatures = {}
+        tree.item("_nodes", text=f"  Nodes  ({len(self.scenario.nodes)})", open=True)
+        tree.item("_obstacles", text=f"  Obstructions  ({len(self.scenario.obstacles)})", open=True)
+
+        desired: list[tuple[str, str, tuple[object, ...], str]] = []
         for node in self.scenario.nodes:
             marker = "●" if node.online else "○"
-            self.scene_tree.insert(nodes_root, "end", iid=node.id, text=f"  {marker}  {node.name}  ·  {node.role}")
-        obstacles_root = self.scene_tree.insert(
-            "", "end", iid="_obstacles", text=f"  Obstructions  ({len(self.scenario.obstacles)})", open=True
-        )
+            signature = (node.name, node.role, node.online)
+            desired.append((node.id, "_nodes", signature, f"  {marker}  {node.name}  ·  {node.role}"))
         for obstacle in self.scenario.obstacles:
-            self.scene_tree.insert(obstacles_root, "end", iid=obstacle.id, text=f"  ▣  {obstacle.name}  ·  {obstacle.kind}")
+            signature = (obstacle.name, obstacle.kind)
+            desired.append(
+                (obstacle.id, "_obstacles", signature, f"  ▣  {obstacle.name}  ·  {obstacle.kind}")
+            )
+
+        existing = set(tree.get_children("_nodes")) | set(tree.get_children("_obstacles"))
+        desired_ids = {item_id for item_id, _parent, _signature, _text in desired}
+        stale = existing - desired_ids
+        if stale:
+            tree.delete(*stale)
+            for item_id in stale:
+                self._scene_tree_signatures.pop(item_id, None)
+        for item_id, parent, signature, text in desired:
+            if item_id not in existing:
+                tree.insert(parent, "end", iid=item_id, text=text)
+            elif self._scene_tree_signatures.get(item_id) != signature:
+                tree.item(item_id, text=text)
+            self._scene_tree_signatures[item_id] = signature
+        for parent, ordered_ids in (
+            ("_nodes", [node.id for node in self.scenario.nodes]),
+            ("_obstacles", [obstacle.id for obstacle in self.scenario.obstacles]),
+        ):
+            if list(tree.get_children(parent)) != ordered_ids:
+                for index, item_id in enumerate(ordered_ids):
+                    tree.move(item_id, parent, index)
         if self.selected_id and self.scene_tree.exists(self.selected_id):
             self.scene_tree.selection_set(self.selected_id)
+
+    def _refresh_added_node(self, node: Node, *, reuse_geographic_layer: bool) -> None:
+        """Refresh node-dependent UI without rebuilding the unchanged obstacle tree."""
+        if self.scene_tree.exists("_nodes"):
+            self.scene_tree.item("_nodes", text=f"  Nodes  ({len(self.scenario.nodes)})")
+            marker = "●" if node.online else "○"
+            self.scene_tree.insert(
+                "_nodes",
+                "end",
+                iid=node.id,
+                text=f"  {marker}  {node.name}  ·  {node.role}",
+            )
+            self._scene_tree_signatures[node.id] = (node.name, node.role, node.online)
+            self.scene_tree.selection_set(node.id)
+            self.scene_tree.see(node.id)
+        else:
+            self.refresh_scene_tree()
+        self._build_object_form()
+        self._build_packet_form()
+        self.render_canvas(reuse_geographic_layer=reuse_geographic_layer)
+        self._refresh_mesh_graph()
+        self._update_title()
 
     def _scene_tree_select(self, _event: tk.Event) -> None:
         selected = self.scene_tree.selection()
         if selected and not selected[0].startswith("_") and selected[0] != self.selected_id:
             self.select(selected[0])
 
+    def _refresh_scene_change(
+        self,
+        *,
+        packet: bool = False,
+        geographic: bool = False,
+    ) -> None:
+        """Refresh only UI surfaces affected by a node/obstacle mutation."""
+        if geographic:
+            self._invalidate_geographic_layer()
+        self.refresh_scene_tree()
+        self._build_object_form()
+        if packet:
+            self._build_packet_form()
+        self.render_canvas()
+        self._refresh_mesh_graph()
+        self._update_title()
+
     def refresh_all(self) -> None:
+        self._invalidate_geographic_layer()
         if hasattr(self, "map_layer_var"):
             self.map_layer_var.set(self.scenario.environment.map_layer)
         self.refresh_scene_tree()

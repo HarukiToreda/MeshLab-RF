@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+from collections import deque
+from functools import lru_cache
 import io
 import hashlib
 import json
@@ -33,6 +35,7 @@ OVERTURE_ADAPTIVE_MAX_DEPTH = 2
 OBSTACLE_DETAIL_CELL_AREA_M2 = 3_000_000.0
 OBSTACLE_IMPORT_MAX_CELLS = 16
 OBSTACLE_IMPORT_MAX_AREA_M2 = 12_000_000.0
+MAP_TILE_WORKERS = 4
 _GEOCODE_LOCK = threading.Lock()
 _LAST_GEOCODE_REQUEST = 0.0
 
@@ -65,6 +68,12 @@ def mercator_to_latlon(x: float, y: float) -> tuple[float, float]:
     return latitude, longitude
 
 
+@lru_cache(maxsize=64)
+def _map_center_mercator(latitude: float, longitude: float) -> tuple[float, float]:
+    """Cache the stable map center used by every imported geometry point."""
+    return latlon_to_mercator(latitude, longitude)
+
+
 def latlon_to_world(
     latitude: float,
     longitude: float,
@@ -73,7 +82,7 @@ def latlon_to_world(
 ) -> tuple[float, float]:
     """Return unrestricted, center-relative Web Mercator coordinates."""
     x, y = latlon_to_mercator(latitude, longitude)
-    center_x, center_y = latlon_to_mercator(center_latitude, center_longitude)
+    center_x, center_y = _map_center_mercator(center_latitude, center_longitude)
     return x - center_x, center_y - y
 
 
@@ -84,7 +93,7 @@ def world_to_latlon(
     center_longitude: float,
 ) -> tuple[float, float]:
     """Convert unrestricted center-relative coordinates to latitude/longitude."""
-    center_x, center_y = latlon_to_mercator(center_latitude, center_longitude)
+    center_x, center_y = _map_center_mercator(center_latitude, center_longitude)
     return mercator_to_latlon(center_x + x, center_y - y)
 
 
@@ -99,7 +108,7 @@ def world_viewport_to_mercator_bounds(
     """Convert an unrestricted canvas viewport into ordered Web Mercator bounds."""
     left, right = min(world_left, world_right), max(world_left, world_right)
     top, bottom = min(world_top, world_bottom), max(world_top, world_bottom)
-    center_x, center_y = latlon_to_mercator(center_latitude, center_longitude)
+    center_x, center_y = _map_center_mercator(center_latitude, center_longitude)
     return (
         center_x + left,
         center_y - top,
@@ -108,6 +117,7 @@ def world_viewport_to_mercator_bounds(
     )
 
 
+@lru_cache(maxsize=32)
 def tile_size_m(zoom: int) -> float:
     return WEB_MERCATOR_WORLD_M / (2**zoom)
 
@@ -269,7 +279,7 @@ class MapDataService:
         self.tile_results: queue.Queue[tuple[tuple[str, int, int, int], bytes | Exception]] = queue.Queue()
         self.pending: set[tuple[str, int, int, int]] = set()
         self.pending_lock = threading.Lock()
-        for index in range(2):
+        for index in range(MAP_TILE_WORKERS):
             threading.Thread(target=self._tile_worker, name=f"MapTileWorker{index + 1}", daemon=True).start()
 
     def request_tile(self, layer: str, zoom: int, x: int, y: int) -> None:
@@ -493,11 +503,11 @@ class MapDataService:
         # leaf rather than allowing source order to empty the cells processed last.
         elements: list[dict[str, Any]] = []
         seen: set[str] = set()
-        remaining = [list(cell_elements) for cell_elements in leaf_results]
+        remaining = [deque(cell_elements) for cell_elements in leaf_results]
         while len(elements) < limit and any(remaining):
             for cell_elements in remaining:
                 while cell_elements:
-                    element = cell_elements.pop(0)
+                    element = cell_elements.popleft()
                     identifier = f"{element.get('type', 'overture')}/{element.get('id', '')}"
                     if identifier in seen:
                         continue
@@ -531,21 +541,47 @@ class MapDataService:
             if count <= 36:
                 break
             zoom -= 1
-        images: dict[tuple[int, int], Image.Image] = {}
-        values: list[float] = []
+        column_samples: list[tuple[int, int]] = []
+        for column in range(columns):
+            mercator_x = left + width_m * column / max(1, columns - 1)
+            tile_x_float, _unused_y = mercator_to_tile(mercator_x, center_y, zoom)
+            tile_x = math.floor(tile_x_float)
+            pixel_x = max(0, min(255, int((tile_x_float - tile_x) * 256)))
+            column_samples.append((tile_x, pixel_x))
+
+        row_samples: list[tuple[int, int]] = []
         for row in range(rows):
             mercator_y = top - height_m * row / max(1, rows - 1)
-            for column in range(columns):
-                mercator_x = left + width_m * column / max(1, columns - 1)
-                tile_x_float, tile_y_float = mercator_to_tile(mercator_x, mercator_y, zoom)
-                tile_x, tile_y = math.floor(tile_x_float), math.floor(tile_y_float)
-                image = images.get((tile_x, tile_y))
-                if image is None:
-                    data = self.get_tile_bytes("TerrainDEM", zoom, tile_x, tile_y)
-                    image = Image.open(io.BytesIO(data)).convert("RGB")
-                    images[(tile_x, tile_y)] = image
-                pixel_x = max(0, min(255, int((tile_x_float - tile_x) * 256)))
-                pixel_y = max(0, min(255, int((tile_y_float - tile_y) * 256)))
-                red, green, blue = image.getpixel((pixel_x, pixel_y))
+            _unused_x, tile_y_float = mercator_to_tile(center_x, mercator_y, zoom)
+            tile_y = math.floor(tile_y_float)
+            pixel_y = max(0, min(255, int((tile_y_float - tile_y) * 256)))
+            row_samples.append((tile_y, pixel_y))
+
+        tile_keys = list(
+            dict.fromkeys(
+                (tile_x, tile_y)
+                for tile_y, _pixel_y in row_samples
+                for tile_x, _pixel_x in column_samples
+            )
+        )
+
+        def load_tile(key: tuple[int, int]) -> Image.Image:
+            data = self.get_tile_bytes("TerrainDEM", zoom, key[0], key[1])
+            return Image.open(io.BytesIO(data)).convert("RGB")
+
+        if len(tile_keys) == 1:
+            images = {tile_keys[0]: load_tile(tile_keys[0])}
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(MAP_TILE_WORKERS, len(tile_keys))
+            ) as executor:
+                futures = {key: executor.submit(load_tile, key) for key in tile_keys}
+                images = {key: futures[key].result() for key in tile_keys}
+
+        pixels = {key: image.load() for key, image in images.items()}
+        values: list[float] = []
+        for tile_y, pixel_y in row_samples:
+            for tile_x, pixel_x in column_samples:
+                red, green, blue = pixels[(tile_x, tile_y)][pixel_x, pixel_y]
                 values.append(red * 256.0 + green + blue / 256.0 - 32768.0)
         return columns, rows, values, zoom

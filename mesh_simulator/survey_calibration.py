@@ -251,15 +251,24 @@ def fit_building_calibration(
     fitted_exponent = scenario.environment.path_loss_exponent
     distance_loss = float(OBSTACLE_DEFAULTS["Building"][3])
     receive_floor = PropagationModel.sensitivity(base) + MIN_DECODE_MARGIN_DB
+    # Only the penetration coefficient changes during this discrete search.
+    # Precompute the invariant path/distance terms instead of performing a
+    # three-column matrix multiply and allocating a parameter vector 601 times.
+    candidate_base_rssi = (
+        budget_array
+        + feature_array[:, 0] * fitted_exponent
+        + feature_array[:, 2] * distance_loss
+    )
+    penetration_exposure = feature_array[:, 1]
+    received_observed = observed_array[received_array]
     best: tuple[float, float, float, float] | None = None
     for candidate in np.arange(0.0, 30.001, 0.05):
-        parameters = np.asarray([fitted_exponent, candidate, distance_loss])
-        candidate_rssi = budget_array + feature_array @ parameters
+        candidate_rssi = candidate_base_rssi + penetration_exposure * candidate
         predicted_received = candidate_rssi >= receive_floor
         accuracy = float(np.mean(predicted_received == received_array))
         count_error = abs(int(np.sum(predicted_received)) - received_count)
         received_rmse = math.sqrt(float(np.mean(np.square(
-            observed_array[received_array] - candidate_rssi[received_array]
+            received_observed - candidate_rssi[received_array]
         ))))
         score = (accuracy, -float(count_error), -received_rmse, -float(candidate))
         if best is None or score > best:

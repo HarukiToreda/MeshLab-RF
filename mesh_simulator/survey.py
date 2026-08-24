@@ -180,46 +180,83 @@ def _integer(row: dict[str, str] | None, field: str, default: int = 0) -> int:
         return default
 
 
-def _gps_degrees(row: dict[str, str] | None, prefix: str, axis: str) -> float | None:
-    if not row or not _integer(row, f"{prefix}_gps_lock"):
-        return None
-    return _integer(row, f"{prefix}_{axis}_i") * 1e-7
+def _gps_position(
+    row: dict[str, str] | None,
+    prefix: str,
+) -> tuple[bool, float | None, float | None]:
+    locked = bool(_integer(row, f"{prefix}_gps_lock"))
+    if not locked:
+        return False, None, None
+    return (
+        True,
+        _integer(row, f"{prefix}_latitude_i") * 1e-7,
+        _integer(row, f"{prefix}_longitude_i") * 1e-7,
+    )
 
 
-def _rx_value(row: dict[str, str] | None, prefix: str, field: str, scale: float = 1.0) -> float | None:
+def _rx_metrics(
+    row: dict[str, str] | None,
+    prefix: str,
+) -> tuple[float | None, float | None]:
     if not row or not _integer(row, f"{prefix}_rx_valid"):
-        return None
-    return _integer(row, f"{prefix}_rx_{field}") / scale
+        return None, None
+    return (
+        float(_integer(row, f"{prefix}_rx_rssi_dbm")),
+        _integer(row, f"{prefix}_rx_snr_centi_db") / 100.0,
+    )
 
 
 def merge_survey_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, object]]:
-    rows = list(rows)
-    known_base_nodes = {_integer(row, "node_num") for row in rows if row.get("role") == "base"}
-    known_base_nodes.discard(0)
+    known_base_nodes: set[int] = set()
     grouped: dict[tuple[int, int], list[dict[str, str]]] = defaultdict(list)
     for row in rows:
+        if row.get("role") == "base":
+            node_num = _integer(row, "node_num")
+            if node_num:
+                known_base_nodes.add(node_num)
         sequence = _integer(row, "sequence")
         if sequence:
             grouped[(_integer(row, "session_id"), sequence)].append(row)
 
     measurements: list[dict[str, object]] = []
     for (session_id, sequence), group in sorted(grouped.items()):
-        sends = [row for row in group if row.get("role") == "mobile" and row.get("event") == "SEND"]
-        if not sends:
-            sends = [
-                row
-                for row in group
-                if row.get("role") == "mobile" and row.get("event") in {"REPLY_RX", "TIMEOUT"}
-            ]
-        if not sends:
+        send: dict[str, str] | None = None
+        completion: dict[str, str] | None = None
+        base_receives: list[dict[str, str]] = []
+        base_receives_by_node: dict[int, dict[str, str]] = {}
+        base_transmits_by_node: dict[int, dict[str, str]] = {}
+        mobile_replies_by_peer: dict[int, dict[str, str]] = {}
+        for row in group:
+            role = row.get("role")
+            event = row.get("event")
+            if role == "mobile":
+                if event == "SEND":
+                    send = row
+                elif event in {"REPLY_RX", "TIMEOUT"}:
+                    completion = row
+                if event == "REPLY_RX":
+                    mobile_replies_by_peer[_integer(row, "peer_num")] = row
+            elif role == "base":
+                if event == "PROBE_RX":
+                    base_receives.append(row)
+                    base_receives_by_node[_integer(row, "node_num")] = row
+                elif event == "REPLY_TX":
+                    base_transmits_by_node[_integer(row, "node_num")] = row
+
+        send = send or completion
+        if send is None:
             # A base-only capture still contains the mobile GPS carried by each
             # probe and the complete outward-link reading.  Surface those points
             # immediately; if a mobile capture is loaded later, the normal path
             # above replaces these partial measurements for the same sequences.
-            for base_receive in (
-                row for row in group
-                if row.get("role") == "base" and row.get("event") == "PROBE_RX"
-            ):
+            for base_receive in base_receives:
+                mobile_gps_lock, mobile_latitude, mobile_longitude = _gps_position(
+                    base_receive, "remote"
+                )
+                base_gps_lock, base_latitude, base_longitude = _gps_position(
+                    base_receive, "local"
+                )
+                forward_rssi_dbm, forward_snr_db = _rx_metrics(base_receive, "local")
                 measurements.append(
                     {
                         "session_id": session_id,
@@ -227,21 +264,21 @@ def merge_survey_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, object]]
                         "epoch_s": _integer(base_receive, "epoch_s"),
                         "mobile_node_num": _integer(base_receive, "peer_num"),
                         "base_node_num": _integer(base_receive, "node_num"),
-                        "mobile_gps_lock": bool(_integer(base_receive, "remote_gps_lock")),
-                        "mobile_latitude": _gps_degrees(base_receive, "remote", "latitude"),
-                        "mobile_longitude": _gps_degrees(base_receive, "remote", "longitude"),
+                        "mobile_gps_lock": mobile_gps_lock,
+                        "mobile_latitude": mobile_latitude,
+                        "mobile_longitude": mobile_longitude,
                         "mobile_altitude_m": _integer(base_receive, "remote_altitude_m"),
                         "mobile_hdop": _integer(base_receive, "remote_hdop_centi") / 100.0,
                         "mobile_satellites": _integer(base_receive, "remote_satellites"),
-                        "base_latitude": _gps_degrees(base_receive, "local", "latitude"),
-                        "base_longitude": _gps_degrees(base_receive, "local", "longitude"),
-                        "base_gps_lock": bool(_integer(base_receive, "local_gps_lock")),
+                        "base_latitude": base_latitude,
+                        "base_longitude": base_longitude,
+                        "base_gps_lock": base_gps_lock,
                         "base_altitude_m": _integer(base_receive, "local_altitude_m"),
                         "base_hdop": _integer(base_receive, "local_hdop_centi") / 100.0,
                         "base_satellites": _integer(base_receive, "local_satellites"),
                         "forward_received": True,
-                        "forward_rssi_dbm": _rx_value(base_receive, "local", "rssi_dbm"),
-                        "forward_snr_db": _rx_value(base_receive, "local", "snr_centi_db", 100.0),
+                        "forward_rssi_dbm": forward_rssi_dbm,
+                        "forward_snr_db": forward_snr_db,
                         # The base knows that it transmitted a reply, but cannot
                         # know whether the mobile received it without that log.
                         "reply_received": None,
@@ -261,68 +298,71 @@ def merge_survey_rows(rows: Iterable[dict[str, str]]) -> list[dict[str, object]]
                     }
                 )
             continue
-        send = sends[-1]
         mobile_node = _integer(send, "node_num")
-        base_receives = [row for row in group if row.get("role") == "base" and row.get("event") == "PROBE_RX"]
-        base_transmits = [row for row in group if row.get("role") == "base" and row.get("event") == "REPLY_TX"]
-        mobile_replies = [row for row in group if row.get("role") == "mobile" and row.get("event") == "REPLY_RX"]
-
-        base_nodes = {_integer(row, "node_num") for row in base_receives}
-        base_nodes.update(_integer(row, "peer_num") for row in mobile_replies)
+        base_nodes = set(base_receives_by_node)
+        base_nodes.update(mobile_replies_by_peer)
         base_nodes.update(known_base_nodes)
         base_nodes.discard(0)
         if not base_nodes:
             base_nodes = {0}
 
+        mobile_gps_lock, mobile_latitude, mobile_longitude = _gps_position(send, "local")
+        send_epoch_s = _integer(send, "epoch_s")
+        mobile_altitude_m = _integer(send, "local_altitude_m")
+        mobile_hdop = _integer(send, "local_hdop_centi") / 100.0
+        mobile_satellites = _integer(send, "local_satellites")
+        region = _integer(send, "region")
+        modem_preset = _integer(send, "modem_preset")
+        frequency_hz = _integer(send, "frequency_hz")
+        tx_power_dbm = _integer(send, "tx_power_dbm")
+        channel_utilization_pct = _integer(send, "channel_utilization_centi_pct") / 100.0
+        tx_utilization_pct = _integer(send, "tx_utilization_centi_pct") / 100.0
         for base_node in sorted(base_nodes):
-            base_receive = next((row for row in reversed(base_receives) if _integer(row, "node_num") == base_node), None)
-            base_transmit = next((row for row in reversed(base_transmits) if _integer(row, "node_num") == base_node), None)
-            mobile_reply = next((row for row in reversed(mobile_replies) if _integer(row, "peer_num") == base_node), None)
+            base_receive = base_receives_by_node.get(base_node)
+            base_transmit = base_transmits_by_node.get(base_node)
+            mobile_reply = mobile_replies_by_peer.get(base_node)
             base_source = mobile_reply or base_receive
+            base_prefix = "remote" if base_source is mobile_reply else "local"
             forward_source = mobile_reply if mobile_reply and _integer(mobile_reply, "remote_rx_valid") else base_receive
             forward_prefix = "remote" if forward_source is mobile_reply else "local"
             forward_received = base_receive is not None or mobile_reply is not None
             reply_received = mobile_reply is not None
+            base_gps_lock, base_latitude, base_longitude = _gps_position(base_source, base_prefix)
+            forward_rssi_dbm, forward_snr_db = _rx_metrics(forward_source, forward_prefix)
+            reverse_rssi_dbm, reverse_snr_db = _rx_metrics(mobile_reply, "local")
             measurement = {
                 "session_id": session_id,
                 "sequence": sequence,
-                "epoch_s": _integer(send, "epoch_s"),
+                "epoch_s": send_epoch_s,
                 "mobile_node_num": mobile_node,
                 "base_node_num": base_node,
-                "mobile_gps_lock": bool(_integer(send, "local_gps_lock")),
-                "mobile_latitude": _gps_degrees(send, "local", "latitude"),
-                "mobile_longitude": _gps_degrees(send, "local", "longitude"),
-                "mobile_altitude_m": _integer(send, "local_altitude_m"),
-                "mobile_hdop": _integer(send, "local_hdop_centi") / 100.0,
-                "mobile_satellites": _integer(send, "local_satellites"),
-                "base_latitude": _gps_degrees(base_source, "remote" if base_source is mobile_reply else "local", "latitude"),
-                "base_longitude": _gps_degrees(base_source, "remote" if base_source is mobile_reply else "local", "longitude"),
-                "base_gps_lock": bool(
-                    _integer(base_source, "remote_gps_lock" if base_source is mobile_reply else "local_gps_lock")
-                ),
+                "mobile_gps_lock": mobile_gps_lock,
+                "mobile_latitude": mobile_latitude,
+                "mobile_longitude": mobile_longitude,
+                "mobile_altitude_m": mobile_altitude_m,
+                "mobile_hdop": mobile_hdop,
+                "mobile_satellites": mobile_satellites,
+                "base_latitude": base_latitude,
+                "base_longitude": base_longitude,
+                "base_gps_lock": base_gps_lock,
                 "base_altitude_m": _integer(
-                    base_source, "remote_altitude_m" if base_source is mobile_reply else "local_altitude_m"
+                    base_source, f"{base_prefix}_altitude_m"
                 ),
-                "base_hdop": _integer(
-                    base_source, "remote_hdop_centi" if base_source is mobile_reply else "local_hdop_centi"
-                )
-                / 100.0,
-                "base_satellites": _integer(
-                    base_source, "remote_satellites" if base_source is mobile_reply else "local_satellites"
-                ),
+                "base_hdop": _integer(base_source, f"{base_prefix}_hdop_centi") / 100.0,
+                "base_satellites": _integer(base_source, f"{base_prefix}_satellites"),
                 "forward_received": forward_received,
-                "forward_rssi_dbm": _rx_value(forward_source, forward_prefix, "rssi_dbm"),
-                "forward_snr_db": _rx_value(forward_source, forward_prefix, "snr_centi_db", 100.0),
+                "forward_rssi_dbm": forward_rssi_dbm,
+                "forward_snr_db": forward_snr_db,
                 "reply_received": reply_received,
                 "base_reply_sent": bool(base_transmit or _integer(base_receive, "reply_sent") or reply_received),
-                "reverse_rssi_dbm": _rx_value(mobile_reply, "local", "rssi_dbm"),
-                "reverse_snr_db": _rx_value(mobile_reply, "local", "snr_centi_db", 100.0),
-                "region": _integer(send, "region"),
-                "modem_preset": _integer(send, "modem_preset"),
-                "frequency_hz": _integer(send, "frequency_hz"),
-                "tx_power_dbm": _integer(send, "tx_power_dbm"),
-                "channel_utilization_pct": _integer(send, "channel_utilization_centi_pct") / 100.0,
-                "tx_utilization_pct": _integer(send, "tx_utilization_centi_pct") / 100.0,
+                "reverse_rssi_dbm": reverse_rssi_dbm,
+                "reverse_snr_db": reverse_snr_db,
+                "region": region,
+                "modem_preset": modem_preset,
+                "frequency_hz": frequency_hz,
+                "tx_power_dbm": tx_power_dbm,
+                "channel_utilization_pct": channel_utilization_pct,
+                "tx_utilization_pct": tx_utilization_pct,
             }
             measurements.append(measurement)
     return measurements

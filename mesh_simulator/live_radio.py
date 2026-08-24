@@ -6,12 +6,13 @@ import queue
 import re
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pubsub import pub
 from serial.tools import list_ports
 
-from meshtastic.serial_interface import SerialInterface
+if TYPE_CHECKING:
+    from meshtastic.serial_interface import SerialInterface
 
 
 @dataclass(frozen=True)
@@ -218,6 +219,11 @@ class LiveRadioClient:
         self._subscribe()
 
         def worker() -> None:
+            # Meshtastic imports its protobuf stack, which is relatively heavy.
+            # Defer it until the COM-radio feature is actually used so map and
+            # survey-only sessions do not pay that startup cost.
+            from meshtastic.serial_interface import SerialInterface
+
             interface: SerialInterface | None = None
             try:
                 interface = SerialInterface(devPath=port, timeout=timeout)
