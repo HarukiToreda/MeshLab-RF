@@ -118,7 +118,9 @@ STATIC_COVERAGE_TAG = "static-coverage"
 # How many obstacle-import tiles to fetch at once.  Each tile already fans its
 # own cells across a small thread pool, so this multiplies overall throughput
 # without overwhelming the Overture endpoint.
-TILE_IMPORT_CONCURRENCY = 3
+TILE_IMPORT_CONCURRENCY = 9
+TILE_ADAPTIVE_QUERY_CONCURRENCY = 2
+SCENE_TREE_OBSTACLE_PAGE_SIZE = 300
 HUD_LAYER_TAG = "hud-layer"
 GEOGRAPHIC_LAYER_TAG = "geographic-layer"
 SELECTED_OBSTACLE_TAG = "selected-obstacle"
@@ -697,6 +699,7 @@ class MeshSimulatorApp:
         self.beacon_request_id = 0
         self.beacon_cancel = threading.Event()
         self.beacon_compute_queue: queue.Queue[tuple[int, Any, Any]] = queue.Queue()
+        self.beacon_compute_after: str | None = None
         self.beacon_blocking_obstacles: list[Obstacle] = []
         self.beacon_weakening_obstacles: list[Obstacle] = []
         # Static (frozen, non-pulsing) coverage shown when a sent packet reaches
@@ -809,6 +812,7 @@ class MeshSimulatorApp:
         ] = {}
         self.node_label_layout: dict[str, tuple[float, float, float, float, float, float]] = {}
         self._scene_tree_signatures: dict[str, tuple[object, ...]] = {}
+        self._scene_tree_imported_obstacle_limit = SCENE_TREE_OBSTACLE_PAGE_SIZE
         self.terrain_visual_source: Image.Image | None = None
         self.terrain_visual_key: tuple[Any, ...] | None = None
         self.terrain_tile_elevations: dict[tuple[int, int, int], np.ndarray] = {}
@@ -836,6 +840,7 @@ class MeshSimulatorApp:
         self.survey_worker: threading.Thread | None = None
         self.survey_updates: queue.Queue[tuple[str, object]] = queue.Queue()
         self.terrain_request_id = 0
+        self.pending_terrain_rf_refresh: tuple[int, str | None, bool, bool] | None = None
 
         self._build_menu()
         self._build_toolbar()
@@ -2117,6 +2122,14 @@ class MeshSimulatorApp:
             elif operation == "terrain_error":
                 request_id, error = result
                 if request_id == self.terrain_request_id:
+                    pending = self.pending_terrain_rf_refresh
+                    if pending is not None and pending[0] == request_id:
+                        self.pending_terrain_rf_refresh = None
+                        self._refresh_active_rf_after_scene_change(
+                            active_beacon_id=pending[1],
+                            restart_live_mesh=pending[2],
+                            restart_packet=pending[3],
+                        )
                     self.status_var.set(f"Terrain loading failed: {error}")
                     messagebox.showerror("Terrain loading failed", str(error), parent=self.root)
             elif operation == "obstacles":
@@ -2449,6 +2462,16 @@ class MeshSimulatorApp:
             or parameters[1] != env.map_center_lon
         ):
             return
+        pending = self.pending_terrain_rf_refresh
+        if pending is not None and pending[0] == request_id:
+            self.pending_terrain_rf_refresh = None
+            active_beacon_id = self.beacon_node_id or pending[1]
+            restart_live_mesh = self._live_mesh_running() or pending[2]
+            restart_packet = pending[3]
+        else:
+            active_beacon_id = self.beacon_node_id
+            restart_live_mesh = self._live_mesh_running()
+            restart_packet = self._standalone_packet_active()
         columns, rows, values, zoom = result
         _map_lat, _map_lon, left, top, right, bottom, _center_lat, _center_lon = parameters
         env.terrain_columns = columns
@@ -2475,6 +2498,12 @@ class MeshSimulatorApp:
             f"Terrain loaded: {self.format_distance(min(values))}–"
             f"{self.format_distance(max(values))} elevation · "
             f"{columns}×{rows} elevation samples"
+        )
+
+        self._refresh_active_rf_after_scene_change(
+            active_beacon_id=active_beacon_id,
+            restart_live_mesh=restart_live_mesh,
+            restart_packet=restart_packet,
         )
 
     def import_osm_obstacles(self) -> None:
@@ -2527,13 +2556,17 @@ class MeshSimulatorApp:
         tile_jobs: list[tuple[float, float, float, float, int, int, int]] = []
         total_building_limit = 0
         for tile_left, tile_top, tile_right, tile_bottom in tiles:
-            columns_c, rows_c, tile_limit, _sampled = obstacle_import_plan(
+            _columns_c, _rows_c, tile_limit, _sampled = obstacle_import_plan(
                 max(1.0, tile_right - tile_left), max(1.0, tile_bottom - tile_top)
             )
             total_building_limit += tile_limit
             north, west = world_to_latlon(tile_left, tile_top, env.map_center_lat, env.map_center_lon)
             south, east = world_to_latlon(tile_right, tile_bottom, env.map_center_lat, env.map_center_lon)
-            tile_jobs.append((south, west, north, east, columns_c, rows_c, tile_limit))
+            # Start with one complete request per top-level tile. Overture returns
+            # every footprint below tile_limit; only a genuinely saturated tile
+            # needs adaptive subdivision. The former unconditional 2x2 split made
+            # a normal nine-tile import perform 36 remote requests.
+            tile_jobs.append((south, west, north, east, 1, 1, tile_limit))
 
         forest_north, forest_west = world_to_latlon(covered_left, covered_top, env.map_center_lat, env.map_center_lon)
         forest_south, forest_east = world_to_latlon(covered_right, covered_bottom, env.map_center_lat, env.map_center_lon)
@@ -2556,6 +2589,11 @@ class MeshSimulatorApp:
                 lock = threading.Lock()
                 completed = [0]
 
+                def fetch_forests() -> list[dict[str, Any]]:
+                    return self.map_service.fetch_osm_forests(
+                        forest_south, forest_west, forest_north, forest_east
+                    )
+
                 def fetch_tile(job: tuple[float, float, float, float, int, int, int]):
                     south, west, north, east, columns_c, rows_c, tile_limit = job
                     source = "Overture"
@@ -2563,6 +2601,7 @@ class MeshSimulatorApp:
                         elements = self.map_service.fetch_overture_buildings_for_viewport(
                             south, west, north, east,
                             limit=tile_limit, columns=columns_c, rows=rows_c,
+                            query_workers=TILE_ADAPTIVE_QUERY_CONCURRENCY,
                         )
                     except Exception as overture_error:
                         try:
@@ -2590,39 +2629,31 @@ class MeshSimulatorApp:
                         )
                     return elements, source
 
-                # Fetch tiles concurrently; each tile still fans its own cells out
-                # across a small pool, so this multiplies overall throughput.
-                if total <= 1:
-                    tile_results = [fetch_tile(job) for job in tile_jobs]
-                else:
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=min(TILE_IMPORT_CONCURRENCY, total)
-                    ) as executor:
-                        tile_results = list(executor.map(fetch_tile, tile_jobs))
+                # Forests use a separate provider and used to begin only after every
+                # building query completed. Start that request beside the bounded
+                # building pool so its latency is normally hidden.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as forest_executor:
+                    forest_future = forest_executor.submit(fetch_forests)
+                    # Each tile fans its cells across a small pool; the outer limit
+                    # keeps aggregate remote work bounded.
+                    if total <= 1:
+                        tile_results = [fetch_tile(job) for job in tile_jobs]
+                    else:
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=min(TILE_IMPORT_CONCURRENCY, total)
+                        ) as executor:
+                            tile_results = list(executor.map(fetch_tile, tile_jobs))
+                    try:
+                        forests = forest_future.result()
+                    except Exception as forest_error:
+                        forests = []
+                        warnings.append(f"OSM forests unavailable: {forest_error}")
                 for elements, source in tile_results:
                     if source == "OSM fallback":
                         building_source = "OSM fallback"
                     for element in elements:
                         key = f"{element.get('type', 'overture')}/{element.get('id', '')}"
                         combined.setdefault(key, element)
-
-                try:
-                    self.geo_results.put(
-                        (
-                            "obstacle_progress",
-                            {
-                                "value": 0,
-                                "text": f"Loaded {len(combined):,} buildings · fetching forests…",
-                                "indeterminate": True,
-                            },
-                        )
-                    )
-                    forests = self.map_service.fetch_osm_forests(
-                        forest_south, forest_west, forest_north, forest_east
-                    )
-                except Exception as forest_error:
-                    forests = []
-                    warnings.append(f"OSM forests unavailable: {forest_error}")
 
                 self.geo_results.put(
                     (
@@ -2671,20 +2702,31 @@ class MeshSimulatorApp:
             warnings = []
             building_limit = OVERTURE_VIEWPORT_BUILDING_LIMIT
         env = self.scenario.environment
+        active_beacon_id = self.beacon_node_id
+        restart_live_mesh = self._live_mesh_running()
+        restart_packet = self._standalone_packet_active()
         existing = {obstacle.osm_id for obstacle in self.scenario.obstacles if obstacle.osm_id}
         added = 0
         added_buildings = 0
         added_forests = 0
         skipped = 0
+        imported_need_terrain = False
+        last_progress_update = 0.0
         self._set_obstacle_progress(f"Adding {len(elements):,} obstacle shapes…", 88.0)
         for element_index, element in enumerate(elements, start=1):
-            if element_index == 1 or element_index % 50 == 0 or element_index == len(elements):
+            now = time.perf_counter()
+            if (
+                element_index == 1
+                or element_index == len(elements)
+                or now - last_progress_update >= 0.1
+            ):
                 percent = 88.0 + 11.0 * element_index / max(1, len(elements))
                 self._set_obstacle_progress(
                     f"Adding obstacle shapes · {element_index:,}/{len(elements):,}",
                     percent,
                 )
                 self.root.update_idletasks()
+                last_progress_update = now
             osm_id = f"{element.get('type', 'way')}/{element.get('id', '')}"
             if osm_id in existing:
                 continue
@@ -2722,6 +2764,8 @@ class MeshSimulatorApp:
             center_x = sum(x_values) / len(x_values)
             center_y = sum(y_values) / len(y_values)
             base_elevation = env.terrain_elevation(center_x, center_y) or 0.0
+            if not imported_need_terrain and not self._terrain_covers(center_x, center_y):
+                imported_need_terrain = True
             feature_source = "Overture" if element.get("type") == "overture" else "OSM"
             name = tags.get("name") or f"{feature_source} {kind.lower()} {element.get('id', '')}"
             obstacle = Obstacle(
@@ -2751,10 +2795,19 @@ class MeshSimulatorApp:
                 added_forests += 1
         self.osm_import_button.configure(state="normal")
         if added:
+            if imported_need_terrain:
+                # Do not publish a temporary beacon/link profile with zero or
+                # partial obstacle elevations. Resume every active RF engine only
+                # after the expanded terrain grid has finalized the same scene a
+                # newly dropped beacon would use.
+                self._suspend_active_rf_for_scene_change(
+                    active_beacon_id=active_beacon_id,
+                    stop_live_mesh=restart_live_mesh,
+                )
             self.selected_id = None
             self.mark_dirty()
             self._mark_results_stale()
-            self.refresh_all()
+            self._refresh_scene_change(geographic=True)
         suffix = f" · {skipped} skipped/capped" if skipped else ""
         warning_suffix = f" · {'; '.join(warnings)}" if warnings else ""
         self.status_var.set(
@@ -2763,15 +2816,21 @@ class MeshSimulatorApp:
         )
         self._hide_obstacle_progress()
         if added:
-            imported = self.scenario.obstacles[-added:]
-            if any(
-                not self._terrain_covers(
-                    (obstacle.normalized()[0] + obstacle.normalized()[2]) / 2.0,
-                    (obstacle.normalized()[1] + obstacle.normalized()[3]) / 2.0,
-                )
-                for obstacle in imported
-            ):
+            if imported_need_terrain:
                 self.load_topography()
+                self.pending_terrain_rf_refresh = (
+                    self.terrain_request_id,
+                    active_beacon_id,
+                    restart_live_mesh,
+                    restart_packet,
+                )
+                self.status_var.set("Obstacles loaded · finalizing terrain before RF recalculation…")
+            else:
+                self._refresh_active_rf_after_scene_change(
+                    active_beacon_id=active_beacon_id,
+                    restart_live_mesh=restart_live_mesh,
+                    restart_packet=restart_packet,
+                )
 
     def _build_results(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent)
@@ -4593,6 +4652,78 @@ class MeshSimulatorApp:
         if was_animating and self.last_result is not None:
             self.root.after_idle(self._populate_results_once)
 
+    def _discard_inflight_simulation(self) -> None:
+        """Reject a packet worker that owns a pre-edit scenario snapshot."""
+        if self.simulation_thread is not None and self.simulation_thread.is_alive():
+            self.simulation_request_id += 1
+            self.simulation_thread = None
+            self.simulation_contours_complete = True
+            if hasattr(self, "send_button"):
+                self.send_button.configure(state="normal", text="▶  Send packet")
+
+    def _standalone_packet_active(self) -> bool:
+        """Return whether packet output should be rebuilt for a finalized scene."""
+        return bool(
+            not self._live_mesh_running()
+            and (
+                self.last_result is not None
+                or (self.simulation_thread is not None and self.simulation_thread.is_alive())
+            )
+        )
+
+    def _suspend_active_rf_for_scene_change(
+        self,
+        *,
+        active_beacon_id: str | None,
+        stop_live_mesh: bool,
+    ) -> None:
+        """Hide stale RF output while terrain finalizes imported obstacles."""
+        self._discard_inflight_simulation()
+        if stop_live_mesh:
+            self.stop_live_mesh(clear_visuals=True)
+        if self.last_result is not None:
+            # A selected live-mesh test also uses last_result for its map trace.
+            # Never leave that pre-import path painted over the finalized scene.
+            self.clear_results(render=False, update_status=False)
+        if active_beacon_id is not None:
+            self.stop_beacon(render=False)
+
+    def _refresh_active_rf_after_scene_change(
+        self,
+        *,
+        active_beacon_id: str | None,
+        restart_live_mesh: bool,
+        restart_packet: bool,
+    ) -> None:
+        """Restart each active RF engine from the finalized current scene."""
+        self._discard_inflight_simulation()
+        if restart_live_mesh:
+            # LiveMeshEngine precomputes a link cache. Rebuild it once in its worker
+            # so all scene changes affect traffic without blocking Tk.
+            self.stop_live_mesh(clear_visuals=True)
+            if self.last_result is not None:
+                self.clear_results(render=False, update_status=False)
+            self.live_mesh_enabled.set(True)
+            self.start_live_mesh()
+
+        if active_beacon_id is not None:
+            node = next(
+                (candidate for candidate in self.scenario.nodes if candidate.id == active_beacon_id),
+                None,
+            )
+            if node is not None and node.online:
+                # A clean start intentionally matches clicking Beacon after every
+                # obstacle and terrain elevation is already loaded.
+                self._queue_beacon_profile(node, keep_existing=False, render_on_stop=False)
+
+        if restart_packet and not restart_live_mesh:
+            if self.last_result is not None:
+                self.clear_results(render=False, update_status=False)
+            # Queue after the current terrain/import callback returns so the
+            # packet worker snapshots exactly the same finalized scene as a
+            # packet sent manually after obstacle loading.
+            self.root.after_idle(self.run_simulation)
+
     def _beacon_running(self) -> bool:
         return self.beacon_after is not None
 
@@ -4619,9 +4750,29 @@ class MeshSimulatorApp:
         if not node.online:
             self.status_var.set(f"{node.name} is offline · bring it online to pulse a beacon")
             return
-        self.stop_beacon()
-        self.beacon_node_id = node.id
-        self.beacon_phase = 0.0
+        self._queue_beacon_profile(node, keep_existing=False)
+
+    def _recompute_active_beacon(self, node_id: str) -> None:
+        """Reprofile a running beacon without hiding its current coverage."""
+        node = next((candidate for candidate in self.scenario.nodes if candidate.id == node_id), None)
+        if node is None or not node.online:
+            self.stop_beacon()
+            return
+        self._queue_beacon_profile(node, keep_existing=True)
+
+    def _queue_beacon_profile(
+        self,
+        node: Node,
+        *,
+        keep_existing: bool,
+        render_on_stop: bool = True,
+    ) -> None:
+        if keep_existing:
+            self.beacon_cancel.set()
+        else:
+            self.stop_beacon(render=render_on_stop)
+            self.beacon_node_id = node.id
+            self.beacon_phase = 0.0
         self.beacon_cancel = threading.Event()
         cancel = self.beacon_cancel
         self.beacon_request_id += 1
@@ -4636,7 +4787,8 @@ class MeshSimulatorApp:
             min(96, math.ceil(max(self.canvas.winfo_width(), self.canvas.winfo_height()) / 24)),
         )
         snapshot = self.scenario
-        self.status_var.set(f"Computing beacon coverage from {node.name}…")
+        action = "Updating" if keep_existing else "Computing"
+        self.status_var.set(f"{action} beacon coverage from {node.name}…")
 
         def worker() -> None:
             try:
@@ -4653,22 +4805,39 @@ class MeshSimulatorApp:
                 self.beacon_compute_queue.put((request_id, None, error))
 
         threading.Thread(target=worker, name="BeaconProfile", daemon=True).start()
-        self.root.after(40, self._poll_beacon_compute)
+        if self.beacon_compute_after is not None:
+            try:
+                self.root.after_cancel(self.beacon_compute_after)
+            except tk.TclError:
+                pass
+        self.beacon_compute_after = self.root.after(40, self._poll_beacon_compute)
 
     def _poll_beacon_compute(self) -> None:
-        try:
-            request_id, profile, error = self.beacon_compute_queue.get_nowait()
-        except queue.Empty:
-            if self.beacon_node_id is not None and not self.beacon_cancel.is_set():
-                self.root.after(50, self._poll_beacon_compute)
-            return
-        if request_id != self.beacon_request_id or self.beacon_cancel.is_set():
-            return  # a newer beacon (or a stop) superseded this compute
+        self.beacon_compute_after = None
+        while True:
+            try:
+                request_id, profile, error = self.beacon_compute_queue.get_nowait()
+            except queue.Empty:
+                if self.beacon_node_id is not None and not self.beacon_cancel.is_set():
+                    self.beacon_compute_after = self.root.after(50, self._poll_beacon_compute)
+                return
+            if request_id == self.beacon_request_id and not self.beacon_cancel.is_set():
+                break
+            # Drain superseded worker results without abandoning the current poll.
         if error is not None or profile is None:
             self.status_var.set(f"Beacon failed: {error}")
             self.stop_beacon()
             return
+        if self.beacon_after is not None:
+            try:
+                self.root.after_cancel(self.beacon_after)
+            except tk.TclError:
+                pass
+            self.beacon_after = None
         self.beacon_profile = profile
+        self.beacon_segment_photo_key = None
+        self._beacon_ripple_profile_id = None
+        self._beacon_ripple_geometry = []
         blocking = set(profile.blocking_obstacle_ids)
         weakening = set(profile.weakening_obstacle_ids)
         self.beacon_blocking_obstacles = [o for o in self.scenario.obstacles if o.id in blocking]
@@ -4681,12 +4850,21 @@ class MeshSimulatorApp:
             f"Beacon pulsing from {name} · {blocked} blocked · {weakened} weakened directions"
         )
         self.beacon_phase = 0.0
+        if hasattr(self, "canvas"):
+            self.canvas.delete(BEACON_STATIC_TAG)
+            self.canvas.delete(BEACON_ANIMATION_TAG)
         self._beacon_tick()
 
     def stop_beacon(self, render: bool = True) -> None:
         needs_full_render = self.zoom_preview_composite_active
         self.beacon_cancel.set()
         self.beacon_request_id += 1
+        if self.beacon_compute_after is not None:
+            try:
+                self.root.after_cancel(self.beacon_compute_after)
+            except tk.TclError:
+                pass
+        self.beacon_compute_after = None
         if self.beacon_after is not None:
             try:
                 self.root.after_cancel(self.beacon_after)
@@ -5124,7 +5302,7 @@ class MeshSimulatorApp:
             for obstacle in self.static_coverage_blocking:
                 self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
 
-    def clear_results(self) -> None:
+    def clear_results(self, *, render: bool = True, update_status: bool = True) -> None:
         if self._live_mesh_running():
             self.live_mesh_hidden_test_ids.update(self.live_mesh_tests)
             self.live_path_test_id = None
@@ -5156,11 +5334,13 @@ class MeshSimulatorApp:
             self.send_button.configure(state="normal", text="▶  Send packet")
         if hasattr(self, "clear_hops_button"):
             self.clear_hops_button.configure(state="disabled")
-        self.status_var.set(
-            "Packet traces cleared · live mesh traffic continues"
-            if self._live_mesh_running() else "Packet traces cleared · ready to send"
-        )
-        self.render_canvas()
+        if update_status:
+            self.status_var.set(
+                "Packet traces cleared · live mesh traffic continues"
+                if self._live_mesh_running() else "Packet traces cleared · ready to send"
+            )
+        if render:
+            self.render_canvas()
 
     def _mark_results_stale(self) -> None:
         """Retain displayed hops after edits until the user explicitly clears them."""
@@ -7148,10 +7328,15 @@ class MeshSimulatorApp:
         if not items:
             return
         photo, replaced = self._paste_zoom_photo(photo_attribute, preview)
-        if replaced or tag not in self.zoom_preview_active_tags:
-            for item in items:
+        for item in items:
+            if replaced or tag not in self.zoom_preview_active_tags:
                 self.canvas.itemconfigure(item, image=photo, state="normal")
-                self.canvas.coords(item, 0, 0)
+            # canvas.scale() moves image anchors but cannot scale their pixels.
+            # The preview pixels already contain the complete current transform,
+            # so retaining that moved anchor applies the cursor offset twice on
+            # the second and later wheel events.
+            self.canvas.coords(item, 0, 0)
+        if replaced or tag not in self.zoom_preview_active_tags:
             self.zoom_preview_active_tags.add(tag)
 
     def _paste_zoom_photo(
@@ -7263,15 +7448,17 @@ class MeshSimulatorApp:
         if preview is None:
             return False
         photo, replaced = self._paste_zoom_photo("zoom_composite_photo", preview)
-        if replaced or GEOGRAPHIC_LAYER_TAG not in self.zoom_preview_active_tags:
-            for item in geographic_items:
+        for item in geographic_items:
+            if replaced or GEOGRAPHIC_LAYER_TAG not in self.zoom_preview_active_tags:
                 self.canvas.itemconfigure(item, image=photo, state="normal")
-                self.canvas.coords(item, 0, 0)
+            self.canvas.coords(item, 0, 0)
+        if replaced or GEOGRAPHIC_LAYER_TAG not in self.zoom_preview_active_tags:
             self.zoom_preview_active_tags.add(GEOGRAPHIC_LAYER_TAG)
-        if "beacon-segment-image" not in self.zoom_preview_active_tags:
-            for item in beacon_items:
+        for item in beacon_items:
+            if "beacon-segment-image" not in self.zoom_preview_active_tags:
                 self.canvas.itemconfigure(item, state="hidden")
-                self.canvas.coords(item, 0, 0)
+            self.canvas.coords(item, 0, 0)
+        if "beacon-segment-image" not in self.zoom_preview_active_tags:
             self.zoom_preview_active_tags.add("beacon-segment-image")
         self.zoom_preview_composite_active = True
         return True
@@ -7647,13 +7834,28 @@ class MeshSimulatorApp:
             marker = "●" if node.online else "○"
             signature = (node.name, node.role, node.online)
             desired.append((node.id, "_nodes", signature, f"  {marker}  {node.name}  ·  {node.role}"))
-        for obstacle in self.scenario.obstacles:
+        # Thousands of imported footprints are retained in the scenario and RF
+        # model, but creating one Tk row for every footprint blocks the event loop
+        # for seconds. Manual objects remain fully listed; imported objects are
+        # paged on demand and map selection still works for every footprint.
+        manual_obstacles = [obstacle for obstacle in self.scenario.obstacles if not obstacle.osm_id]
+        imported_obstacles = [obstacle for obstacle in self.scenario.obstacles if obstacle.osm_id]
+        displayed_obstacles = manual_obstacles + imported_obstacles[
+            : self._scene_tree_imported_obstacle_limit
+        ]
+        selected = self.get_selected()
+        if isinstance(selected, Obstacle) and selected not in displayed_obstacles:
+            displayed_obstacles.append(selected)
+        for obstacle in displayed_obstacles:
             signature = (obstacle.name, obstacle.kind)
             desired.append(
                 (obstacle.id, "_obstacles", signature, f"  ▣  {obstacle.name}  ·  {obstacle.kind}")
             )
 
-        existing = set(tree.get_children("_nodes")) | set(tree.get_children("_obstacles"))
+        more_id = "_obstacles_more"
+        existing = set(tree.get_children("_nodes")) | (
+            set(tree.get_children("_obstacles")) - {more_id}
+        )
         desired_ids = {item_id for item_id, _parent, _signature, _text in desired}
         stale = existing - desired_ids
         if stale:
@@ -7668,11 +7870,23 @@ class MeshSimulatorApp:
             self._scene_tree_signatures[item_id] = signature
         for parent, ordered_ids in (
             ("_nodes", [node.id for node in self.scenario.nodes]),
-            ("_obstacles", [obstacle.id for obstacle in self.scenario.obstacles]),
+            ("_obstacles", [obstacle.id for obstacle in displayed_obstacles]),
         ):
-            if list(tree.get_children(parent)) != ordered_ids:
+            current_ids = [item_id for item_id in tree.get_children(parent) if item_id != more_id]
+            if current_ids != ordered_ids:
                 for index, item_id in enumerate(ordered_ids):
                     tree.move(item_id, parent, index)
+        remaining = max(0, len(imported_obstacles) - self._scene_tree_imported_obstacle_limit)
+        if remaining:
+            next_count = min(SCENE_TREE_OBSTACLE_PAGE_SIZE, remaining)
+            more_text = f"  …  Load {next_count:,} more imported obstructions · {remaining:,} remaining"
+            if tree.exists(more_id):
+                tree.item(more_id, text=more_text)
+                tree.move(more_id, "_obstacles", "end")
+            else:
+                tree.insert("_obstacles", "end", iid=more_id, text=more_text)
+        elif tree.exists(more_id):
+            tree.delete(more_id)
         if self.selected_id and self.scene_tree.exists(self.selected_id):
             self.scene_tree.selection_set(self.selected_id)
 
@@ -7700,6 +7914,10 @@ class MeshSimulatorApp:
 
     def _scene_tree_select(self, _event: tk.Event) -> None:
         selected = self.scene_tree.selection()
+        if selected == ("_obstacles_more",):
+            self._scene_tree_imported_obstacle_limit += SCENE_TREE_OBSTACLE_PAGE_SIZE
+            self.refresh_scene_tree()
+            return
         if selected and not selected[0].startswith("_") and selected[0] != self.selected_id:
             self.select(selected[0])
 

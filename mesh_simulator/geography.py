@@ -455,13 +455,23 @@ class MapDataService:
         limit: int = OVERTURE_VIEWPORT_BUILDING_LIMIT,
         columns: int = 2,
         rows: int = 2,
+        query_workers: int = 4,
         progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """Recursively split saturated cells so capped source batches do not leave internal holes."""
         initial_cells = split_geographic_bounds(south, west, north, east, columns=columns, rows=rows)
         frontier = [(cell, 0) for cell in initial_cells]
         leaf_results: list[list[dict[str, Any]]] = []
-        cell_query_limit = max(1, min(OVERTURE_CELL_QUERY_LIMIT, limit))
+        # A 750-feature cap forced dense city cells through as many as 84 remote
+        # queries per viewport tile.  Give each initial cell enough headroom to
+        # supply its proportional share of the requested result (plus 50%).  A
+        # genuinely saturated cell is still subdivided, preserving spatial
+        # coverage, but ordinary urban imports normally finish in one wave.
+        proportional_limit = math.ceil(limit / max(1, len(initial_cells)) * 1.5)
+        cell_query_limit = max(
+            1,
+            min(limit, max(OVERTURE_CELL_QUERY_LIMIT, proportional_limit)),
+        )
         completed_units = 0
         total_units = len(frontier) * (4**OVERTURE_ADAPTIVE_MAX_DEPTH)
         processed_queries = 0
@@ -474,7 +484,9 @@ class MapDataService:
 
         while frontier:
             next_frontier: list[tuple[tuple[float, float, float, float], int]] = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(frontier))) as executor:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(max(1, query_workers), len(frontier))
+            ) as executor:
                 future_items = {executor.submit(fetch_cell, item): item for item in frontier}
                 for future in concurrent.futures.as_completed(future_items):
                     cell, depth = future_items[future]

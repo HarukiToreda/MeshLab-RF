@@ -99,6 +99,115 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(app.zoom, 20.0)
         self.assertLessEqual(app.zoom, MAX_CANVAS_ZOOM)
 
+    def test_repeated_zoom_preview_resets_raster_anchor(self):
+        class PreviewCanvas:
+            def __init__(self):
+                self.coordinates: list[tuple[int, int, int]] = []
+
+            @staticmethod
+            def find_withtag(_tag: str) -> tuple[int, ...]:
+                return (17,)
+
+            @staticmethod
+            def itemconfigure(_item: int, **_values: object) -> None:
+                return None
+
+            def coords(self, item: int, x: int, y: int) -> None:
+                self.coordinates.append((item, x, y))
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.canvas = PreviewCanvas()
+        app.zoom_preview_active_tags = {"geographic"}
+        app._transformed_zoom_source = lambda *_args, **_kwargs: object()
+        app._paste_zoom_photo = lambda *_args, **_kwargs: (object(), False)
+
+        app._zoom_preview_layer(
+            object(),
+            (1, 1, 0.0, 0.0, 1.0),
+            tag="geographic",
+            photo_attribute="zoom_geographic_photo",
+        )
+
+        self.assertEqual(app.canvas.coordinates, [(17, 0, 0)])
+
+    def test_scene_change_restarts_beacon_like_a_fresh_drop(self):
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        source = Node(id="source", name="Source")
+        app.scenario = Scenario(nodes=[source])
+        app.simulation_thread = None
+        queued: list[tuple[str, bool, bool]] = []
+        app._queue_beacon_profile = lambda node, *, keep_existing, render_on_stop=True: queued.append(
+            (node.id, keep_existing, render_on_stop)
+        )
+
+        app._refresh_active_rf_after_scene_change(
+            active_beacon_id=source.id,
+            restart_live_mesh=False,
+            restart_packet=False,
+        )
+
+        self.assertEqual(queued, [(source.id, False, False)])
+
+    def test_scene_change_restarts_live_mesh_and_clears_its_old_packet_trace(self):
+        class Toggle:
+            def __init__(self) -> None:
+                self.value = False
+
+            def set(self, value: bool) -> None:
+                self.value = value
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.scenario = Scenario()
+        app.simulation_thread = None
+        app.last_result = object()
+        app.live_mesh_enabled = Toggle()
+        calls: list[tuple[str, bool, bool]] = []
+        app._discard_inflight_simulation = lambda: calls.append(("discard", False, False))
+        app.stop_live_mesh = lambda clear_visuals=False: calls.append(("stop-live", clear_visuals, False))
+        app.clear_results = lambda *, render=True, update_status=True: calls.append(
+            ("clear-packet", render, update_status)
+        )
+        app.start_live_mesh = lambda: calls.append(("start-live", app.live_mesh_enabled.value, False))
+
+        app._refresh_active_rf_after_scene_change(
+            active_beacon_id=None,
+            restart_live_mesh=True,
+            restart_packet=False,
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                ("discard", False, False),
+                ("stop-live", True, False),
+                ("clear-packet", False, False),
+                ("start-live", True, False),
+            ],
+        )
+
+    def test_scene_change_requeues_standalone_packet_after_final_scene(self):
+        class Root:
+            def after_idle(self, callback):
+                callback()
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.scenario = Scenario()
+        app.simulation_thread = None
+        app.last_result = object()
+        app.root = Root()
+        calls: list[str] = []
+        app._discard_inflight_simulation = lambda: calls.append("discard")
+        app.clear_results = lambda *, render=True, update_status=True: calls.append("clear")
+        app.run_simulation = lambda: calls.append("run")
+
+        app._refresh_active_rf_after_scene_change(
+            active_beacon_id=None,
+            restart_live_mesh=False,
+            restart_packet=True,
+        )
+
+        self.assertEqual(calls, ["discard", "clear", "run"])
+
     def test_nearby_node_labels_are_placed_without_overlapping(self):
         placements = layout_node_labels(
             [
