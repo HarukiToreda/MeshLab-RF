@@ -18,7 +18,7 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable
 
 import numpy as np
-from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont, ImageTk
 
 from .geography import (
     MapDataService,
@@ -712,7 +712,7 @@ class MeshSimulatorApp:
         self.static_coverage_cancel = threading.Event()
         self.static_coverage_request_id = 0
         self.static_coverage_queue: queue.Queue[tuple[int, Any, Any, str]] = queue.Queue()
-        self.static_coverage_grow = 1.0   # one-shot expand 0->1, then frozen
+        self.static_coverage_grow = 1.0   # one-shot beacon-style ripple phase
         self.static_coverage_after: str | None = None
         # When the zero-hop heatmap finishes expanding: freeze (reached nobody) or
         # clear it and continue the normal hop animation (reached another node).
@@ -5004,7 +5004,7 @@ class MeshSimulatorApp:
                 f"Packet reached no other node · coverage from {name} · "
                 f"{blocked} blocked · {weakened} weakened directions"
             )
-        # One-shot expand from the sender outwards.
+        # One beacon-style ripple over the fixed, physically sampled footprint.
         self.static_coverage_grow = 0.0
         self._animate_static_coverage()
 
@@ -5020,8 +5020,8 @@ class MeshSimulatorApp:
                 self.clear_static_coverage()
                 self._continue_after_zero_hop()
             return
-        self.static_coverage_grow = min(1.0, self.static_coverage_grow + 0.06)
-        self.static_coverage_after = self.root.after(30, self._animate_static_coverage)
+        self.static_coverage_grow = min(1.0, self.static_coverage_grow + 0.045)
+        self.static_coverage_after = self.root.after(45, self._animate_static_coverage)
 
     def _continue_after_zero_hop(self) -> None:
         """The heatmap already showed the source's own (hop-1) coverage, so reveal
@@ -5137,9 +5137,17 @@ class MeshSimulatorApp:
                     strength_position = max(0.0, min(1.0, midpoint_distance / outer))
                     margin = (inner.margin_db + outer_sample.margin_db) * 0.5
                     margin_position = 1.0 - max(0.0, min(1.0, margin / 24.0))
-                    # Preserve the original distance bands while allowing the RF
-                    # model to bend their colour around local obstruction loss.
-                    strength_position = strength_position * 0.72 + margin_position * 0.28
+                    obstacle_loss = (
+                        inner.obstacle_loss_db + outer_sample.obstacle_loss_db
+                    ) * 0.5
+                    obstacle_position = max(0.0, min(1.0, obstacle_loss / 24.0))
+                    # Preserve the established distance bands and boundary shape,
+                    # while making each accumulated penetration visible immediately.
+                    # Margin controls the fade near decoding limits; cumulative
+                    # obstacle loss prevents a ray from staying falsely green after
+                    # it has already passed through one or more buildings.
+                    local_loss_position = max(margin_position, obstacle_position)
+                    strength_position = strength_position * 0.65 + local_loss_position * 0.35
                     if crossed_gap:
                         # A section that reappears on elevated terrain uses its
                         # measured margin, so a strong mountain-top path can be
@@ -5183,7 +5191,9 @@ class MeshSimulatorApp:
                 layer,
                 weakening,
                 blocking,
+                profile=profile,
                 render_scale=render_scale,
+                grow=grow,
             )
 
             layer = layer.resize((width, height), Image.Resampling.LANCZOS)
@@ -5206,9 +5216,11 @@ class MeshSimulatorApp:
         weakening: list[Obstacle],
         blocking: list[Obstacle],
         *,
+        profile: BeaconProfile,
         render_scale: int,
+        grow: float,
     ) -> None:
-        """Rasterize beacon warning footprints without creating canvas objects."""
+        """Rasterize warning footprints only inside rays that touched them."""
         if not weakening and not blocking:
             return
         scale = self._base_scale() * self.zoom * render_scale
@@ -5220,13 +5232,10 @@ class MeshSimulatorApp:
             view_x + layer.width / max(scale, 1e-12),
             view_y + layer.height / max(scale, 1e-12),
         )
-        overlay = Image.new("RGBA", layer.size, (0, 0, 0, 0))
-        drawing = ImageDraw.Draw(overlay, "RGBA")
-
         def point(world_x: float, world_y: float) -> tuple[float, float]:
             return ((world_x - view_x) * scale, (world_y - view_y) * scale)
 
-        def draw_obstacle(obstacle: Obstacle, color: str) -> None:
+        def draw_obstacle(drawing: ImageDraw.ImageDraw, obstacle: Obstacle, color: str) -> None:
             if not self._bounds_overlap(self._obstacle_bounds(obstacle), viewport):
                 return
             red, green, blue = ImageColor.getrgb(color)
@@ -5260,11 +5269,45 @@ class MeshSimulatorApp:
                 width=line_width,
             )
 
-        for obstacle in weakening:
-            draw_obstacle(obstacle, self._BEACON_SLOW)
-        for obstacle in blocking:
-            draw_obstacle(obstacle, self._BEACON_BLOCK)
-        layer.alpha_composite(overlay)
+        weakening_ids = {obstacle.id for obstacle in weakening}
+        blocking_ids = {obstacle.id for obstacle in blocking}
+        half_step = math.pi / max(1, len(profile.rays))
+
+        def ray_mask(wanted_ids: set[str]) -> Image.Image:
+            mask = Image.new("L", layer.size, 0)
+            mask_drawing = ImageDraw.Draw(mask)
+            source = point(profile.x, profile.y)
+            for ray in profile.rays:
+                if not wanted_ids.intersection(ray.obstacle_ids):
+                    continue
+                reachable = [sample.distance_m for sample in ray.samples if sample.reachable]
+                if not reachable:
+                    continue
+                distance = min(profile.max_reach_m, max(reachable) + 60.0) * grow
+                left = point(
+                    profile.x + math.cos(ray.angle - half_step) * distance,
+                    profile.y + math.sin(ray.angle - half_step) * distance,
+                )
+                right = point(
+                    profile.x + math.cos(ray.angle + half_step) * distance,
+                    profile.y + math.sin(ray.angle + half_step) * distance,
+                )
+                mask_drawing.polygon((source, left, right), fill=255)
+            return mask
+
+        def composite_group(obstacles: list[Obstacle], color: str, mask: Image.Image) -> None:
+            if not obstacles or mask.getbbox() is None:
+                return
+            overlay = Image.new("RGBA", layer.size, (0, 0, 0, 0))
+            drawing = ImageDraw.Draw(overlay, "RGBA")
+            for obstacle in obstacles:
+                draw_obstacle(drawing, obstacle, color)
+            overlay.putalpha(ImageChops.multiply(overlay.getchannel("A"), mask))
+            layer.alpha_composite(overlay)
+
+        composite_group(weakening, self._BEACON_SLOW, ray_mask(weakening_ids))
+        # Draw blockers last so red keeps priority where footprints overlap.
+        composite_group(blocking, self._BEACON_BLOCK, ray_mask(blocking_ids))
 
     def _draw_segmented_ripple(
         self,
@@ -5351,22 +5394,25 @@ class MeshSimulatorApp:
         return True
 
     def _draw_static_coverage(self, c: tk.Canvas) -> None:
-        """Coverage heatmap for the sender of an unreached packet: it expands once
-        to full extent then holds (no pulsing).  Green->yellow->red fill, yellow
-        slows / red blocks obstacles."""
+        """Fixed zero-hop footprint with one beacon-style reachable-only ripple."""
         profile = self.static_coverage_profile
         if profile is None or len(profile.rays) < 3:
             return
-        grow = max(0.0, min(1.0, self.static_coverage_grow))
-        if grow <= 0.01:
-            return
-        if self._draw_segmented_coverage(c, profile, cache_prefix="static", grow=grow):
+        phase = max(0.0, min(1.0, self.static_coverage_grow))
+        # The coverage is already the result of complete per-segment link checks.
+        # Keep it fixed at its true location: scaling it during animation drags
+        # separated reachable sections through dead ground and falsely paints that
+        # ground as covered.  Only the broken reception ripple travels outward.
+        if self._draw_segmented_coverage(c, profile, cache_prefix="static", grow=1.0):
+            if phase > 0.02:
+                self._draw_segmented_ripple(c, profile, phase)
             return
         w2s = self.world_to_screen
         ox, oy = profile.x, profile.y
-        # Boundary points scaled by the current growth so the whole shape expands.
+        # Compatibility fallback for old profiles without radial samples: keep the
+        # footprint fixed rather than implying reception in unsampled locations.
         world = [
-            (ox + math.cos(ray.angle) * ray.reach_m * grow, oy + math.sin(ray.angle) * ray.reach_m * grow)
+            (ox + math.cos(ray.angle) * ray.reach_m, oy + math.sin(ray.angle) * ray.reach_m)
             for ray in profile.rays
         ]
         bands = 7
@@ -5384,12 +5430,10 @@ class MeshSimulatorApp:
         edge.extend(edge[:2])
         c.create_line(*edge, fill=self._BEACON_HALO, width=3, joinstyle=tk.ROUND)
         c.create_line(*edge, fill="#ffffff", width=1, joinstyle=tk.ROUND)
-        # Reveal the culprit obstacles only once the wave has fully arrived.
-        if grow >= 0.999:
-            for obstacle in self.static_coverage_weakening:
-                self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
-            for obstacle in self.static_coverage_blocking:
-                self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
+        for obstacle in self.static_coverage_weakening:
+            self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
+        for obstacle in self.static_coverage_blocking:
+            self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
 
     def clear_results(self, *, render: bool = True, update_status: bool = True) -> None:
         if self._live_mesh_running():

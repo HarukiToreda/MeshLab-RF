@@ -249,6 +249,75 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(canvas_warning_calls, [])
 
+    def test_segmented_warning_footprint_is_clipped_to_the_ray_that_hit_it(self):
+        obstacle = Obstacle(id="hit-building", x1=20, y1=-50, x2=60, y2=50)
+        rays = []
+        for angle in (0.0, math.pi / 2, math.pi, 3 * math.pi / 2):
+            rays.append(
+                BeaconRay(
+                    angle,
+                    100.0,
+                    100.0,
+                    "clear",
+                    [obstacle.id] if angle == 0.0 else [],
+                    [
+                        BeaconRadialSample(0.0, 40.0, True),
+                        BeaconRadialSample(100.0, 20.0, True),
+                    ],
+                )
+            )
+        profile = BeaconProfile("source", 0.0, 0.0, rays, max_reach_m=100.0)
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.zoom = 1.0
+        app.view_x = -100.0
+        app.view_y = -100.0
+        app._base_scale = lambda: 1.0
+        app._obstacle_bounds = lambda candidate: candidate.normalized()
+        layer = Image.new("RGBA", (200, 200), (0, 0, 0, 0))
+
+        app._draw_segmented_warning_obstacles(
+            layer,
+            [obstacle],
+            [],
+            profile=profile,
+            render_scale=1,
+            grow=1.0,
+        )
+
+        self.assertGreater(layer.getpixel((140, 100))[3], 0)
+        self.assertEqual(layer.getpixel((140, 52))[3], 0)
+
+    def test_zero_hop_keeps_coverage_fixed_and_animates_beacon_ripple(self):
+        rays = [
+            BeaconRay(
+                angle,
+                100.0,
+                100.0,
+                "clear",
+                samples=[
+                    BeaconRadialSample(0.0, 40.0, True),
+                    BeaconRadialSample(100.0, 10.0, True),
+                ],
+            )
+            for angle in (0.0, 2.1, 4.2)
+        ]
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.static_coverage_profile = BeaconProfile("source", 0.0, 0.0, rays)
+        app.static_coverage_grow = 0.42
+        coverage_calls: list[float] = []
+        ripple_calls: list[float] = []
+        app._draw_segmented_coverage = lambda *_args, **kwargs: (
+            coverage_calls.append(kwargs["grow"]) or True
+        )
+        app._draw_segmented_ripple = lambda _canvas, _profile, fraction: (
+            ripple_calls.append(fraction) or True
+        )
+
+        app._draw_static_coverage(object())
+
+        self.assertEqual(coverage_calls, [1.0])
+        self.assertEqual(ripple_calls, [0.42])
+
     def test_scene_change_restarts_beacon_like_a_fresh_drop(self):
         app = MeshSimulatorApp.__new__(MeshSimulatorApp)
         source = Node(id="source", name="Source")
@@ -679,6 +748,40 @@ class ModelTests(unittest.TestCase):
         )
         blocked = PropagationModel(scenario).link(a, b)
         self.assertAlmostEqual(clear.rssi_dbm - blocked.rssi_dbm, 20, places=3)
+
+    def test_beacon_samples_keep_cumulative_building_loss_and_attribute_each_hit(self):
+        source = Node(x=0, y=0, antenna_height_m=2)
+        buildings = [
+            Obstacle(
+                id=f"building-{index}",
+                name=f"Building {index}",
+                x1=distance,
+                y1=-20,
+                x2=distance + 20,
+                y2=20,
+                height_m=20,
+                attenuation_db=6,
+                loss_per_100m_db=0,
+            )
+            for index, distance in enumerate((180, 380, 580), start=1)
+        ]
+        model = PropagationModel(Scenario(nodes=[source], obstacles=buildings))
+
+        profile = model.beacon_profile(
+            source,
+            angular_samples=8,
+            max_range_m=1_000,
+            segment_samples=40,
+        )
+        east = profile.rays[0]
+        losses = [
+            next(sample.obstacle_loss_db for sample in east.samples if sample.distance_m >= distance)
+            for distance in (250, 450, 650)
+        ]
+
+        self.assertEqual(losses, [6.0, 12.0, 18.0])
+        self.assertEqual(set(east.obstacle_ids), {building.id for building in buildings})
+        self.assertTrue({building.id for building in buildings}.issubset(profile.weakening_obstacle_ids))
 
     def test_large_import_spatial_index_keeps_intersecting_obstacles(self):
         source = Node(x=0, y=500)

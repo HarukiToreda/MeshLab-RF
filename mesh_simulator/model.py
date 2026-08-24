@@ -416,6 +416,7 @@ class BeaconRadialSample:
     distance_m: float
     margin_db: float
     reachable: bool
+    obstacle_loss_db: float = 0.0
 
 
 @dataclass
@@ -1313,10 +1314,34 @@ class PropagationModel:
                     and failed_link.reason not in self._MISMATCH_REASONS
                 )
 
-            # Attribute culprit obstacles only up to where the signal actually
-            # reached, plus a tiny fixed margin so the blocker sitting right at the
-            # edge is caught -- never buildings sitting out beyond the coverage.
-            attribution = min(maximum_range, reach + 60.0)
+            radial_samples: list[BeaconRadialSample] = []
+            if segment_samples > 0:
+                radial_count = max(16, min(160, int(segment_samples)))
+                # The source is always the beginning of a visible section.
+                radial_samples.append(BeaconRadialSample(0.0, 40.0, True, 0.0))
+                for radial_index in range(1, radial_count + 1):
+                    distance = maximum_range * radial_index / radial_count
+                    radial_link = sample(dx, dy, distance)
+                    radial_samples.append(
+                        BeaconRadialSample(
+                            distance,
+                            radial_link.margin_db,
+                            radial_link.compatible
+                            and radial_link.margin_db >= MIN_DECODE_MARGIN_DB,
+                            radial_link.obstacle_loss_db,
+                        )
+                    )
+
+            # Attribute obstacles only as far as this sampled direction has actual
+            # reception, plus a short margin that catches the building at a cutoff.
+            # A later elevated section may be reachable after dead ground, so use
+            # the furthest reachable radial sample rather than only the first binary
+            # cutoff.  This keeps distant, untouched buildings out of the overlay.
+            furthest_reachable = max(
+                (radial.distance_m for radial in radial_samples if radial.reachable),
+                default=reach,
+            )
+            attribution = min(maximum_range, max(reach, furthest_reachable) + 60.0)
             position(dx, dy, attribution)
             obstacle_ids = self._ray_blocking_obstacles(
                 source,
@@ -1327,7 +1352,6 @@ class PropagationModel:
 
             if hard_blocked:
                 kind = "blocked"
-                blocking.extend(obstacle_ids)
             else:
                 # A beam that falls well short of the open-air range was cut down by
                 # something 3-D in the way -- a building OR the terrain/a mountain --
@@ -1339,24 +1363,19 @@ class PropagationModel:
                     mid_link = sample(dx, dy, max(1.0, min(reach, clear_reference) * 0.7))
                     weakened = mid_link.obstacle_loss_db >= weaken_loss_db
                 kind = "weakened" if weakened else "clear"
-                if weakened:
-                    weakening.extend(obstacle_ids)
-            radial_samples: list[BeaconRadialSample] = []
-            if segment_samples > 0:
-                radial_count = max(16, min(160, int(segment_samples)))
-                # The source is always the beginning of a visible section.
-                radial_samples.append(BeaconRadialSample(0.0, 40.0, True))
-                for radial_index in range(1, radial_count + 1):
-                    distance = maximum_range * radial_index / radial_count
-                    radial_link = sample(dx, dy, distance)
-                    radial_samples.append(
-                        BeaconRadialSample(
-                            distance,
-                            radial_link.margin_db,
-                            radial_link.compatible
-                            and radial_link.margin_db >= MIN_DECODE_MARGIN_DB,
-                        )
-                    )
+
+            # Warning colour describes each physical obstacle, not the overall ray
+            # classification.  Every penetrated ATTENUATE obstacle removes signal
+            # and is yellow even when enough margin remains for the ray to be clear;
+            # only an explicit hard blocker is red.  Red retains priority if several
+            # sampled directions touch the same footprint.
+            obstacle_by_id = {obstacle.id: obstacle for obstacle in ray_obstacles}
+            for obstacle_id in obstacle_ids:
+                obstacle = obstacle_by_id.get(obstacle_id)
+                if obstacle is not None and obstacle.behavior == "BLOCK":
+                    blocking.append(obstacle_id)
+                else:
+                    weakening.append(obstacle_id)
             rays.append(
                 BeaconRay(
                     angle,
