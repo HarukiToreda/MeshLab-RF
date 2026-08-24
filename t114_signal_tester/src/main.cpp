@@ -669,13 +669,13 @@ void showScreen(const char *title, const char *line1 = nullptr, const char *line
 }
 
 #if defined(SURVEY_ROLE_MOBILE)
-void showMovementWaiting(double distanceMeters)
+void showMovementWaiting(double distanceMeters, float requiredDistanceMeters)
 {
     if (menuMode != MenuMode::Closed)
         return;
     char message[48];
     snprintf(message, sizeof(message), "Waiting for movement %.1f / %.1f m", distanceMeters,
-             GPS_MIN_SAMPLE_DISTANCE_METERS);
+             requiredDistanceMeters);
     display.fillRect(0, 100, 240, 19, ST77XX_BLACK);
     display.setTextColor(ST77XX_YELLOW);
     drawWrappedText(message, 4, 102, 232, 118, 1);
@@ -706,7 +706,7 @@ void showLoggingStatus()
     else if (!storage.canAppend())
         showScreen("OLD LOG FOUND", "Extraction still works", "Wipe to use compact log");
     else
-        showScreen("LOGGING PAUSED", "No samples recorded", "Start when both are ready");
+        showScreen(ROLE_NAME, "Logging paused", "Stored logs retained", "Start from menu");
 }
 
 const char *menuLabel(uint8_t selection)
@@ -736,13 +736,18 @@ uint16_t popupAccent()
     return ST77XX_YELLOW;
 }
 
+uint16_t popupPanelColor()
+{
+    return display.color565(18, 22, 30);
+}
+
 void drawPopupFrame(const char *title)
 {
     constexpr int16_t x = 8;
     constexpr int16_t y = 4;
     constexpr int16_t width = 224;
     constexpr int16_t height = 126;
-    const uint16_t panel = display.color565(18, 22, 30);
+    const uint16_t panel = popupPanelColor();
     display.fillRoundRect(x, y, width, height, 7, ST77XX_BLACK);
     display.fillRoundRect(x + 2, y + 2, width - 4, height - 4, 5, panel);
     display.drawRoundRect(x, y, width, height, 7, popupAccent());
@@ -754,22 +759,32 @@ void drawPopupFrame(const char *title)
     display.drawFastHLine(16, 23, 208, ST77XX_WHITE);
 }
 
+void drawMenuOption(uint8_t option, bool selected)
+{
+    const int16_t y = 27 + option * 13;
+    display.fillRect(15, y - 2, 210, 11, popupPanelColor());
+    if (selected) {
+        display.fillRoundRect(15, y - 2, 210, 11, 3, popupAccent());
+        display.setTextColor(ST77XX_BLACK);
+    } else {
+        display.setTextColor(ST77XX_WHITE);
+    }
+    display.setTextSize(1);
+    display.setCursor(20, y);
+    display.print(selected ? "> " : "  ");
+    display.print(menuLabel(option));
+}
+
+void clearMenuHoldProgress()
+{
+    display.fillRect(18, 119, 204, 4, popupPanelColor());
+}
+
 void showMenu()
 {
     drawPopupFrame("SURVEY MENU");
-    for (uint8_t option = 0; option < 7; ++option) {
-        const int16_t y = 27 + option * 13;
-        if (option == menuSelection) {
-            display.fillRoundRect(15, y - 2, 210, 11, 3, popupAccent());
-            display.setTextColor(ST77XX_BLACK);
-        } else {
-            display.setTextColor(ST77XX_WHITE);
-        }
-        display.setTextSize(1);
-        display.setCursor(20, y);
-        display.print(option == menuSelection ? "> " : "  ");
-        display.print(menuLabel(option));
-    }
+    for (uint8_t option = 0; option < 7; ++option)
+        drawMenuOption(option, option == menuSelection);
 }
 
 void showStoragePopup()
@@ -902,8 +917,11 @@ void handleShortButtonPress()
         menuSelection = 0;
         showMenu();
     } else if (menuMode == MenuMode::Select) {
+        const uint8_t previousSelection = menuSelection;
         menuSelection = (menuSelection + 1) % 7;
-        showMenu();
+        clearMenuHoldProgress();
+        drawMenuOption(previousSelection, false);
+        drawMenuOption(menuSelection, true);
     } else {
         menuMode = MenuMode::Select;
         showMenu();
@@ -958,7 +976,8 @@ void handleLongButtonPress()
             }
 #endif
         }
-        showMenu();
+        clearMenuHoldProgress();
+        drawMenuOption(menuSelection, true);
         break;
     case 3:
         menuMode = MenuMode::ConfirmErase;
@@ -1060,10 +1079,11 @@ void processButton()
                                      ? 100
                                      : static_cast<uint8_t>(elapsed * 100UL / BUTTON_LONG_PRESS_MS);
         if (progress != buttonHoldProgress) {
+            const int16_t previousWidth = static_cast<int16_t>(204UL * buttonHoldProgress / 100UL);
+            const int16_t progressWidth = static_cast<int16_t>(204UL * progress / 100UL);
             buttonHoldProgress = progress;
-            display.fillRect(18, 119, 204, 4, ST77XX_BLACK);
-            if (progress)
-                display.fillRect(18, 119, static_cast<int16_t>(204UL * progress / 100UL), 4, ST77XX_YELLOW);
+            if (progressWidth > previousWidth)
+                display.fillRect(18 + previousWidth, 119, progressWidth - previousWidth, 4, ST77XX_YELLOW);
         }
     }
     if (menuMode != MenuMode::Closed && static_cast<uint32_t>(now - lastMenuInteractionMs) >= MENU_TIMEOUT_MS) {
@@ -1091,11 +1111,43 @@ uint32_t gpsEpoch()
     return seconds > 0 && seconds <= UINT32_MAX ? static_cast<uint32_t>(seconds) : 0;
 }
 
+bool gpsSpeedIsFresh()
+{
+    return gps.speed.isValid() && gps.speed.age() < GPS_MAX_FIX_AGE_MS;
+}
+
+bool gpsDrivingMode()
+{
+    return gpsSpeedIsFresh() && gps.speed.kmph() >= GPS_DRIVING_SPEED_KMPH;
+}
+
+uint8_t requiredGpsGoodFixes()
+{
+    return gpsDrivingMode() ? GPS_DRIVING_REQUIRED_GOOD_FIXES : GPS_REQUIRED_GOOD_FIXES;
+}
+
+#if defined(SURVEY_ROLE_MOBILE)
+float minimumSampleDistanceMeters()
+{
+    return gpsDrivingMode() ? GPS_DRIVING_MIN_SAMPLE_DISTANCE_METERS : GPS_MIN_SAMPLE_DISTANCE_METERS;
+}
+#endif
+
+float allowedGpsJumpMeters(float elapsedSeconds)
+{
+    float allowedMetersPerSecond = GPS_JUMP_METERS_PER_SECOND;
+    if (gpsSpeedIsFresh()) {
+        const float speedBasedAllowance = static_cast<float>(gps.speed.mps()) * GPS_SPEED_JUMP_MULTIPLIER;
+        if (speedBasedAllowance > allowedMetersPerSecond)
+            allowedMetersPerSecond = speedBasedAllowance;
+    }
+    return GPS_JUMP_BASE_METERS + allowedMetersPerSecond * elapsedSeconds;
+}
+
 SurveyPosition currentPosition()
 {
     SurveyPosition position = {};
-    const bool speedReasonable = !gps.speed.isValid() || gps.speed.age() >= GPS_MAX_FIX_AGE_MS ||
-                                 gps.speed.kmph() <= GPS_MAX_WALK_SPEED_KMPH;
+    const bool speedReasonable = !gpsSpeedIsFresh() || gps.speed.kmph() <= GPS_MAX_TRAVEL_SPEED_KMPH;
     position.valid = gpsFixTrusted && gps.location.isValid() && gps.location.age() < GPS_MAX_FIX_AGE_MS &&
                      gps.satellites.isValid() && gps.satellites.age() < GPS_MAX_FIX_AGE_MS &&
                      gps.satellites.value() >= GPS_MIN_SATELLITES && gps.hdop.isValid() &&
@@ -1124,8 +1176,7 @@ bool rawGpsFixMeetsQuality()
         return false;
     if (!gps.hdop.isValid() || gps.hdop.age() >= GPS_MAX_FIX_AGE_MS || gps.hdop.value() > GPS_MAX_HDOP_CENTI)
         return false;
-    return !gps.speed.isValid() || gps.speed.age() >= GPS_MAX_FIX_AGE_MS ||
-           gps.speed.kmph() <= GPS_MAX_WALK_SPEED_KMPH;
+    return !gpsSpeedIsFresh() || gps.speed.kmph() <= GPS_MAX_TRAVEL_SPEED_KMPH;
 }
 
 void updateGpsTrust()
@@ -1142,7 +1193,7 @@ void updateGpsTrust()
     const uint32_t now = millis();
     if (gpsCandidateValid) {
         const float elapsedSeconds = static_cast<float>(now - gpsCandidateMs) / 1000.0F;
-        const float allowedJump = GPS_JUMP_BASE_METERS + GPS_JUMP_METERS_PER_SECOND * elapsedSeconds;
+        const float allowedJump = allowedGpsJumpMeters(elapsedSeconds);
         const double distance = TinyGPSPlus::distanceBetween(gpsCandidateLatitude, gpsCandidateLongitude,
                                                               latitude, longitude);
         if (distance > allowedJump) {
@@ -1155,9 +1206,10 @@ void updateGpsTrust()
     gpsCandidateLongitude = longitude;
     gpsCandidateMs = now;
     gpsCandidateValid = true;
-    if (gpsGoodFixCount < GPS_REQUIRED_GOOD_FIXES)
+    const uint8_t requiredFixes = requiredGpsGoodFixes();
+    if (gpsGoodFixCount < requiredFixes)
         ++gpsGoodFixCount;
-    gpsFixTrusted = gpsGoodFixCount >= GPS_REQUIRED_GOOD_FIXES;
+    gpsFixTrusted = gpsGoodFixCount >= requiredFixes;
 }
 
 #if defined(SURVEY_ROLE_MOBILE)
@@ -1184,13 +1236,19 @@ void showGpsWaitStatus()
                gps.hdop.value() > GPS_MAX_HDOP_CENTI) {
         snprintf(detail, sizeof(detail), "Need HDOP <= %.2f", GPS_MAX_HDOP_CENTI / 100.0F);
         showScreen("GPS QUALITY LOW", detail, quality, "No packet sent");
-    } else if (gps.speed.isValid() && gps.speed.age() < GPS_MAX_FIX_AGE_MS &&
-               gps.speed.kmph() > GPS_MAX_WALK_SPEED_KMPH) {
+    } else if (gpsSpeedIsFresh() && gps.speed.kmph() > GPS_MAX_TRAVEL_SPEED_KMPH) {
         snprintf(detail, sizeof(detail), "Speed %.1f km/h rejected", gps.speed.kmph());
-        showScreen("GPS DRIFT REJECTED", detail, quality, "No packet sent");
+        showScreen("GPS SPEED INVALID", detail, quality, "No packet sent");
     } else {
-        snprintf(detail, sizeof(detail), "Stable fixes %u / %u", gpsGoodFixCount, GPS_REQUIRED_GOOD_FIXES);
-        showScreen("GPS STABILIZING", detail, quality, "No packet sent yet");
+        const uint8_t requiredFixes = requiredGpsGoodFixes();
+        snprintf(detail, sizeof(detail), "Stable fixes %u / %u", gpsGoodFixCount, requiredFixes);
+        if (gpsDrivingMode()) {
+            char speed[40];
+            snprintf(speed, sizeof(speed), "Vehicle mode %.1f km/h", gps.speed.kmph());
+            showScreen("GPS STABILIZING", detail, quality, speed);
+        } else {
+            showScreen("GPS STABILIZING", detail, quality, "No packet sent yet");
+        }
     }
 }
 #endif
@@ -1622,11 +1680,12 @@ void loop()
         const uint32_t now = millis();
         const double latitude = position.latitudeE7 / 10000000.0;
         const double longitude = position.longitudeE7 / 10000000.0;
+        const float minimumDistance = minimumSampleDistanceMeters();
         const double distance = lastProbePositionValid
                                     ? TinyGPSPlus::distanceBetween(lastProbeLatitude, lastProbeLongitude,
                                                                    latitude, longitude)
-                                    : GPS_MIN_SAMPLE_DISTANCE_METERS;
-        if (position.valid && distance >= GPS_MIN_SAMPLE_DISTANCE_METERS &&
+                                    : minimumDistance;
+        if (position.valid && distance >= minimumDistance &&
             (!lastSendMs || static_cast<uint32_t>(now - lastSendMs) >= SURVEY_SEND_INTERVAL_MS))
             sendProbe(position);
     }
@@ -1639,9 +1698,10 @@ void loop()
         const double distance = TinyGPSPlus::distanceBetween(
             lastProbeLatitude, lastProbeLongitude, position.latitudeE7 / 10000000.0,
             position.longitudeE7 / 10000000.0);
-        if (distance < GPS_MIN_SAMPLE_DISTANCE_METERS) {
+        const float minimumDistance = minimumSampleDistanceMeters();
+        if (distance < minimumDistance) {
             lastGpsNoticeMs = millis();
-            showMovementWaiting(distance);
+            showMovementWaiting(distance, minimumDistance);
         }
     }
 #else

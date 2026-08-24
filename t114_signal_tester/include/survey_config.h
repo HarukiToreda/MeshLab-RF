@@ -24,16 +24,20 @@ constexpr uint32_t BUTTON_LONG_PRESS_MS = 500;
 constexpr uint32_t MENU_TIMEOUT_MS = 30000;
 
 // A position is trusted only after several consecutive fresh fixes meet these
-// walking-survey limits. This prevents a first, stale, or visibly drifting fix
-// from triggering a radio sample.
+// quality limits. Vehicle mode allows legitimate driving motion while requiring
+// additional stable fixes and checking jumps against the GPS-reported speed.
 constexpr uint32_t GPS_MAX_FIX_AGE_MS = 1500;
 constexpr uint8_t GPS_MIN_SATELLITES = 6;
 constexpr uint16_t GPS_MAX_HDOP_CENTI = 200;
 constexpr uint8_t GPS_REQUIRED_GOOD_FIXES = 5;
-constexpr float GPS_MAX_WALK_SPEED_KMPH = 15.0F;
+constexpr uint8_t GPS_DRIVING_REQUIRED_GOOD_FIXES = 7;
+constexpr float GPS_DRIVING_SPEED_KMPH = 20.0F;
+constexpr float GPS_MAX_TRAVEL_SPEED_KMPH = 180.0F;
 constexpr float GPS_JUMP_BASE_METERS = 8.0F;
 constexpr float GPS_JUMP_METERS_PER_SECOND = 4.0F;
+constexpr float GPS_SPEED_JUMP_MULTIPLIER = 1.75F;
 constexpr float GPS_MIN_SAMPLE_DISTANCE_METERS = 5.0F;
+constexpr float GPS_DRIVING_MIN_SAMPLE_DISTANCE_METERS = 15.0F;
 
 constexpr uint8_t LORA_CS = 24;
 constexpr uint8_t LORA_DIO1 = 20;
