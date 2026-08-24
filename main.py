@@ -19,6 +19,32 @@ def smoke_test() -> None:
     result = SimulationEngine(app.scenario).run(packet)
     if not result.events or not result.reached:
         raise RuntimeError("Simulation produced no events or reached nodes")
+    env = app.scenario.environment
+    app.survey_measurements = [
+        {
+            "sequence": 1,
+            "epoch_s": 1_700_000_000,
+            "mobile_latitude": env.map_center_lat + 0.001,
+            "mobile_longitude": env.map_center_lon + 0.001,
+            "mobile_satellites": 9,
+            "mobile_hdop": 1.1,
+            "base_latitude": env.map_center_lat,
+            "base_longitude": env.map_center_lon,
+            "forward_received": True,
+            "forward_rssi_dbm": -101,
+            "forward_snr_db": -2.5,
+            "reply_received": True,
+            "reverse_rssi_dbm": -97,
+            "reverse_snr_db": 1.25,
+        }
+    ]
+    app.show_survey_viewer()
+    root.update_idletasks()
+    if len(app.survey_tree.get_children()) != 1:
+        raise RuntimeError("Survey viewer did not display its measurement")
+    if not app.canvas.find_withtag("survey-layer"):
+        raise RuntimeError("Survey measurement was not plotted on the map")
+    app._close_survey_viewer()
     app.stop_animation()
     root.destroy()
 

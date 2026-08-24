@@ -41,7 +41,7 @@
   "name": "Heltec T114 standalone signal tester",
   "upload": {
     "maximum_ram_size": 248832,
-    "maximum_size": 815104,
+    "maximum_size": 159744,
     "speed": 115200,
     "protocol": "nrfutil",
     "protocols": ["jlink", "nrfjprog", "nrfutil", "stlink"],

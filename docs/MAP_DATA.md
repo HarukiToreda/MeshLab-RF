@@ -31,7 +31,9 @@ The viewport is divided into 4–16 geographic cells. Overture cells that reach 
 
 OSM forest ways use `landuse=forest` or `natural=wood`; up to 500 are added per import. OSM buildings are used if Overture fails. Duplicate provider IDs are skipped.
 
-Building height uses the supplied height, then floors × 3 m, then a 12 m default. Forests default to 18 m. RF loss values are editable MeshLab assumptions, not values supplied by the map provider.
+Building height uses the supplied height, then floors × 3 m, then a 12 m default. Forests default to 18 m. RF loss values never come from the map provider. MeshLab's global field-survey Building default is 10.8 dB per crossed footprint plus 0.3 dB/100 m inside it, with attenuation rather than a distance cutoff; imported buildings receive the same default as manually drawn buildings.
+
+Survey measurements plotted on the map are a comparison layer. They do not modify nearby map data, building footprints, terrain, or predicted coverage. Applying **Calibrate buildings** changes the Building value across the entire current scenario, including unsurveyed footprints.
 
 ## Cache and privacy
 

@@ -6,7 +6,8 @@ constexpr uint32_t SURVEY_RECORD_MAGIC = 0x3152464DUL; // "MFR1"
 constexpr uint32_t SURVEY_STORAGE_MAGIC = 0x314C534DUL; // "MSL1"
 constexpr uint32_t SURVEY_PROBE_MAGIC = 0x3150524DUL; // "MRP1"
 constexpr uint32_t SURVEY_REPLY_MAGIC = 0x3152524DUL; // "MRR1"
-constexpr uint8_t SURVEY_FORMAT_VERSION = 1;
+constexpr uint8_t SURVEY_FORMAT_VERSION = 2;
+constexpr uint8_t SURVEY_LEGACY_FORMAT_VERSION = 1;
 
 enum class SurveyRole : uint8_t {
     Mobile = 1,
@@ -28,6 +29,7 @@ enum SurveyFlags : uint8_t {
     RemoteGpsLock = 1 << 1,
     LocalRxValid = 1 << 2,
     RemoteRxValid = 1 << 3,
+    ReplySent = 1 << 4,
 };
 
 struct __attribute__((packed)) SurveyPosition {
@@ -81,6 +83,37 @@ struct __attribute__((packed)) SurveyRecord {
     uint32_t sequence;
     uint32_t epochSeconds;
     uint32_t uptimeMs;
+    uint32_t nodeId;
+    uint32_t peerId;
+    int32_t localLatitudeE7;
+    int32_t localLongitudeE7;
+    int32_t localAltitudeCm;
+    uint16_t localHdopCenti;
+    uint8_t localSatellites;
+    uint8_t remoteSatellites;
+    int32_t remoteLatitudeE7;
+    int32_t remoteLongitudeE7;
+    int32_t remoteAltitudeCm;
+    uint16_t remoteHdopCenti;
+    int16_t localRssiDbm;
+    int16_t localSnrCentiDb;
+    int16_t remoteRssiDbm;
+    int16_t remoteSnrCentiDb;
+    uint32_t packetId;
+    uint16_t reserved;
+    uint32_t crc32;
+};
+
+struct __attribute__((packed)) LegacySurveyRecordV1 {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t role;
+    uint8_t event;
+    uint8_t flags;
+    uint32_t sessionId;
+    uint32_t sequence;
+    uint32_t epochSeconds;
+    uint32_t uptimeMs;
     uint64_t nodeId;
     uint64_t peerId;
     int32_t localLatitudeE7;
@@ -121,5 +154,6 @@ struct __attribute__((packed)) StorageHeader {
 static_assert(sizeof(SurveyPosition) == 16, "SurveyPosition wire size changed");
 static_assert(sizeof(ProbePacket) == 52, "ProbePacket wire size changed");
 static_assert(sizeof(ReplyPacket) == 68, "ReplyPacket wire size changed");
-static_assert(sizeof(SurveyRecord) == 128, "SurveyRecord storage size changed");
+static_assert(sizeof(SurveyRecord) == 80, "SurveyRecord storage size changed");
+static_assert(sizeof(LegacySurveyRecordV1) == 128, "Legacy survey record size changed");
 static_assert(sizeof(StorageHeader) == 20, "StorageHeader size changed");

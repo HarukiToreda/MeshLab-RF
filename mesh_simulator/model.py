@@ -74,7 +74,9 @@ ROLE_COLORS = {
 
 OBSTACLE_DEFAULTS = {
     # color, penetration dB, height m, loss/100m dB, behavior, max distance beyond obstacle m
-    "Building": ("#33302b", 18.0, 12.0, 0.3, "LIMIT_AFTER", 482.803),
+    # Calibrated from the August 2026 paired field survey.  Buildings
+    # attenuate continuously; the former 0.3-mile hard cutoff was not observed.
+    "Building": ("#33302b", 10.8, 12.0, 0.3, "ATTENUATE", 0.0),
     "Wall": ("#ef4444", 25.0, 4.0, 0.0, "ATTENUATE", 0.0),
     "Forest": ("#166534", 2.0, 18.0, 10.0, "ATTENUATE", 0.0),
     "Mountain": ("#64748b", 35.0, 180.0, 0.08, "BLOCK", 0.0),
@@ -83,6 +85,11 @@ OBSTACLE_DEFAULTS = {
 }
 
 REQUIRED_SNR = {5: -2.5, 6: -5.0, 7: -7.5, 8: -10.0, 9: -12.5, 10: -15.0, 11: -17.5, 12: -20.0}
+# The paired field survey found occasional successful packets below the
+# theoretical zero-margin line.  This is the single range threshold used by
+# coverage previews and every simulated packet-delivery path.  Its red map band
+# is intermittent rather than reliable when stochastic fading is enabled.
+MIN_DECODE_MARGIN_DB = -4.0
 DEFAULT_MAP_CENTER_LAT = 40.9045
 DEFAULT_MAP_CENTER_LON = -74.2099
 
@@ -270,10 +277,10 @@ class Obstacle:
     y2: float = 1800.0
     height_m: float = 18.0
     base_elevation_m: float = 0.0
-    attenuation_db: float = 12.0
+    attenuation_db: float = 10.8
     loss_per_100m_db: float = 0.3
-    behavior: str = "LIMIT_AFTER"
-    max_range_beyond_m: float = 482.803
+    behavior: str = "ATTENUATE"
+    max_range_beyond_m: float = 0.0
     shape: str = "rectangle"
     points: list[list[float]] = field(default_factory=list)
     brush_radius_m: float = 150.0
@@ -400,14 +407,24 @@ class LinkResult:
 
 
 @dataclass
+class BeaconRadialSample:
+    """One reception check along a beacon ray."""
+
+    distance_m: float
+    margin_db: float
+    reachable: bool
+
+
+@dataclass
 class BeaconRay:
-    """One radial sample of a beacon's signal, from the beacon outwards."""
+    """One radial direction, including any separated reachable sections."""
 
     angle: float
     reach_m: float
     clear_reach_m: float
     kind: str  # "clear" | "weakened" | "blocked"
     obstacle_ids: list[str] = field(default_factory=list)
+    samples: list[BeaconRadialSample] = field(default_factory=list)
 
 
 @dataclass
@@ -506,6 +523,39 @@ class Scenario:
             raw.setdefault("shape", "rectangle")
             raw.setdefault("points", [])
             raw.setdefault("brush_radius_m", 150.0)
+            # Migrate only the exact former Building preset.  Explicit custom
+            # obstacle settings remain untouched.
+            if (
+                raw.get("kind") == "Building"
+                and math.isclose(float(raw.get("attenuation_db", 18.0)), 18.0, abs_tol=1e-6)
+                and math.isclose(float(raw.get("loss_per_100m_db", 0.3)), 0.3, abs_tol=1e-6)
+                and raw.get("behavior") == "LIMIT_AFTER"
+                and math.isclose(float(raw.get("max_range_beyond_m", 482.803)), 482.803, abs_tol=1e-3)
+            ):
+                raw["attenuation_db"] = defaults[1]
+                raw["loss_per_100m_db"] = defaults[3]
+                raw["behavior"] = defaults[4]
+                raw["max_range_beyond_m"] = defaults[5]
+            elif (
+                raw.get("kind") == "Building"
+                and math.isclose(float(raw.get("attenuation_db", 0.0)), 2.59, abs_tol=1e-6)
+                and math.isclose(float(raw.get("loss_per_100m_db", 0.0)), 0.29, abs_tol=1e-6)
+                and raw.get("behavior") == "ATTENUATE"
+                and math.isclose(float(raw.get("max_range_beyond_m", 0.0)), 0.0, abs_tol=1e-6)
+            ):
+                # Replace the received-only fit, which had survivorship bias,
+                # with the censored fit that also includes failed probes.
+                raw["attenuation_db"] = defaults[1]
+                raw["loss_per_100m_db"] = defaults[3]
+            elif (
+                raw.get("kind") == "Building"
+                and math.isclose(float(raw.get("attenuation_db", 0.0)), 3.08, abs_tol=1e-6)
+                and math.isclose(float(raw.get("loss_per_100m_db", 0.0)), 2.94, abs_tol=1e-6)
+                and raw.get("behavior") == "ATTENUATE"
+                and math.isclose(float(raw.get("max_range_beyond_m", 0.0)), 0.0, abs_tol=1e-6)
+            ):
+                raw["attenuation_db"] = defaults[1]
+                raw["loss_per_100m_db"] = defaults[3]
             obstacles.append(Obstacle(**raw))
         if legacy_coordinates:
             shift_x = legacy_width / 2.0
@@ -646,7 +696,7 @@ class PropagationModel:
         return PropagationModel.noise_floor(node) + REQUIRED_SNR.get(node.radio.spreading_factor, -7.5)
 
     def unobstructed_range_m(self, source: Node, target: Node) -> float:
-        """Return the link-budget range at which an unobstructed receiver reaches zero margin."""
+        """Return the field-calibrated unobstructed packet range."""
         frequency_hz = max(1.0, source.radio.frequency_mhz * 1_000_000.0)
         fspl_1m = 20.0 * math.log10(4.0 * math.pi * frequency_hz / self.SPEED_OF_LIGHT)
         received_budget = (
@@ -657,7 +707,7 @@ class PropagationModel:
             - target.cable_loss_db
             - self.scenario.environment.weather_loss_db
         )
-        allowed_path_loss = received_budget - self.sensitivity(target)
+        allowed_path_loss = received_budget - self.sensitivity(target) - MIN_DECODE_MARGIN_DB
         exponent = max(0.1, self.scenario.environment.path_loss_exponent)
         distance = 10.0 ** ((allowed_path_loss - fspl_1m) / (10.0 * exponent))
         return max(1.0, min(2_000_000.0, distance))
@@ -1050,6 +1100,7 @@ class PropagationModel:
         weaken_loss_db: float = 4.0,
         max_range_m: float | None = None,
         binary_iterations: int = 14,
+        segment_samples: int = 0,
     ) -> "BeaconProfile":
         """Radially probe a beacon: where its signal reaches, fades, or is blocked.
 
@@ -1099,7 +1150,7 @@ class PropagationModel:
             ray_obstacles = self._candidate_obstacles(source, probe)
 
             far_link = sample(dx, dy, maximum_range)
-            if far_link.compatible and far_link.margin_db >= 0:
+            if far_link.compatible and far_link.margin_db >= MIN_DECODE_MARGIN_DB:
                 reach = maximum_range
                 hard_blocked = False
             else:
@@ -1108,7 +1159,7 @@ class PropagationModel:
                 for _iteration in range(binary_iterations):
                     midpoint = (low + high) / 2.0
                     midpoint_link = sample(dx, dy, max(1.0, midpoint))
-                    if midpoint_link.compatible and midpoint_link.margin_db >= 0:
+                    if midpoint_link.compatible and midpoint_link.margin_db >= MIN_DECODE_MARGIN_DB:
                         low = midpoint
                     else:
                         high = midpoint
@@ -1142,7 +1193,32 @@ class PropagationModel:
                 kind = "weakened" if weakened else "clear"
                 if weakened:
                     weakening.extend(obstacle_ids)
-            rays.append(BeaconRay(angle, reach, clear_reference, kind, obstacle_ids))
+            radial_samples: list[BeaconRadialSample] = []
+            if segment_samples > 0:
+                radial_count = max(16, min(160, int(segment_samples)))
+                # The source is always the beginning of a visible section.
+                radial_samples.append(BeaconRadialSample(0.0, 40.0, True))
+                for radial_index in range(1, radial_count + 1):
+                    distance = maximum_range * radial_index / radial_count
+                    radial_link = sample(dx, dy, distance)
+                    radial_samples.append(
+                        BeaconRadialSample(
+                            distance,
+                            radial_link.margin_db,
+                            radial_link.compatible
+                            and radial_link.margin_db >= MIN_DECODE_MARGIN_DB,
+                        )
+                    )
+            rays.append(
+                BeaconRay(
+                    angle,
+                    reach,
+                    clear_reference,
+                    kind,
+                    obstacle_ids,
+                    radial_samples,
+                )
+            )
 
         return BeaconProfile(
             source.id,
@@ -1214,7 +1290,11 @@ class SimulationEngine:
             if sender is None or receiver is None or not sender.online or not receiver.online:
                 return False
             link = self.model.link(sender, receiver, sample_shadowing=True, rng=self.rng)
-            if not link.compatible or link.margin_db < 0 or receiver.channel != sender.channel:
+            if (
+                not link.compatible
+                or link.margin_db < MIN_DECODE_MARGIN_DB
+                or receiver.channel != sender.channel
+            ):
                 return False
             if self.scenario.environment.stochastic and self.rng.random() > link.probability:
                 return False
@@ -1277,7 +1357,7 @@ class SimulationEngine:
             link = self.model.link(transmitter, receiver, sample_shadowing=True, rng=self.rng)
             result.links.append(link)
             arrival = elapsed + airtime
-            success = link.compatible and link.margin_db >= 0
+            success = link.compatible and link.margin_db >= MIN_DECODE_MARGIN_DB
             if self.scenario.environment.stochastic:
                 success = success and self.rng.random() <= link.probability
             decoded = receiver.channel == packet.channel
@@ -1491,9 +1571,9 @@ class SimulationEngine:
                     )
                     continue
 
-                success = link.margin_db >= 0
+                success = link.margin_db >= MIN_DECODE_MARGIN_DB
                 if self.scenario.environment.stochastic:
-                    success = self.rng.random() <= link.probability
+                    success = success and self.rng.random() <= link.probability
                 if not success:
                     result.dropped += 1
                     result.events.append(
@@ -1506,7 +1586,7 @@ class SimulationEngine:
                             link.rssi_dbm,
                             link.snr_db,
                             link.margin_db,
-                            "below receive threshold",
+                            f"below calibrated {MIN_DECODE_MARGIN_DB:g} dB field threshold",
                             False,
                         )
                     )

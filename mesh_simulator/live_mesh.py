@@ -8,7 +8,17 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .model import CORE_PORTS, LinkResult, LiveMeshConfig, Node, PacketConfig, PropagationModel, Scenario, dm_route_key
+from .model import (
+    CORE_PORTS,
+    MIN_DECODE_MARGIN_DB,
+    LinkResult,
+    LiveMeshConfig,
+    Node,
+    PacketConfig,
+    PropagationModel,
+    Scenario,
+    dm_route_key,
+)
 
 
 POLITE_CHANNEL_LIMIT_PERCENT = 25.0
@@ -390,7 +400,7 @@ class LiveMeshEngine:
                 link = self.model.link(source, target)
                 # A blocked terrain/obstacle path can still have a mathematically
                 # high pre-block margin. Never retain it as a live RF neighbor.
-                if link.compatible and link.margin_db >= -10.0:
+                if link.compatible and link.margin_db >= MIN_DECODE_MARGIN_DB:
                     neighbors.append((target, link))
             self._links_by_source[source.id] = neighbors
         return True
@@ -711,7 +721,7 @@ class LiveMeshEngine:
             )
             event_margin = link.margin_db + shadow
             event_probability = 1.0 / (1.0 + math.exp(-max(-40.0, min(40.0, event_margin)) / 2.0))
-            success = link.compatible and event_margin >= 0.0
+            success = link.compatible and event_margin >= MIN_DECODE_MARGIN_DB
             if self.scenario.environment.stochastic:
                 success = success and self.rng.random() <= event_probability
             if not success:
@@ -777,7 +787,14 @@ class LiveMeshEngine:
                 if receiver.id == transmitter.id or receiver.id in cached:
                     continue
                 link = self.model.link(transmitter, receiver)
-                reason = link.reason if not link.compatible else f"RF margin {link.margin_db:.1f} dB below receive threshold"
+                reason = (
+                    link.reason
+                    if not link.compatible
+                    else (
+                        f"RF margin {link.margin_db:.1f} dB below calibrated "
+                        f"{MIN_DECODE_MARGIN_DB:g} dB field threshold"
+                    )
+                )
                 self._test_event(task.packet, time_ms, "UNREACHABLE", receiver.id, transmitter.id, task.hop + 1, link, reason)
 
     def _receive(self, time_ms: float, reception: _Reception) -> None:

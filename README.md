@@ -29,7 +29,7 @@ Use the mouse wheel to zoom, right-drag to pan, and **Fit** to frame the current
 
 ## Reading the simulation
 
-- Every send starts with a **coverage heatmap** expanding from the source: strong (green) to weak (red), with obstacles that slow it outlined yellow and those that block it red. It continues into the hop animation if another node is reached, or stays frozen if none is.
+- Every send starts with the original ray-styled **coverage heatmap** expanding from the source: strong (green) to weak/intermittent (red), with obstacles that slow it outlined yellow and those that block it red. The globally field-calibrated packet threshold is −4 dB margin, and both the heatmap and actual simulated sends use it. Reception in that red edge remains intermittent when stochastic fading is enabled. Each ray is sampled in sections, so ground below that fringe remains empty and coverage can resume where higher terrain rises back into a usable path. It continues into the hop animation if another node is reached, or stays frozen if none is.
 - Broadcasts radiate from every node that receives and rebroadcasts the packet.
 - Hop colors and `H0`–`H7` badges show how far the packet traveled.
 - Nodes not reached by the completed simulation turn gray.
@@ -53,7 +53,7 @@ Terrain affects line of sight and Fresnel clearance. Each node has:
 
 Nodes automatically follow terrain unless their ground elevation is manually overridden. A rooftop antenna should use the building height plus any mast height as its AGL.
 
-Imported buildings and forests are editable RF obstructions. Building and vegetation loss values are planning defaults and should be adjusted when better local information is available.
+Imported buildings and forests are editable RF obstructions. The Building preset now uses the paired August 2026 field-survey value of 10.8 dB per crossed footprint plus 0.3 dB/100 m inside it, with no arbitrary distance cutoff. The same values apply globally to every tested or untested, existing, drawn, and imported building; loaded survey points remain a visual comparison layer and never locally repaint or override predicted coverage. Vegetation remains a planning default.
 
 The **Terrain only** option shows elevation contours without roads and labels. **Show map tiles** changes only the background and does not change simulation results.
 
@@ -69,7 +69,9 @@ The connection is read-only. It does not transmit packets or change radio settin
 
 Results depend on terrain and map quality, actual radio power, antennas, cable loss, local noise, building materials, foliage, and the selected path-loss settings. Verify important placements with real measurements.
 
-For local building-loss calibration with two Heltec T114 radios, use the paired [T114 field survey](docs/FIELD_SURVEY.md). Both the walking and fixed radios retain logs for later USB extraction, including bidirectional RSSI/SNR and packet loss.
+To collect building-loss evidence with two Heltec T114 radios, use the paired [T114 field survey](docs/FIELD_SURVEY.md). Both the walking and fixed radios retain logs for later USB extraction, including bidirectional RSSI/SNR and packet loss. The tester is purpose-built standalone firmware, not a Meshtastic firmware build.
+
+After loading a survey and importing its matching buildings, choose **Calibrate buildings**. MeshLab compares received RSSI and failed probes against clear and building-crossing paths, retains the scenario's propagation baseline, and fits one per-building attenuation value. After confirmation it applies that value globally to every Building in the scenario, including unsurveyed areas, with no distance cutoff. Save the scenario to retain it.
 
 Technical details:
 

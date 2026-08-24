@@ -8,6 +8,7 @@ from shapely.geometry import MultiPolygon, Polygon
 
 from mesh_simulator.model import (
     Environment,
+    MIN_DECODE_MARGIN_DB,
     Node,
     Obstacle,
     PacketConfig,
@@ -35,6 +36,7 @@ from mesh_simulator.geography import (
     world_viewport_to_mercator_bounds,
 )
 from mesh_simulator.live_radio import parse_live_node
+from mesh_simulator.survey_calibration import BuildingCalibration, apply_building_calibration
 from mesh_simulator.ui import (
     MAX_CANVAS_ZOOM,
     MIN_CANVAS_ZOOM,
@@ -410,14 +412,34 @@ class ModelTests(unittest.TestCase):
         slow.radio.apply_preset("LONG_SLOW")
         self.assertGreater(PropagationModel.airtime_ms(slow, 32), PropagationModel.airtime_ms(fast, 32))
 
-    def test_unobstructed_range_ends_at_receiver_threshold(self):
+    def test_unobstructed_range_ends_at_field_decode_threshold(self):
         source = Node(x=0, y=0)
         receiver = Node(x=1, y=0)
         scenario = Scenario(nodes=[source, receiver])
         scenario.environment.stochastic = False
         model = PropagationModel(scenario)
         receiver.x = model.unobstructed_range_m(source, receiver)
-        self.assertAlmostEqual(model.link(source, receiver).margin_db, 0.0, delta=0.05)
+        self.assertAlmostEqual(
+            model.link(source, receiver).margin_db,
+            MIN_DECODE_MARGIN_DB,
+            delta=0.05,
+        )
+
+    def test_packet_delivery_uses_same_field_threshold_as_coverage(self):
+        source = Node(x=0, y=0)
+        receiver = Node(x=1, y=0)
+        scenario = Scenario(nodes=[source, receiver])
+        scenario.environment.stochastic = False
+        model = PropagationModel(scenario)
+        receiver.x = model.unobstructed_range_m(source, receiver) * 0.99
+
+        link = model.link(source, receiver)
+        result = SimulationEngine(scenario).run(
+            PacketConfig(source_id=source.id, destination_id=receiver.id)
+        )
+
+        self.assertGreaterEqual(link.margin_db, MIN_DECODE_MARGIN_DB)
+        self.assertIn(receiver.id, result.reached)
 
     def test_obstacle_adds_loss(self):
         a = Node(x=0, y=0, antenna_height_m=2)
@@ -548,6 +570,40 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(loss, 10)
         self.assertTrue(names)
 
+    def test_coverage_link_fails_on_low_ground_and_recovers_on_high_terrain(self):
+        source = Node(x=0, y=0, elevation_m=0, antenna_height_m=1.5)
+        building = Obstacle(
+            kind="Building",
+            x1=100,
+            y1=-25,
+            x2=140,
+            y2=25,
+            base_elevation_m=0,
+            height_m=20,
+            attenuation_db=80,
+            behavior="ATTENUATE",
+        )
+        model = PropagationModel(Scenario(nodes=[source], obstacles=[building]))
+        low_ground = Node(x=400, y=0, elevation_m=0, antenna_height_m=1.5)
+        high_terrain = Node(x=800, y=0, elevation_m=200, antenna_height_m=1.5)
+
+        self.assertLess(model.link(source, low_ground).margin_db, 0)
+        self.assertGreater(model.link(source, high_terrain).margin_db, 0)
+
+    def test_coverage_keeps_a_small_red_intermittent_fringe(self):
+        source = Node(x=0, y=0)
+        model = PropagationModel(Scenario(nodes=[source]))
+
+        profile = model.beacon_profile(source, angular_samples=8, segment_samples=32)
+        samples = profile.rays[0].samples
+        edge = [sample for sample in samples if sample.reachable][-1]
+
+        self.assertLess(edge.margin_db, 0.0)
+        self.assertGreaterEqual(edge.margin_db, MIN_DECODE_MARGIN_DB)
+        self.assertTrue(edge.reachable)
+        self.assertLess(samples[-1].margin_db, MIN_DECODE_MARGIN_DB)
+        self.assertFalse(samples[-1].reachable)
+
     def test_old_scenario_migrates_obstacle_behavior(self):
         scenario = Scenario.from_dict(
             {
@@ -558,8 +614,65 @@ class ModelTests(unittest.TestCase):
             }
         )
         self.assertEqual(scenario.obstacles[0].behavior, "BLOCK")
-        self.assertEqual(scenario.obstacles[1].behavior, "LIMIT_AFTER")
-        self.assertAlmostEqual(scenario.obstacles[1].max_range_beyond_m / 1609.344, 0.3, places=3)
+        self.assertEqual(scenario.obstacles[1].behavior, "ATTENUATE")
+        self.assertEqual(scenario.obstacles[1].max_range_beyond_m, 0.0)
+
+    def test_exact_old_building_preset_migrates_without_range_cap(self):
+        scenario = Scenario.from_dict(
+            {
+                "obstacles": [
+                    {
+                        "kind": "Building",
+                        "attenuation_db": 18.0,
+                        "loss_per_100m_db": 0.3,
+                        "behavior": "LIMIT_AFTER",
+                        "max_range_beyond_m": 482.803,
+                    }
+                ]
+            }
+        )
+        building = scenario.obstacles[0]
+        self.assertEqual(building.behavior, "ATTENUATE")
+        self.assertEqual(building.max_range_beyond_m, 0.0)
+        self.assertAlmostEqual(building.attenuation_db, 10.8)
+        self.assertAlmostEqual(building.loss_per_100m_db, 0.3)
+
+    def test_building_calibration_does_not_change_propagation_baseline(self):
+        restored = Scenario.from_dict({"environment": {"path_loss_exponent": 2.45}})
+        self.assertEqual(restored.environment.path_loss_exponent, 2.45)
+        self.assertEqual(Environment().path_loss_exponent, 2.45)
+
+    def test_survey_calibration_updates_every_building_and_local_distance_loss(self):
+        buildings = [Obstacle(kind="Building"), Obstacle(kind="Building", attenuation_db=14)]
+        wall = Obstacle(kind="Wall", attenuation_db=25, behavior="BLOCK")
+        scenario = Scenario(obstacles=[*buildings, wall])
+        calibration = BuildingCalibration(
+            sample_count=133,
+            received_sample_count=100,
+            lost_sample_count=33,
+            clear_sample_count=66,
+            obstructed_sample_count=67,
+            building_count=2,
+            penetration_db=2.59,
+            loss_per_100m_db=0.29,
+            path_loss_exponent=3.37,
+            calibration_offset_db=-5.23,
+            fitted_rmse_db=7.33,
+        )
+
+        changed = apply_building_calibration(scenario, calibration)
+
+        self.assertEqual(changed, 2)
+        for building in buildings:
+            self.assertEqual(building.attenuation_db, 2.59)
+            self.assertEqual(building.loss_per_100m_db, 0.29)
+            self.assertEqual(building.behavior, "ATTENUATE")
+            self.assertEqual(building.max_range_beyond_m, 0.0)
+        self.assertEqual(wall.behavior, "BLOCK")
+        self.assertEqual(scenario.environment.path_loss_exponent, 2.45)
+
+    def test_dense_building_maps_keep_the_original_beacon_sampling(self):
+        self.assertEqual(MeshSimulatorApp._beacon_ray_count(2_315), 72)
 
     def test_geographic_projection_roundtrip(self):
         x, y = latlon_to_world(40.7138, -74.004, 40.7128, -74.006)
@@ -1081,8 +1194,8 @@ class ModelTests(unittest.TestCase):
 
     def test_acknowledged_dm_learns_and_reuses_directed_path(self):
         source = Node(id="source", name="Source", x=0, y=0)
-        relay = Node(id="relay", name="Relay", x=500, y=0, role="ROUTER")
-        destination = Node(id="destination", name="Destination", x=1000, y=0)
+        relay = Node(id="relay", name="Relay", x=600, y=0, role="ROUTER")
+        destination = Node(id="destination", name="Destination", x=1200, y=0)
         scenario = Scenario(nodes=[source, relay, destination])
         scenario.environment.path_loss_exponent = 4.2
         scenario.environment.stochastic = False
@@ -1113,8 +1226,8 @@ class ModelTests(unittest.TestCase):
 
     def test_failed_learned_dm_path_is_invalidated_and_falls_back_to_flooding(self):
         source = Node(id="source", x=0, y=0)
-        relay = Node(id="relay", x=500, y=0, role="ROUTER")
-        destination = Node(id="destination", x=1000, y=0)
+        relay = Node(id="relay", x=600, y=0, role="ROUTER")
+        destination = Node(id="destination", x=1200, y=0)
         key = dm_route_key(source.id, destination.id)
         scenario = Scenario(
             nodes=[source, relay, destination],
@@ -1245,6 +1358,7 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(min(radii), math.hypot(2_000, 1_000))
         self.assertLess((max(radii) - min(radii)) / min(radii), 0.002)
         self.assertTrue(all(kind == "threshold" for _x, _y, kind in contour))
+
 
     def test_client_mute_does_not_bridge(self):
         scenario = create_demo_scenario()

@@ -1,6 +1,6 @@
 # Firmware and RF model
 
-MeshLab RF is based on the Meshtastic firmware checkout at `C:\firmware`. It models behavior that affects visible packet reach and timing; it is not a full firmware emulator.
+MeshLab RF's mesh simulation is informed by the Meshtastic firmware checkout at `C:\firmware`. It models behavior that affects visible packet reach and timing; it is not a full firmware emulator. The paired T114 field-survey firmware in this repository is a separate purpose-built signal tester and does not contain Meshtastic.
 
 ## Firmware behavior
 
@@ -38,7 +38,7 @@ Receiver noise is:
 
 `N = −174 + 10 log10(BW Hz) + noise figure`
 
-Required SNR ranges from about `−2.5 dB` at SF5 to `−20 dB` at SF12. Link margin becomes a reception probability when stochastic mode is enabled.
+Required SNR ranges from about `−2.5 dB` at SF5 to `−20 dB` at SF12. The paired field survey established `−4 dB` margin as MeshLab's global minimum delivery/range threshold. Coverage, ordinary flooding, directed routes, ACKs/replies, and live-mesh receptions all use that same threshold. Link margin also becomes a reception probability when stochastic mode is enabled, making the red edge intermittent instead of guaranteed.
 
 Radios must have compatible frequency, bandwidth, spreading factor, and coding rate. Channel/PSK behavior is represented by matching channel-name strings; encryption is not simulated.
 
@@ -60,6 +60,10 @@ Obstructions add fixed and distance-through-material loss. Their modes are:
 - `LIMIT_AFTER`: stop reception past a set distance beyond the obstruction.
 
 An RF path that clears an obstruction and 60% of its first Fresnel zone is unaffected by it.
+
+The global Building default is 10.8 dB for each crossed footprint plus 0.3 dB per 100 m traveled inside footprints, always using `ATTENUATE` and no arbitrary post-building range cap. This value applies equally to drawn, imported, surveyed, and unsurveyed buildings. Survey calibration can replace the fixed per-building value across the whole current scenario while leaving the propagation baseline and inside-distance term unchanged.
+
+Coverage is sampled angularly and radially. Only ground sections meeting the complete link budget down to the −4 dB threshold are painted; a blocked section is left empty, while a later section may reappear when higher terrain restores the path. Green, yellow, and red indicate decreasing margin, and loaded survey points are visual evidence only—not a local coverage override.
 
 ## Important limits
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import csv
 import io
+import json
 import math
 import os
 import queue
@@ -10,6 +11,8 @@ import random
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
+from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable
 
@@ -61,6 +64,21 @@ from .model import (
     scenario_from_file,
     scenario_to_file,
 )
+from .survey import merge_survey_rows
+from .survey_calibration import (
+    SurveyCalibrationError,
+    apply_building_calibration,
+    fit_building_calibration,
+)
+from .survey_device import (
+    DeviceCapture,
+    DeviceInfo,
+    SurveyExport,
+    capture_device,
+    query_device,
+    read_measurements,
+    save_captures,
+)
 
 
 BG = "#07101d"
@@ -100,6 +118,8 @@ STATIC_COVERAGE_TAG = "static-coverage"
 TILE_IMPORT_CONCURRENCY = 3
 HUD_LAYER_TAG = "hud-layer"
 SELECTED_OBSTACLE_TAG = "selected-obstacle"
+SURVEY_LAYER_TAG = "survey-layer"
+SURVEY_PORT_NONE = "— Not selected —"
 LIVE_TRAFFIC_PRESETS: dict[str, dict[str, Any]] = {
     "Default / slow": {
         "profile": "FIRMWARE_LIKE",
@@ -224,6 +244,36 @@ def format_area_value(square_meters: float, unit_system: str) -> str:
     if unit_system == "Imperial":
         return f"{square_meters / (METERS_PER_MILE**2):.2f} mi²"
     return f"{square_meters / 1_000_000:.2f} km²"
+
+
+def survey_bool(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def survey_value_known(value: object) -> bool:
+    return value is not None and str(value).strip().lower() not in {"", "none", "null"}
+
+
+def survey_float(value: object) -> float | None:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def survey_signal_color(measurement: dict[str, object]) -> str:
+    if not survey_bool(measurement.get("forward_received")):
+        return RED
+    rssi = survey_float(measurement.get("forward_rssi_dbm"))
+    if rssi is None:
+        return MUTED
+    if rssi >= -90.0:
+        return GREEN
+    if rssi >= -110.0:
+        return AMBER
+    return RED
 
 
 def build_terrain_visual(
@@ -635,6 +685,8 @@ class MeshSimulatorApp:
         self.animation_frame = 0
         self.beacon_node_id: str | None = None
         self.beacon_profile: BeaconProfile | None = None
+        self.beacon_segment_photo: ImageTk.PhotoImage | None = None
+        self.beacon_segment_photo_key: tuple[object, ...] | None = None
         self.beacon_after: str | None = None
         self.beacon_phase = 0.0
         self.beacon_request_id = 0
@@ -645,6 +697,8 @@ class MeshSimulatorApp:
         # Static (frozen, non-pulsing) coverage shown when a sent packet reaches
         # no other node -- same heatmap/colours as the beacon, but never animates.
         self.static_coverage_profile: BeaconProfile | None = None
+        self.static_segment_photo: ImageTk.PhotoImage | None = None
+        self.static_segment_photo_key: tuple[object, ...] | None = None
         self.static_coverage_blocking: list[Obstacle] = []
         self.static_coverage_weakening: list[Obstacle] = []
         self.static_coverage_cancel = threading.Event()
@@ -738,6 +792,19 @@ class MeshSimulatorApp:
         self.live_ports: dict[str, SerialPort] = {}
         self.live_nodes: dict[int, LiveNode] = {}
         self.live_connection_ready = False
+        self.survey_window: tk.Toplevel | None = None
+        self.survey_ports: dict[str, SerialPort] = {}
+        self.survey_mobile_port_var = tk.StringVar()
+        self.survey_base_port_var = tk.StringVar()
+        self.survey_captures: dict[str, DeviceCapture] = {}
+        self.survey_capture_attempts: set[tuple[str, str]] = set()
+        self.survey_devices: list[DeviceInfo] = []
+        self.survey_measurements: list[dict[str, object]] = []
+        self.survey_selected_index: int | None = None
+        self.survey_export_path: Path | None = None
+        self.survey_export_roles: set[str] = set()
+        self.survey_worker: threading.Thread | None = None
+        self.survey_updates: queue.Queue[tuple[str, object]] = queue.Queue()
         self.terrain_request_id = 0
 
         self._build_menu()
@@ -861,6 +928,7 @@ class MeshSimulatorApp:
         file_menu.add_command(label="Save", accelerator="Ctrl+S", command=self.save_scenario)
         file_menu.add_command(label="Save as…", accelerator="Ctrl+Shift+S", command=self.save_scenario_as)
         file_menu.add_command(label="Export results CSV…", command=self.export_results)
+        file_menu.add_command(label="Survey node export & viewer…", command=self.show_survey_viewer)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.on_close)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -949,6 +1017,9 @@ class MeshSimulatorApp:
         ttk.Button(bar, text="⌫  Delete", style="Tool.TButton", command=self.delete_selected).pack(side="left", padx=2)
         ttk.Button(bar, text="⊙  Fit", style="Tool.TButton", command=self.fit_view).pack(side="left", padx=2)
         ttk.Button(bar, text="◌  Mesh graph", style="Tool.TButton", command=self.show_mesh_graph).pack(
+            side="left", padx=2
+        )
+        ttk.Button(bar, text="Survey logs", style="Tool.TButton", command=self.show_survey_viewer).pack(
             side="left", padx=2
         )
         self.send_button = ttk.Button(bar, text="▶  Send packet", style="Accent.TButton", command=self.run_simulation)
@@ -4519,14 +4590,26 @@ class MeshSimulatorApp:
         self.beacon_request_id += 1
         request_id = self.beacon_request_id
         cap = self._coverage_range_cap()
-        samples = self._beacon_ray_count(len(self.scenario.nodes) + len(self.scenario.obstacles))
+        samples = max(
+            144,
+            self._beacon_ray_count(len(self.scenario.nodes) + len(self.scenario.obstacles)),
+        )
+        segment_samples = max(
+            56,
+            min(96, math.ceil(max(self.canvas.winfo_width(), self.canvas.winfo_height()) / 24)),
+        )
         snapshot = self.scenario
         self.status_var.set(f"Computing beacon coverage from {node.name}…")
 
         def worker() -> None:
             try:
                 model = PropagationModel(snapshot)
-                profile = model.beacon_profile(node, angular_samples=samples, max_range_m=cap)
+                profile = model.beacon_profile(
+                    node,
+                    angular_samples=samples,
+                    max_range_m=cap,
+                    segment_samples=segment_samples,
+                )
                 if not cancel.is_set():
                     self.beacon_compute_queue.put((request_id, profile, None))
             except Exception as error:  # noqa: BLE001 - surfaced to the status bar
@@ -4574,6 +4657,8 @@ class MeshSimulatorApp:
         self.beacon_after = None
         self.beacon_node_id = None
         self.beacon_profile = None
+        self.beacon_segment_photo = None
+        self.beacon_segment_photo_key = None
         self.beacon_blocking_obstacles = []
         self.beacon_weakening_obstacles = []
         self.beacon_phase = 0.0
@@ -4605,6 +4690,8 @@ class MeshSimulatorApp:
                 pass
         self.static_coverage_after = None
         self.static_coverage_profile = None
+        self.static_segment_photo = None
+        self.static_segment_photo_key = None
         self.static_coverage_blocking = []
         self.static_coverage_weakening = []
         if render and hasattr(self, "canvas"):
@@ -4630,14 +4717,26 @@ class MeshSimulatorApp:
         self.static_coverage_request_id += 1
         request_id = self.static_coverage_request_id
         cap = self._coverage_range_cap()
-        samples = self._beacon_ray_count(len(self.scenario.nodes) + len(self.scenario.obstacles))
+        samples = max(
+            144,
+            self._beacon_ray_count(len(self.scenario.nodes) + len(self.scenario.obstacles)),
+        )
+        segment_samples = max(
+            56,
+            min(96, math.ceil(max(self.canvas.winfo_width(), self.canvas.winfo_height()) / 24)),
+        )
         snapshot = self.scenario
         name = node.name
 
         def worker() -> None:
             try:
                 model = PropagationModel(snapshot)
-                profile = model.beacon_profile(node, angular_samples=samples, max_range_m=cap)
+                profile = model.beacon_profile(
+                    node,
+                    angular_samples=samples,
+                    max_range_m=cap,
+                    segment_samples=segment_samples,
+                )
                 if not cancel.is_set():
                     self.static_coverage_queue.put((request_id, profile, None, name))
             except Exception as error:  # noqa: BLE001 - surfaced to the status bar
@@ -4712,6 +4811,145 @@ class MeshSimulatorApp:
         self._draw_static_coverage(c)
         self._tag_items_created_since(c, start, STATIC_COVERAGE_TAG)
 
+    def _draw_segmented_coverage(
+        self,
+        c: tk.Canvas,
+        profile: BeaconProfile,
+        *,
+        cache_prefix: str,
+        grow: float = 1.0,
+    ) -> bool:
+        """Paint only sampled reachable ray sections, preserving gaps between them."""
+        if len(profile.rays) < 3 or any(len(ray.samples) < 2 for ray in profile.rays):
+            return False
+        width = max(1, c.winfo_width())
+        height = max(1, c.winfo_height())
+        grow = max(0.0, min(1.0, grow))
+        key = (
+            id(profile),
+            width,
+            height,
+            round(grow, 3),
+            round(self.view_x, 3),
+            round(self.view_y, 3),
+            round(self.zoom, 6),
+        )
+        key_name = f"{cache_prefix}_segment_photo_key"
+        photo_name = f"{cache_prefix}_segment_photo"
+        photo = getattr(self, photo_name, None)
+        if getattr(self, key_name, None) != key or photo is None:
+            render_scale = 2
+            layer = Image.new(
+                "RGBA",
+                (width * render_scale, height * render_scale),
+                (0, 0, 0, 0),
+            )
+            drawing = ImageDraw.Draw(layer, "RGBA")
+            ox, oy = profile.x, profile.y
+
+            def screen_at(angle: float, distance: float) -> tuple[float, float]:
+                screen_x, screen_y = self.world_to_screen(
+                    ox + math.cos(angle) * distance * grow,
+                    oy + math.sin(angle) * distance * grow,
+                )
+                return screen_x * render_scale, screen_y * render_scale
+
+            ray_count = len(profile.rays)
+            outer_points: list[tuple[float, float] | None] = []
+            outer_distances: list[float] = []
+            for ray in profile.rays:
+                reachable = [sample.distance_m for sample in ray.samples if sample.reachable]
+                outer = max(reachable) if reachable else 0.0
+                outer_distances.append(outer)
+                outer_points.append(screen_at(ray.angle, outer) if outer > 0 else None)
+
+            # Each sampled direction owns its angular wedge. This retains the
+            # original bold ray shape instead of eroding it whenever one adjacent
+            # direction differs, while every radial section still has to pass its
+            # own complete calibrated link-budget check.
+            half_step = math.pi / ray_count
+            for ray_index, ray in enumerate(profile.rays):
+                outer = max(1.0, outer_distances[ray_index])
+                left_angle = ray.angle - half_step
+                right_angle = ray.angle + half_step
+                crossed_gap = False
+                for radial_index in range(len(ray.samples) - 1):
+                    inner, outer_sample = ray.samples[radial_index : radial_index + 2]
+                    if not (inner.reachable and outer_sample.reachable):
+                        crossed_gap = True
+                        continue
+                    midpoint_distance = (inner.distance_m + outer_sample.distance_m) * 0.5
+                    strength_position = max(0.0, min(1.0, midpoint_distance / outer))
+                    margin = (inner.margin_db + outer_sample.margin_db) * 0.5
+                    margin_position = 1.0 - max(0.0, min(1.0, margin / 24.0))
+                    # Preserve the original distance bands while allowing the RF
+                    # model to bend their colour around local obstruction loss.
+                    strength_position = strength_position * 0.72 + margin_position * 0.28
+                    if crossed_gap:
+                        # A section that reappears on elevated terrain uses its
+                        # measured margin, so a strong mountain-top path can be
+                        # green even though dead ground separates it from source.
+                        strength_position = margin_position
+                    red, green, blue = ImageColor.getrgb(self._strength_color(strength_position))
+                    drawing.polygon(
+                        (
+                            screen_at(left_angle, inner.distance_m),
+                            screen_at(left_angle, outer_sample.distance_m),
+                            screen_at(right_angle, outer_sample.distance_m),
+                            screen_at(right_angle, inner.distance_m),
+                        ),
+                        fill=(red, green, blue, 145),
+                    )
+
+            # Keep the original crisp outer boundary, but break it wherever the
+            # sampled signal itself has no adjacent reachable section.
+            for ray_index, first in enumerate(outer_points):
+                second = outer_points[(ray_index + 1) % ray_count]
+                if first is None or second is None:
+                    continue
+                drawing.line((first, second), fill=(5, 8, 13, 255), width=6)
+                drawing.line((first, second), fill=(255, 255, 255, 255), width=2)
+
+            layer = layer.resize((width, height), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(layer)
+            setattr(self, photo_name, photo)
+            setattr(self, key_name, key)
+        c.create_image(0, 0, anchor="nw", image=photo)
+        return True
+
+    def _draw_segmented_ripple(
+        self,
+        c: tk.Canvas,
+        profile: BeaconProfile,
+        fraction: float,
+    ) -> bool:
+        """Draw a broken pulse only across currently reachable radial sections."""
+        if len(profile.rays) < 3 or any(len(ray.samples) < 2 for ray in profile.rays):
+            return False
+        points: list[tuple[float, float] | None] = []
+        ox, oy = profile.x, profile.y
+        for ray in profile.rays:
+            outer = max(
+                (sample.distance_m for sample in ray.samples if sample.reachable),
+                default=0.0,
+            )
+            distance = outer * fraction
+            sample = min(ray.samples, key=lambda item: abs(item.distance_m - distance))
+            if not sample.reachable:
+                points.append(None)
+                continue
+            points.append(
+                self.world_to_screen(
+                    ox + math.cos(ray.angle) * distance,
+                    oy + math.sin(ray.angle) * distance,
+                )
+            )
+        for index, first in enumerate(points):
+            second = points[(index + 1) % len(points)]
+            if first is not None and second is not None:
+                c.create_line(*first, *second, fill=self._BEACON_EDGE, width=1)
+        return True
+
     def _draw_static_coverage(self, c: tk.Canvas) -> None:
         """Coverage heatmap for the sender of an unreached packet: it expands once
         to full extent then holds (no pulsing).  Green->yellow->red fill, yellow
@@ -4721,6 +4959,13 @@ class MeshSimulatorApp:
             return
         grow = max(0.0, min(1.0, self.static_coverage_grow))
         if grow <= 0.01:
+            return
+        if self._draw_segmented_coverage(c, profile, cache_prefix="static", grow=grow):
+            if grow >= 0.999:
+                for obstacle in self.static_coverage_weakening:
+                    self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
+                for obstacle in self.static_coverage_blocking:
+                    self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
             return
         w2s = self.world_to_screen
         ox, oy = profile.x, profile.y
@@ -4897,6 +5142,82 @@ class MeshSimulatorApp:
         self.view_y = (top + bottom - visible_h) / 2.0
         self.render_canvas()
 
+    def fit_survey_view(self) -> None:
+        points = [
+            position
+            for measurement in self.survey_measurements
+            if (position := self._survey_world_position(measurement)) is not None
+        ]
+        base = self._survey_base_world_position()
+        if base:
+            points.append(base)
+        if not points:
+            return
+        xs, ys = [point[0] for point in points], [point[1] for point in points]
+        left, right, top, bottom = min(xs), max(xs), min(ys), max(ys)
+        span_x = max(120.0, right - left)
+        span_y = max(120.0, bottom - top)
+        left, right = (left + right - span_x) / 2.0, (left + right + span_x) / 2.0
+        top, bottom = (top + bottom - span_y) / 2.0, (top + bottom + span_y) / 2.0
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+        scale = self._base_scale()
+        self.zoom = clamp(
+            min(canvas_width / max(1.0, right - left), canvas_height / max(1.0, bottom - top))
+            / max(scale, 1e-9)
+            * 0.86,
+            MIN_CANVAS_ZOOM,
+            MAX_CANVAS_ZOOM,
+        )
+        visible_width = canvas_width / max(1e-9, scale * self.zoom)
+        visible_height = canvas_height / max(1e-9, scale * self.zoom)
+        self.view_x = (left + right - visible_width) / 2.0
+        self.view_y = (top + bottom - visible_height) / 2.0
+        self.map_visible.set(True)
+        self.render_canvas()
+
+    def select_survey_measurement(self, index: int, center: bool = True) -> None:
+        if not 0 <= index < len(self.survey_measurements):
+            return
+        self.survey_selected_index = index
+        position = self._survey_world_position(self.survey_measurements[index])
+        if center and position:
+            visible_width = self.canvas.winfo_width() / max(1e-9, self._base_scale() * self.zoom)
+            visible_height = self.canvas.winfo_height() / max(1e-9, self._base_scale() * self.zoom)
+            self.view_x = position[0] - visible_width / 2.0
+            self.view_y = position[1] - visible_height / 2.0
+        if hasattr(self, "survey_tree"):
+            item = str(index)
+            if self.survey_tree.exists(item):
+                if self.survey_tree.selection() != (item,):
+                    self.survey_tree.selection_set(item)
+                self.survey_tree.see(item)
+        measurement = self.survey_measurements[index]
+        forward = survey_float(measurement.get("forward_rssi_dbm"))
+        reverse = survey_float(measurement.get("reverse_rssi_dbm"))
+        sequence = measurement.get("sequence", index + 1)
+        message = (
+            f"Survey point #{sequence} · forward {forward:.0f} dBm"
+            if forward is not None
+            else f"Survey point #{sequence} · forward packet lost"
+        )
+        if reverse is not None:
+            message += f" · reply {reverse:.0f} dBm"
+        self.status_var.set(message)
+        self.render_canvas()
+
+    def _survey_hit_test(self, screen_x: float, screen_y: float) -> int | None:
+        best: tuple[float, int] | None = None
+        for index, measurement in enumerate(self.survey_measurements):
+            position = self._survey_world_position(measurement)
+            if position is None:
+                continue
+            x, y = self.world_to_screen(*position)
+            distance = math.hypot(screen_x - x, screen_y - y)
+            if distance <= 10 and (best is None or distance < best[0]):
+                best = (distance, index)
+        return best[1] if best else None
+
     def render_canvas(self) -> None:
         if not hasattr(self, "canvas"):
             return
@@ -4927,6 +5248,7 @@ class MeshSimulatorApp:
         for node in self.scenario.nodes:
             self._draw_node(c, node)
         self._tag_items_created_since(c, node_start, NODE_LAYER_TAG)
+        self._draw_survey_overlay(c)
         if self.temp_forest_points:
             coordinates: list[float] = []
             for point_x, point_y in self.temp_forest_points:
@@ -4965,6 +5287,119 @@ class MeshSimulatorApp:
             attribution_start = len(c.find_all())
             self._draw_map_attribution(c)
             self._tag_items_created_since(c, attribution_start, HUD_LAYER_TAG)
+
+    def _survey_world_position(
+        self, measurement: dict[str, object], prefix: str = "mobile"
+    ) -> tuple[float, float] | None:
+        latitude = survey_float(measurement.get(f"{prefix}_latitude"))
+        longitude = survey_float(measurement.get(f"{prefix}_longitude"))
+        if latitude is None or longitude is None:
+            return None
+        env = self.scenario.environment
+        return latlon_to_world(latitude, longitude, env.map_center_lat, env.map_center_lon)
+
+    def _survey_base_world_position(self) -> tuple[float, float] | None:
+        coordinates = [
+            (
+                survey_float(measurement.get("base_latitude")),
+                survey_float(measurement.get("base_longitude")),
+            )
+            for measurement in self.survey_measurements
+        ]
+        valid = [(latitude, longitude) for latitude, longitude in coordinates if latitude is not None and longitude is not None]
+        if not valid:
+            return None
+        latitude = sum(point[0] for point in valid) / len(valid)
+        longitude = sum(point[1] for point in valid) / len(valid)
+        env = self.scenario.environment
+        return latlon_to_world(latitude, longitude, env.map_center_lat, env.map_center_lon)
+
+    def _draw_survey_overlay(self, c: tk.Canvas) -> None:
+        if not self.survey_measurements:
+            return
+        width, height = c.winfo_width(), c.winfo_height()
+        selected = self.survey_selected_index
+        base_position = self._survey_base_world_position()
+        if selected is not None and 0 <= selected < len(self.survey_measurements):
+            mobile_position = self._survey_world_position(self.survey_measurements[selected])
+            if mobile_position and base_position:
+                mx, my = self.world_to_screen(*mobile_position)
+                bx, by = self.world_to_screen(*base_position)
+                c.create_line(
+                    mx, my, bx, by, fill="#f8fbff", width=2, dash=(5, 4),
+                    tags=(SURVEY_LAYER_TAG,),
+                )
+
+        for index, measurement in enumerate(self.survey_measurements):
+            position = self._survey_world_position(measurement)
+            if position is None:
+                continue
+            x, y = self.world_to_screen(*position)
+            if x < -12 or y < -12 or x > width + 12 or y > height + 12:
+                continue
+            color = survey_signal_color(measurement)
+            radius = 8 if index == selected else 4
+            tags = (SURVEY_LAYER_TAG, f"survey-point:{index}")
+            if not survey_bool(measurement.get("forward_received")):
+                c.create_line(x - radius, y - radius, x + radius, y + radius, fill=color, width=3, tags=tags)
+                c.create_line(x - radius, y + radius, x + radius, y - radius, fill=color, width=3, tags=tags)
+            else:
+                outline = "#ffffff" if index == selected else "#06101c"
+                c.create_oval(
+                    x - radius, y - radius, x + radius, y + radius,
+                    fill=color, outline=outline, width=3 if index == selected else 1, tags=tags,
+                )
+
+        if base_position:
+            x, y = self.world_to_screen(*base_position)
+            if -20 <= x <= width + 20 and -20 <= y <= height + 20:
+                c.create_polygon(
+                    x, y - 10, x + 10, y, x, y + 10, x - 10, y,
+                    fill=ACCENT, outline="#ffffff", width=2, tags=(SURVEY_LAYER_TAG,),
+                )
+                c.create_text(
+                    x, y - 17, text="SURVEY BASE", fill="#ffffff",
+                    font=("Segoe UI Semibold", 8), tags=(SURVEY_LAYER_TAG,),
+                )
+
+        if selected is not None and 0 <= selected < len(self.survey_measurements):
+            measurement = self.survey_measurements[selected]
+            position = self._survey_world_position(measurement)
+            if position:
+                x, y = self.world_to_screen(*position)
+                forward = survey_float(measurement.get("forward_rssi_dbm"))
+                reverse = survey_float(measurement.get("reverse_rssi_dbm"))
+                sequence = measurement.get("sequence", selected + 1)
+                label = (
+                    f"#{sequence}  out {forward:.0f} dBm"
+                    if forward is not None
+                    else f"#{sequence}  forward lost"
+                )
+                if reverse is not None:
+                    label += f"  back {reverse:.0f} dBm"
+                c.create_text(
+                    x + 12, y - 15, text=label, anchor="sw", fill="#ffffff",
+                    font=("Segoe UI Semibold", 9), tags=(SURVEY_LAYER_TAG,),
+                )
+
+        legend_x = max(10, width - 190)
+        c.create_rectangle(
+            legend_x, 12, width - 12, 72, fill="#081321", outline=BORDER,
+            tags=(SURVEY_LAYER_TAG, HUD_LAYER_TAG),
+        )
+        c.create_text(
+            legend_x + 9, 21, text=f"FIELD SURVEY · {len(self.survey_measurements):,} points",
+            anchor="w", fill="#ffffff", font=("Segoe UI Semibold", 8),
+            tags=(SURVEY_LAYER_TAG, HUD_LAYER_TAG),
+        )
+        legend = ((GREEN, "≥ -90"), (AMBER, "-91 to -110"), (RED, "< -110 / loss"))
+        for offset, (color, text) in enumerate(legend):
+            x = legend_x + 11 + offset * 55
+            c.create_oval(x, 39, x + 8, 47, fill=color, outline="", tags=(SURVEY_LAYER_TAG, HUD_LAYER_TAG))
+            c.create_text(
+                x + 4, 58, text=text, anchor="n", fill=MUTED, font=("Segoe UI", 7),
+                tags=(SURVEY_LAYER_TAG, HUD_LAYER_TAG),
+            )
 
     @staticmethod
     def _bounds_overlap(
@@ -5966,6 +6401,33 @@ class MeshSimulatorApp:
         w2s = self.world_to_screen
         ox, oy = profile.x, profile.y
 
+        if self._draw_segmented_coverage(c, profile, cache_prefix="beacon"):
+            for obstacle in self.beacon_weakening_obstacles:
+                self._draw_beacon_obstacle(c, obstacle, self._BEACON_SLOW, 2, fill=True)
+            for obstacle in self.beacon_blocking_obstacles:
+                self._draw_beacon_obstacle(c, obstacle, self._BEACON_BLOCK, 2, fill=True)
+            if phase > 0.02:
+                self._draw_segmented_ripple(c, profile, phase)
+            cx, cy = w2s(ox, oy)
+            halo = 5 + 4 * glow
+            c.create_oval(
+                cx - halo,
+                cy - halo,
+                cx + halo,
+                cy + halo,
+                outline=self._BEACON_EDGE,
+                width=2,
+            )
+            c.create_oval(
+                cx - 3,
+                cy - 3,
+                cx + 3,
+                cy + 3,
+                fill=self._BEACON_EDGE,
+                outline=self._BEACON_HALO,
+            )
+            return
+
         # Boundary points in world space (where the signal reaches per direction).
         world = [
             (ox + math.cos(ray.angle) * ray.reach_m, oy + math.sin(ray.angle) * ray.reach_m)
@@ -6278,6 +6740,10 @@ class MeshSimulatorApp:
         if self.tool in OBSTACLE_DEFAULTS:
             x, y = self.drag_start_world
             self.temp_obstacle = (x, y, x, y)
+            return
+        survey_hit = self._survey_hit_test(event.x, event.y)
+        if survey_hit is not None:
+            self.select_survey_measurement(survey_hit, center=False)
             return
         hit = self.hit_test(event.x, event.y)
         self.select(hit.id if hit else None)
@@ -6831,6 +7297,592 @@ class MeshSimulatorApp:
             return False
         self.file_path = path
         return self.save_scenario()
+
+    def show_survey_viewer(self) -> None:
+        if self.survey_window is not None and self.survey_window.winfo_exists():
+            self.survey_window.deiconify()
+            self.survey_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.survey_window = window
+        window.title("MeshLab RF — Survey Export & Viewer")
+        window.geometry("1220x760")
+        window.minsize(920, 600)
+        window.configure(bg=BG)
+        window.protocol("WM_DELETE_WINDOW", self._close_survey_viewer)
+
+        header = ttk.Frame(window, style="Toolbar.TFrame")
+        header.pack(fill="x")
+        title = ttk.Frame(header, style="Toolbar.TFrame")
+        title.pack(side="left", padx=14, pady=10)
+        ttk.Label(title, text="FIELD SURVEY", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            title,
+            text="Select either node to load its retained log immediately; later selections merge without replacing it.",
+            style="Muted.TLabel",
+        ).pack(anchor="w")
+        actions = ttk.Frame(header, style="Toolbar.TFrame")
+        actions.pack(side="right", padx=12, pady=10)
+        self.survey_scan_button = ttk.Button(actions, text="Refresh ports", command=self._start_survey_scan)
+        self.survey_scan_button.pack(side="left", padx=3)
+        self.survey_export_button = ttk.Button(
+            actions, text="Save captured logs…", style="Accent.TButton", command=self._start_survey_export,
+            state="disabled",
+        )
+        self.survey_export_button.pack(side="left", padx=3)
+        ttk.Button(actions, text="Open saved export…", command=self._open_survey_export).pack(side="left", padx=3)
+        self.survey_folder_button = ttk.Button(
+            actions, text="Open folder", command=self._open_survey_folder,
+            state="normal" if self.survey_export_path else "disabled",
+        )
+        self.survey_folder_button.pack(side="left", padx=3)
+
+        status = ttk.Frame(window)
+        status.pack(fill="x", padx=12, pady=(9, 4))
+        self.survey_status_var = tk.StringVar(
+            value="Choose a mobile or base serial port; its complete log loads and plots automatically."
+        )
+        ttk.Label(status, textvariable=self.survey_status_var, style="Muted.TLabel").pack(side="left", fill="x", expand=True)
+        self.survey_progress = ttk.Progressbar(status, mode="determinate", maximum=100, length=250)
+        self.survey_progress.pack(side="right", padx=(10, 0))
+
+        devices_frame = ttk.LabelFrame(window, text="Survey node ports")
+        devices_frame.pack(fill="x", padx=12, pady=5)
+        port_picker = ttk.Frame(devices_frame)
+        port_picker.pack(fill="x", padx=7, pady=(7, 2))
+        ttk.Label(port_picker, text="Mobile port", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        self.survey_mobile_port_combo = ttk.Combobox(
+            port_picker, textvariable=self.survey_mobile_port_var, state="readonly", width=42,
+        )
+        self.survey_mobile_port_combo.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(port_picker, text="Base port", style="Muted.TLabel").grid(row=0, column=1, sticky="w")
+        self.survey_base_port_combo = ttk.Combobox(
+            port_picker, textvariable=self.survey_base_port_var, state="readonly", width=42,
+        )
+        self.survey_base_port_combo.grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        self.survey_identify_button = ttk.Button(
+            port_picker, text="Reload selected", command=self._start_survey_identify, state="disabled",
+        )
+        self.survey_identify_button.grid(row=1, column=2, sticky="ew")
+        port_picker.columnconfigure(0, weight=1)
+        port_picker.columnconfigure(1, weight=1)
+        self.survey_mobile_port_combo.bind("<<ComboboxSelected>>", self._survey_port_changed)
+        self.survey_base_port_combo.bind("<<ComboboxSelected>>", self._survey_port_changed)
+        self.survey_devices_tree = ttk.Treeview(
+            devices_frame,
+            columns=("role", "port", "node", "records", "size", "format"),
+            show="headings",
+            height=2,
+        )
+        for key, label, width in (
+            ("role", "Role", 90), ("port", "Port", 90), ("node", "Node ID", 190),
+            ("records", "Stored records", 115), ("size", "Log data", 100), ("format", "Format", 90),
+        ):
+            self.survey_devices_tree.heading(key, text=label)
+            self.survey_devices_tree.column(key, width=width, minwidth=65, stretch=key == "node")
+        self.survey_devices_tree.pack(fill="x", padx=5, pady=(2, 5))
+
+        summary = ttk.Frame(window)
+        summary.pack(fill="x", padx=10, pady=4)
+        self.survey_metric_vars: dict[str, tk.StringVar] = {}
+        for column, (key, title_text) in enumerate((
+            ("probes", "Joined probes"), ("forward", "Reached base"),
+            ("reply", "Replies returned"), ("gps", "Mapped GPS points"),
+        )):
+            card = tk.Frame(summary, bg="#101f32", highlightbackground=BORDER, highlightthickness=1)
+            card.grid(row=0, column=column, sticky="ew", padx=2)
+            summary.columnconfigure(column, weight=1)
+            tk.Label(card, text=title_text, bg="#101f32", fg=MUTED, anchor="w").pack(fill="x", padx=9, pady=(5, 0))
+            variable = tk.StringVar(value="—")
+            self.survey_metric_vars[key] = variable
+            tk.Label(
+                card, textvariable=variable, bg="#101f32", fg=TEXT,
+                font=("Segoe UI Semibold", 15), anchor="w",
+            ).pack(fill="x", padx=9, pady=(0, 5))
+
+        controls = ttk.Frame(window)
+        controls.pack(fill="x", padx=12, pady=(4, 3))
+        ttk.Label(controls, text="Show", style="Muted.TLabel").pack(side="left")
+        self.survey_filter_var = tk.StringVar(value="All measurements")
+        filter_box = ttk.Combobox(
+            controls,
+            textvariable=self.survey_filter_var,
+            values=("All measurements", "Complete round trips", "Forward only", "Forward lost"),
+            state="readonly",
+            width=22,
+        )
+        filter_box.pack(side="left", padx=6)
+        filter_box.bind("<<ComboboxSelected>>", self._refresh_survey_table)
+        ttk.Button(controls, text="Fit all points on map", command=self.fit_survey_view).pack(side="right", padx=3)
+        ttk.Button(controls, text="Clear map points", command=self._clear_survey_map).pack(side="right", padx=3)
+        ttk.Button(
+            controls,
+            text="Calibrate buildings",
+            command=self._calibrate_buildings_from_survey,
+        ).pack(side="right", padx=3)
+
+        table_frame = ttk.Frame(window)
+        table_frame.pack(fill="both", expand=True, padx=12, pady=(2, 12))
+        self.survey_tree = self._tree(
+            table_frame,
+            [
+                ("sequence", "Probe", 65), ("time", "Time", 145), ("location", "Mobile GPS", 190),
+                ("sat", "Sat", 45), ("hdop", "HDOP", 55), ("forward", "Forward", 75),
+                ("forward_rssi", "Out RSSI", 75), ("forward_snr", "Out SNR", 65),
+                ("reply", "Reply", 70), ("reverse_rssi", "Back RSSI", 80),
+                ("reverse_snr", "Back SNR", 70),
+            ],
+        )
+        self.survey_tree.bind("<<TreeviewSelect>>", self._survey_tree_selected)
+
+        self._start_survey_scan()
+        if self.survey_measurements:
+            self._apply_survey_measurements(self.survey_measurements, self.survey_export_path, fit=False)
+
+    def _close_survey_viewer(self) -> None:
+        if self.survey_window is not None:
+            self.survey_window.destroy()
+        self.survey_window = None
+
+    def _survey_set_busy(self, busy: bool, message: str = "") -> None:
+        if self.survey_window is None or not self.survey_window.winfo_exists():
+            return
+        state = "disabled" if busy else "normal"
+        self.survey_scan_button.configure(state=state)
+        self.survey_mobile_port_combo.configure(state="disabled" if busy else "readonly")
+        self.survey_base_port_combo.configure(state="disabled" if busy else "readonly")
+        selected_ports = self._selected_survey_ports()
+        self.survey_identify_button.configure(
+            state="normal" if not busy and selected_ports else "disabled"
+        )
+        self.survey_export_button.configure(
+            state="disabled" if busy or not self.survey_captures else "normal"
+        )
+        if message:
+            self.survey_status_var.set(message)
+        if busy:
+            self.survey_progress.configure(mode="indeterminate")
+            self.survey_progress.start(12)
+        else:
+            self.survey_progress.stop()
+            self.survey_progress.configure(mode="determinate")
+
+    def _start_survey_scan(self) -> None:
+        if self.survey_worker is not None and self.survey_worker.is_alive():
+            return
+        previous_mobile = self.survey_mobile_port_var.get()
+        previous_base = self.survey_base_port_var.get()
+        ports = list_serial_ports()
+        self.survey_ports = {port.label: port for port in ports}
+        labels = [SURVEY_PORT_NONE, *self.survey_ports]
+        self.survey_mobile_port_combo.configure(values=labels)
+        self.survey_base_port_combo.configure(values=labels)
+        self.survey_mobile_port_var.set(previous_mobile if previous_mobile in self.survey_ports else SURVEY_PORT_NONE)
+        self.survey_base_port_var.set(previous_base if previous_base in self.survey_ports else SURVEY_PORT_NONE)
+        self._survey_port_changed()
+        if ports:
+            self.survey_status_var.set(
+                f"Found {len(ports)} serial port{'s' if len(ports) != 1 else ''}. "
+                "Choose either survey node to load and plot it automatically."
+            )
+        else:
+            self.survey_status_var.set("No serial ports found. Connect the survey nodes and refresh ports.")
+
+    def _selected_survey_ports(self) -> list[str]:
+        selected: list[str] = []
+        for variable in (self.survey_mobile_port_var, self.survey_base_port_var):
+            port = self.survey_ports.get(variable.get())
+            if port is not None and port.device not in selected:
+                selected.append(port.device)
+        return selected
+
+    def _survey_port_changed(self, _event: tk.Event | None = None) -> None:
+        self.survey_devices = []
+        self._populate_survey_devices()
+        selected = self._selected_survey_ports()
+        if hasattr(self, "survey_identify_button"):
+            self.survey_identify_button.configure(state="normal" if selected else "disabled")
+        if hasattr(self, "survey_export_button"):
+            self.survey_export_button.configure(state="disabled")
+        if hasattr(self, "survey_status_var") and selected:
+            self.survey_status_var.set(
+                f"Loading {len(selected)} selected survey node{'s' if len(selected) != 1 else ''}…"
+            )
+        for assignment in self._selected_survey_assignments().items():
+            self.survey_capture_attempts.discard(assignment)
+        self._capture_next_selected()
+
+    def _selected_survey_assignments(self) -> dict[str, str]:
+        assignments: dict[str, str] = {}
+        mobile = self.survey_ports.get(self.survey_mobile_port_var.get())
+        base = self.survey_ports.get(self.survey_base_port_var.get())
+        if mobile is not None:
+            assignments["mobile"] = mobile.device
+        if base is not None:
+            assignments["base"] = base.device
+        return assignments
+
+    def _capture_next_selected(self) -> None:
+        if self.survey_worker is not None and self.survey_worker.is_alive():
+            return
+        for role, port in self._selected_survey_assignments().items():
+            existing = self.survey_captures.get(role)
+            if (existing is None or existing.info.port != port) and (role, port) not in self.survey_capture_attempts:
+                self._start_survey_capture(role, port)
+                return
+
+    def _start_survey_identify(self) -> None:
+        if self.survey_worker is not None and self.survey_worker.is_alive():
+            return
+        assignments = self._selected_survey_assignments()
+        if not assignments:
+            self.survey_status_var.set("Choose at least one survey-node port first.")
+            return
+        for role in assignments:
+            self.survey_captures.pop(role, None)
+        for assignment in assignments.items():
+            self.survey_capture_attempts.discard(assignment)
+        self._capture_next_selected()
+
+    def _start_survey_capture(self, expected_role: str, port: str) -> None:
+        self.survey_capture_attempts.add((expected_role, port))
+        self._survey_set_busy(True, f"Loading the {expected_role} survey log from {port}…")
+
+        def progress(message: str, fraction: float | None) -> None:
+            self.survey_updates.put(("progress", (message, fraction)))
+
+        def worker() -> None:
+            try:
+                info = query_device(port)
+                if info.role != expected_role:
+                    raise RuntimeError(
+                        f"{port} is not the {expected_role} survey node; firmware reported {info.role}"
+                    )
+                self.survey_updates.put(("capture", capture_device(info, progress)))
+            except Exception as error:
+                self.survey_updates.put(("error", error))
+
+        self.survey_worker = threading.Thread(target=worker, name="SurveyDeviceCapture", daemon=True)
+        self.survey_worker.start()
+        self.root.after(50, self._poll_survey_updates)
+
+    def _start_survey_export(self) -> None:
+        if self.survey_worker is not None and self.survey_worker.is_alive():
+            return
+        if not self.survey_captures:
+            return
+        parent = Path.cwd() / "survey-data"
+        parent.mkdir(parents=True, exist_ok=True)
+        selected = filedialog.askdirectory(
+            title="Choose parent folder for the captured survey logs",
+            initialdir=str(parent),
+            parent=self.survey_window,
+        )
+        if not selected:
+            return
+        destination = Path(selected) / datetime.now().strftime("%Y%m%d-%H%M%S")
+        captures = tuple(self.survey_captures.values())
+        self._survey_set_busy(True, "Saving captured survey logs…")
+
+        def progress(message: str, fraction: float | None) -> None:
+            self.survey_updates.put(("progress", (message, fraction)))
+
+        def worker() -> None:
+            try:
+                self.survey_updates.put(("export", save_captures(captures, destination, progress)))
+            except Exception as error:
+                self.survey_updates.put(("error", error))
+
+        self.survey_worker = threading.Thread(target=worker, name="SurveyDeviceExport", daemon=True)
+        self.survey_worker.start()
+        self.root.after(50, self._poll_survey_updates)
+
+    def _poll_survey_updates(self) -> None:
+        while True:
+            try:
+                operation, payload = self.survey_updates.get_nowait()
+            except queue.Empty:
+                break
+            if operation == "progress":
+                message, fraction = payload
+                if self.survey_window is not None and self.survey_window.winfo_exists():
+                    self.survey_status_var.set(str(message))
+                    if fraction is not None:
+                        self.survey_progress.stop()
+                        self.survey_progress.configure(mode="determinate", value=float(fraction) * 100.0)
+            elif operation == "capture":
+                capture = payload
+                assert isinstance(capture, DeviceCapture)
+                self.survey_captures[capture.info.role] = capture
+                self.survey_devices = [
+                    item.info for item in sorted(
+                        self.survey_captures.values(), key=lambda item: item.info.role, reverse=True
+                    )
+                ]
+                self._populate_survey_devices()
+                raw_rows = [
+                    row for item in self.survey_captures.values() for row in item.rows
+                ]
+                measurements = merge_survey_rows(raw_rows)
+                self.survey_export_path = None
+                self.survey_export_roles = set(self.survey_captures)
+                if self.survey_window is not None and self.survey_window.winfo_exists():
+                    self.survey_folder_button.configure(state="disabled")
+                self._apply_survey_measurements(measurements, None)
+                roles = sorted(self.survey_captures)
+                if roles == ["base", "mobile"]:
+                    message = (
+                        f"Loaded both retained logs in memory · {len(measurements):,} joined measurements plotted."
+                    )
+                elif roles in (["base"], ["mobile"]):
+                    message = (
+                        f"Loaded {capture.valid_records:,} {roles[0]} records in memory. "
+                        "Select the other node whenever ready; this capture will be retained."
+                    )
+                elif not roles:
+                    message = "No survey-node logs are loaded."
+                else:
+                    message = f"Loaded survey roles: {', '.join(roles)}."
+                self._survey_set_busy(False, message)
+            elif operation == "export":
+                result = payload
+                assert isinstance(result, SurveyExport)
+                self.survey_export_path = result.destination
+                self.survey_export_roles = set(result.roles)
+                self._apply_survey_measurements(result.measurements, result.destination)
+                if self.survey_window is not None and self.survey_window.winfo_exists():
+                    self.survey_folder_button.configure(state="normal")
+                self._survey_set_busy(
+                    False,
+                    (
+                        f"Complete paired export: {len(result.measurements):,} measurements saved to {result.destination}"
+                        if set(result.roles) == {"mobile", "base"}
+                        else f"Single {result.roles[0]} log exported to {result.destination}. "
+                        "Connect and export the other role later to complete this survey."
+                    ),
+                )
+                self.status_var.set(f"Survey exported and plotted · {result.destination}")
+            elif operation == "error":
+                self._survey_set_busy(False, f"Survey operation failed: {payload}")
+                if self.survey_window is not None and self.survey_window.winfo_exists():
+                    messagebox.showerror("Survey operation failed", str(payload), parent=self.survey_window)
+        if self.survey_worker is not None and self.survey_worker.is_alive():
+            self.root.after(50, self._poll_survey_updates)
+        else:
+            self.survey_worker = None
+            self.root.after(10, self._capture_next_selected)
+
+    def _populate_survey_devices(self) -> None:
+        if not hasattr(self, "survey_devices_tree"):
+            return
+        self.survey_devices_tree.delete(*self.survey_devices_tree.get_children())
+        for device in sorted(self.survey_devices, key=lambda item: item.role, reverse=True):
+            self.survey_devices_tree.insert(
+                "",
+                "end",
+                values=(
+                    device.role.upper(), device.port, f"{device.node_id:016x}", f"{device.slots:,}",
+                    f"{device.slots * device.record_size / 1024:.1f} KB", f"v{device.version} / {device.record_size} B",
+                ),
+            )
+
+    def _open_survey_export(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open MeshLab survey measurements",
+            filetypes=[("MeshLab measurements", "measurements.csv"), ("CSV files", "*.csv")],
+            parent=self.survey_window or self.root,
+        )
+        if not path:
+            return
+        try:
+            measurements = read_measurements(path)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Could not open survey", str(error), parent=self.survey_window or self.root)
+            return
+        self.survey_export_path = Path(path).parent
+        manifest_path = self.survey_export_path / "survey-export.json"
+        self.survey_export_roles = set()
+        if manifest_path.is_file():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.survey_export_roles = {
+                    str(role).lower() for role in manifest.get("roles", [])
+                    if str(role).lower() in {"mobile", "base"}
+                }
+            except (OSError, ValueError, TypeError):
+                self.survey_export_roles = set()
+        self._apply_survey_measurements(measurements, self.survey_export_path)
+        if self.survey_window is not None and self.survey_window.winfo_exists():
+            self.survey_folder_button.configure(state="normal")
+            if len(self.survey_export_roles) == 1:
+                role = next(iter(self.survey_export_roles))
+                self.survey_status_var.set(
+                    f"Loaded single {role} export. Connect and export the other role to complete it."
+                )
+            else:
+                self.survey_status_var.set(f"Loaded {len(measurements):,} measurements from {path}")
+
+    def _open_survey_folder(self) -> None:
+        if self.survey_export_path is None:
+            return
+        try:
+            os.startfile(str(self.survey_export_path))
+        except OSError as error:
+            messagebox.showerror("Could not open export folder", str(error), parent=self.survey_window or self.root)
+
+    def _apply_survey_measurements(
+        self,
+        measurements: list[dict[str, object]],
+        source: Path | None,
+        fit: bool = True,
+    ) -> None:
+        self.survey_measurements = list(measurements)
+        self.survey_export_path = source
+        self.survey_selected_index = None
+        total = len(self.survey_measurements)
+        forward = sum(survey_bool(row.get("forward_received")) for row in self.survey_measurements)
+        reply = sum(survey_bool(row.get("reply_received")) for row in self.survey_measurements)
+        reply_known = sum(
+            survey_value_known(row.get("reply_received")) for row in self.survey_measurements
+        )
+        gps = sum(self._survey_world_position(row) is not None for row in self.survey_measurements)
+        if hasattr(self, "survey_metric_vars"):
+            self.survey_metric_vars["probes"].set(f"{total:,}")
+            self.survey_metric_vars["forward"].set(f"{forward:,} · {forward / total * 100:.1f}%" if total else "0")
+            if reply_known < total:
+                self.survey_metric_vars["reply"].set(
+                    f"{reply:,} received · {total - reply_known:,} unknown"
+                )
+            else:
+                self.survey_metric_vars["reply"].set(
+                    f"{reply:,} · {reply / total * 100:.1f}%" if total else "0"
+                )
+            self.survey_metric_vars["gps"].set(f"{gps:,}")
+            self._refresh_survey_table()
+        if fit:
+            self.fit_survey_view()
+        else:
+            self.render_canvas()
+
+    def _survey_filter_matches(self, measurement: dict[str, object]) -> bool:
+        selected = self.survey_filter_var.get() if hasattr(self, "survey_filter_var") else "All measurements"
+        forward = survey_bool(measurement.get("forward_received"))
+        reply = survey_bool(measurement.get("reply_received"))
+        return (
+            selected == "All measurements"
+            or (selected == "Complete round trips" and forward and reply)
+            or (selected == "Forward only" and forward and not reply)
+            or (selected == "Forward lost" and not forward)
+        )
+
+    def _refresh_survey_table(self, _event: tk.Event | None = None) -> None:
+        if not hasattr(self, "survey_tree"):
+            return
+        self.survey_tree.delete(*self.survey_tree.get_children())
+        for index, measurement in enumerate(self.survey_measurements):
+            if not self._survey_filter_matches(measurement):
+                continue
+            epoch = survey_float(measurement.get("epoch_s")) or 0.0
+            timestamp = datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S") if epoch > 0 else "GPS time unavailable"
+            latitude = survey_float(measurement.get("mobile_latitude"))
+            longitude = survey_float(measurement.get("mobile_longitude"))
+            location = f"{latitude:.6f}, {longitude:.6f}" if latitude is not None and longitude is not None else "No GPS"
+            forward = survey_bool(measurement.get("forward_received"))
+            reply = survey_bool(measurement.get("reply_received"))
+            reply_known = survey_value_known(measurement.get("reply_received"))
+            forward_rssi = survey_float(measurement.get("forward_rssi_dbm"))
+            forward_snr = survey_float(measurement.get("forward_snr_db"))
+            reverse_rssi = survey_float(measurement.get("reverse_rssi_dbm"))
+            reverse_snr = survey_float(measurement.get("reverse_snr_db"))
+            self.survey_tree.insert(
+                "", "end", iid=str(index),
+                values=(
+                    measurement.get("sequence", index + 1), timestamp, location,
+                    measurement.get("mobile_satellites", ""), measurement.get("mobile_hdop", ""),
+                    "Received" if forward else "Lost",
+                    f"{forward_rssi:.0f} dBm" if forward_rssi is not None else "—",
+                    f"{forward_snr:.2f} dB" if forward_snr is not None else "—",
+                    (
+                        "Received" if reply
+                        else "Not returned" if reply_known and forward
+                        else "Not observed" if forward
+                        else "—"
+                    ),
+                    f"{reverse_rssi:.0f} dBm" if reverse_rssi is not None else "—",
+                    f"{reverse_snr:.2f} dB" if reverse_snr is not None else "—",
+                ),
+                tags=("lost" if not forward else "complete" if reply else "partial",),
+            )
+        self.survey_tree.tag_configure("lost", foreground="#ff9aaa")
+        self.survey_tree.tag_configure("complete", foreground="#b9f5d8")
+        self.survey_tree.tag_configure("partial", foreground="#ffd58a")
+
+    def _survey_tree_selected(self, _event: tk.Event | None = None) -> None:
+        selected = self.survey_tree.selection()
+        if len(selected) != 1:
+            return
+        try:
+            index = int(selected[0])
+        except ValueError:
+            return
+        self.select_survey_measurement(index)
+
+    def _clear_survey_map(self) -> None:
+        self.survey_measurements = []
+        self.survey_selected_index = None
+        if hasattr(self, "survey_tree"):
+            self.survey_tree.delete(*self.survey_tree.get_children())
+        if hasattr(self, "survey_metric_vars"):
+            for variable in self.survey_metric_vars.values():
+                variable.set("—")
+        self.render_canvas()
+        self.status_var.set("Survey points cleared from the map; exported files were not deleted")
+
+    def _calibrate_buildings_from_survey(self) -> None:
+        try:
+            calibration = fit_building_calibration(self.scenario, self.survey_measurements)
+        except SurveyCalibrationError as error:
+            messagebox.showerror(
+                "Building calibration unavailable",
+                str(error),
+                parent=self.survey_window or self.root,
+            )
+            return
+        message = (
+            f"MeshLab fitted {calibration.sample_count:,} survey outcomes "
+            f"({calibration.received_sample_count:,} received RSSI, "
+            f"{calibration.lost_sample_count:,} failed probes) "
+            f"({calibration.clear_sample_count:,} clear, "
+            f"{calibration.obstructed_sample_count:,} building-obstructed).\n\n"
+            f"Apply these measured values to all {calibration.building_count:,} buildings?\n\n"
+            f"Penetration: {calibration.penetration_db:.2f} dB per crossed building\n"
+            f"Inside distance: {calibration.loss_per_100m_db:.2f} dB / 100 m\n"
+            "Range cutoff: none\n"
+            "Propagation baseline: unchanged\n\n"
+            "The sampled Building value is applied globally, including areas where no "
+            "survey points were collected."
+        )
+        if not messagebox.askyesno(
+            "Apply measured building calibration?",
+            message,
+            parent=self.survey_window or self.root,
+        ):
+            return
+        changed = apply_building_calibration(self.scenario, calibration)
+        self.mark_dirty()
+        self._mark_results_stale()
+        self.refresh_all()
+        self.status_var.set(
+            f"Calibrated {changed:,} buildings from {calibration.sample_count:,} survey samples; "
+            "no building range cap"
+        )
+        if hasattr(self, "survey_status_var"):
+            self.survey_status_var.set(
+                f"Applied: {calibration.penetration_db:.2f} dB/building + "
+                f"{calibration.loss_per_100m_db:.2f} dB/100 m, no cap, across the entire map. "
+                "Save the scenario to retain it."
+            )
 
     def export_results(self) -> None:
         if not self.last_result:
