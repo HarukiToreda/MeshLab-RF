@@ -956,6 +956,13 @@ def create_demo_scenario() -> Scenario:
 
 class PropagationModel:
     SPEED_OF_LIGHT = 299_792_458.0
+    # Obstacle/terrain loss only ever subtracts further from a link budget, so
+    # a free-space (zero-obstruction) margin already this far underwater can
+    # never be rescued by anything physically plausible. Skipping the
+    # obstacle-index walk and terrain-profile sampling for those pairs is what
+    # makes a large flood (many nodes, most of them out of each other's range)
+    # tractable instead of paying full ray/terrain geometry for every pair.
+    HOPELESS_MARGIN_DEFICIT_DB = 40.0
 
     def __init__(self, scenario: Scenario):
         self.scenario = scenario
@@ -1435,34 +1442,40 @@ class PropagationModel:
         frequency_hz = max(1.0, source.radio.frequency_mhz * 1_000_000.0)
         fspl_1m = 20.0 * math.log10(4.0 * math.pi * frequency_hz / self.SPEED_OF_LIGHT)
         path_loss = fspl_1m + 10.0 * self.scenario.environment.path_loss_exponent * math.log10(distance)
-        obstacle_loss, obstacles, blocked_reason = self._obstacle_effects(
-            source,
-            target,
-            obstacle_candidates,
-            ray_intervals,
-        )
-        terrain_loss, terrain_blocked_reason = self._terrain_effects(source, target)
-        obstacle_loss += terrain_loss
-        if terrain_loss > 0:
-            obstacles.append(f"Topography/Fresnel ({terrain_loss:.1f} dB)")
-        blocked_reason = blocked_reason or terrain_blocked_reason
-        shadow = 0.0
-        if sample_shadowing and self.scenario.environment.stochastic:
-            shadow = (rng or random).gauss(0.0, self.scenario.environment.shadowing_sigma_db)
-        rssi = (
+        noise = self.noise_floor(target)
+        required = REQUIRED_SNR.get(target.radio.spreading_factor, -7.5)
+        free_space_rssi = (
             source.tx_power_dbm
             + source.antenna_gain_dbi
             + target.antenna_gain_dbi
             - source.cable_loss_db
             - target.cable_loss_db
             - path_loss
-            - obstacle_loss
             - self.scenario.environment.weather_loss_db
-            + shadow
         )
-        noise = self.noise_floor(target)
+        free_space_margin = free_space_rssi - noise - required
+        if compatible and free_space_margin < -self.HOPELESS_MARGIN_DEFICIT_DB:
+            # Obstacles/terrain can only add loss, so a pair that can't clear
+            # the decode threshold even with zero obstruction never could --
+            # skip the obstacle-index walk and terrain-profile sampling.
+            obstacle_loss, obstacles, blocked_reason = 0.0, [], ""
+        else:
+            obstacle_loss, obstacles, blocked_reason = self._obstacle_effects(
+                source,
+                target,
+                obstacle_candidates,
+                ray_intervals,
+            )
+            terrain_loss, terrain_blocked_reason = self._terrain_effects(source, target)
+            obstacle_loss += terrain_loss
+            if terrain_loss > 0:
+                obstacles.append(f"Topography/Fresnel ({terrain_loss:.1f} dB)")
+            blocked_reason = blocked_reason or terrain_blocked_reason
+        shadow = 0.0
+        if sample_shadowing and self.scenario.environment.stochastic:
+            shadow = (rng or random).gauss(0.0, self.scenario.environment.shadowing_sigma_db)
+        rssi = free_space_rssi - obstacle_loss + shadow
         snr = rssi - noise
-        required = REQUIRED_SNR.get(target.radio.spreading_factor, -7.5)
         margin = snr - required
         probability = 1.0 / (1.0 + math.exp(-max(-40.0, min(40.0, margin)) / 2.0))
         if blocked_reason:
@@ -1555,6 +1568,7 @@ class PropagationModel:
         max_range_m: float | None = None,
         binary_iterations: int = 14,
         segment_samples: int = 0,
+        align_to_nodes: bool = True,
     ) -> "BeaconProfile":
         """Radially probe a beacon: where its signal reaches, fades, or is blocked.
 
@@ -1631,20 +1645,28 @@ class PropagationModel:
         # Evenly spaced rays can straddle a real node without ever landing on it
         # (the node-elevation snap above never fires for that direction), so add
         # its exact bearing as its own ray whenever it isn't already covered.
-        min_angle_gap = (math.tau / samples) * 0.2
         node_angles: list[float] = []
-        for node in compatible_receivers:
-            node_dx = node.x - source.x
-            node_dy = node.y - source.y
-            node_distance = math.hypot(node_dx, node_dy)
-            if node_distance < 1.0 or node_distance > maximum_range:
-                continue
-            bearing = math.atan2(node_dy, node_dx) % math.tau
-            if all(
-                min(abs(bearing - existing), math.tau - abs(bearing - existing)) >= min_angle_gap
-                for existing in base_angles
-            ):
-                node_angles.append(bearing)
+        if align_to_nodes:
+            # Each inserted ray costs a full binary-search reach probe, so this
+            # is only worth it for a single, deliberately-triggered sweep (the
+            # interactive beacon / zero-hop coverage). A packet simulation's
+            # per-hop, per-transmitter contour pass already re-runs this for
+            # every relay at every hop -- inserting a ray per other node there
+            # multiplies that cost by the node count and is what made a large,
+            # obstacle-heavy flood crawl.
+            min_angle_gap = (math.tau / samples) * 0.2
+            for node in compatible_receivers:
+                node_dx = node.x - source.x
+                node_dy = node.y - source.y
+                node_distance = math.hypot(node_dx, node_dy)
+                if node_distance < 1.0 or node_distance > maximum_range:
+                    continue
+                bearing = math.atan2(node_dy, node_dx) % math.tau
+                if all(
+                    min(abs(bearing - existing), math.tau - abs(bearing - existing)) >= min_angle_gap
+                    for existing in base_angles
+                ):
+                    node_angles.append(bearing)
         angles = sorted(base_angles + node_angles)
         for angle in angles:
             dx, dy = math.cos(angle), math.sin(angle)

@@ -944,6 +944,54 @@ class ModelTests(unittest.TestCase):
         slow.radio.apply_preset("LONG_SLOW")
         self.assertGreater(PropagationModel.airtime_ms(slow, 32), PropagationModel.airtime_ms(fast, 32))
 
+    def test_hopelessly_out_of_range_pairs_skip_expensive_geometry(self):
+        """A large flood (many nodes) spends most of its O(n^2) link() calls
+        on pairs nowhere near each other. Obstacle/terrain loss only ever
+        subtracts from a link budget, so once the free-space margin is
+        already deeply negative, walking the obstacle spatial index and
+        sampling the terrain profile can't change the outcome -- it should
+        be skipped entirely rather than paying for it on every pair."""
+        source = Node(x=0, y=0)
+        far_receiver = Node(x=100_000_000, y=0)
+        blocking_wall = Obstacle(
+            id="wall", name="Wall", x1=49_999_000, y1=-50, x2=49_999_020, y2=50,
+            height_m=30, behavior="BLOCK",
+        )
+        scenario = Scenario(nodes=[source, far_receiver], obstacles=[blocking_wall])
+        scenario.environment.stochastic = False
+        model = PropagationModel(scenario)
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError("obstacle/terrain geometry should not run for a hopeless pair")
+
+        model._obstacle_effects = boom
+        model._terrain_effects = boom
+
+        link = model.link(source, far_receiver)
+
+        self.assertTrue(link.compatible)
+        self.assertLess(link.margin_db, MIN_DECODE_MARGIN_DB)
+        self.assertEqual(link.obstacle_loss_db, 0.0)
+
+    def test_in_range_pairs_still_evaluate_real_obstacles(self):
+        """The hopeless-pair shortcut must never swallow a link that's
+        actually within reach -- those still need the full obstacle/terrain
+        geometry to know whether something physically blocks them."""
+        source = Node(x=0, y=0, antenna_height_m=2)
+        receiver = Node(x=500, y=0, antenna_height_m=2)
+        wall = Obstacle(
+            id="wall", name="Wall", x1=245, y1=-50, x2=255, y2=50,
+            height_m=30, behavior="BLOCK",
+        )
+        scenario = Scenario(nodes=[source, receiver], obstacles=[wall])
+        scenario.environment.stochastic = False
+        model = PropagationModel(scenario)
+
+        link = model.link(source, receiver)
+
+        self.assertFalse(link.compatible)
+        self.assertIn("Wall blocks line of sight", link.reason)
+
     def test_unobstructed_range_ends_at_field_decode_threshold(self):
         source = Node(x=0, y=0)
         receiver = Node(x=1, y=0)
@@ -1456,6 +1504,24 @@ class ModelTests(unittest.TestCase):
         east_ray = min(profile.rays, key=lambda ray: abs(ray.angle))
         self.assertEqual(east_ray.kind, "clear")
         self.assertAlmostEqual(east_ray.reach_m, 2000.0, delta=1.0)
+
+    def test_align_to_nodes_false_skips_the_per_node_ray_insertion(self):
+        """Each inserted node-bearing ray costs a full binary-search reach
+        probe -- worth it for a single, deliberately-triggered beacon sweep,
+        but build_coverage_contours calls beacon_profile once per transmitter
+        per hop, so that extra cost multiplies by the node count on every
+        hop of a flood. align_to_nodes=False must keep exactly the requested
+        angular_samples rays regardless of how many other nodes are nearby."""
+        source = Node(x=0, y=0)
+        nearby = [Node(x=500 + index, y=0) for index in range(20)]
+        scenario = Scenario(nodes=[source, *nearby])
+        model = PropagationModel(scenario)
+
+        profile = model.beacon_profile(
+            source, angular_samples=8, max_range_m=2000, align_to_nodes=False
+        )
+
+        self.assertEqual(len(profile.rays), 8)
 
     def test_manual_below_ground_override_remains_physically_blocked(self):
         environment = Environment(

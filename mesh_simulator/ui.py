@@ -610,7 +610,7 @@ def build_coverage_contours(
     for source_id in transmitter_ids:
         source = nodes[source_id]
         profile = model.beacon_profile(
-            source, angular_samples=angular_samples, max_range_m=max_range_m
+            source, angular_samples=angular_samples, max_range_m=max_range_m, align_to_nodes=False
         )
         points: list[tuple[float, float, str]] = []
         for ray in profile.rays:
