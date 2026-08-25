@@ -40,7 +40,7 @@ Receiver noise is:
 
 Required SNR ranges from about `−2.5 dB` at SF5 to `−20 dB` at SF12. The paired field survey established `−4 dB` margin as MeshLab's global minimum delivery/range threshold. Coverage, ordinary flooding, directed routes, ACKs/replies, and live-mesh receptions all use that same threshold. Link margin also becomes a reception probability when stochastic mode is enabled, making the red edge intermittent instead of guaranteed.
 
-Radios must have compatible frequency, bandwidth, spreading factor, and coding rate. Channel/PSK behavior is represented by matching channel-name strings; encryption is not simulated.
+Radios must have compatible frequency, bandwidth, spreading factor, and coding rate. Channel/PSK behavior is represented by matching channel-name strings; encryption is not simulated. New nodes default to `LONG_FAST` in the US region. For non-custom presets, the editor mirrors the firmware's DJB2 channel-name hashing and slot calculation for every active Meshtastic region. This includes each region's band edges, permitted preset family, channel spacing and padding, 2.4 GHz wide-LoRa bandwidths, European sibling-region preset switching, and fixed licensed-amateur slots. Changing either the region or preset automatically updates the radio parameters and center frequency. That resolved frequency feeds compatibility, path loss, Fresnel clearance, beacon coverage, live mesh, and packet delivery rather than serving as display-only metadata.
 
 Hardware profiles provide editable planning values for common 13, 20, 22, and 29–30 dBm radios. They do not determine regional legality or replace measured output.
 

@@ -3,7 +3,7 @@ import math
 import unittest
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageColor
 from shapely.geometry import MultiPolygon, Polygon
 
 from mesh_simulator.model import (
@@ -11,11 +11,13 @@ from mesh_simulator.model import (
     BeaconRadialSample,
     BeaconRay,
     Environment,
+    HARDWARE_POWER_PROFILE_KEYS,
     MIN_DECODE_MARGIN_DB,
     Node,
     Obstacle,
     PacketConfig,
     PRESETS,
+    REGION_BANDS,
     PropagationModel,
     Scenario,
     SimulationEngine,
@@ -24,6 +26,8 @@ from mesh_simulator.model import (
     dbm_to_watts,
     dm_route_key,
     hardware_power_profile,
+    meshtastic_default_frequency_mhz,
+    preset_parameters,
 )
 from mesh_simulator.geography import (
     MapDataService,
@@ -41,6 +45,7 @@ from mesh_simulator.geography import (
 from mesh_simulator.live_radio import parse_live_node
 from mesh_simulator.survey_calibration import BuildingCalibration, apply_building_calibration
 from mesh_simulator.ui import (
+    MAPLESS_BACKGROUND,
     MAX_CANVAS_ZOOM,
     MIN_CANVAS_ZOOM,
     MeshSimulatorApp,
@@ -69,6 +74,70 @@ class ModelTests(unittest.TestCase):
         self.assertAlmostEqual(dbm_to_watts(30), 1.0)
         self.assertAlmostEqual(dbm_to_watts(22), 0.158489, places=5)
 
+    def test_hardware_power_profiles_include_high_power_and_one_watt_devices(self):
+        labels = "\n".join(HARDWARE_POWER_PROFILE_KEYS)
+        for model in (
+            "WiFi LoRa 32 V4 HP",
+            "Wireless Tracker V2",
+            "Mesh Node T096",
+            "MeshTower V2",
+            "RAK WisMesh 1W",
+            "T-Beam 1W",
+            "Station G2",
+            "MeshToad V3",
+        ):
+            self.assertIn(model, labels)
+
+        cases = {
+            "HELTEC_V4_R8": ("WiFi LoRa 32 V4 HP", 28.0, 29.0),
+            "HELTEC_WIRELESS_TRACKER_V2": ("Wireless Tracker V2", 28.0, 29.0),
+            "HELTEC_MESH_NODE_T096": ("Mesh Node T096", 28.0, 29.0),
+            "HELTEC_MESHTOWER_V2": ("MeshTower V2", 30.0, 30.0),
+            "RAK_WISMESH_STATION_HP": ("RAK WisMesh 1W", 30.0, 30.0),
+            "RAK_WISMESH_REPEATER_MINI_HP": ("RAK WisMesh 1W", 30.0, 30.0),
+            "NULLHOP_MESHTOAD_V3": ("MeshToad V3", 30.0, 30.0),
+        }
+        for hardware_name, (label, recommended, maximum) in cases.items():
+            with self.subTest(hardware_name=hardware_name):
+                profile = hardware_power_profile(hardware_name)
+                self.assertIn(label, profile.key)
+                self.assertEqual(profile.recommended_dbm, recommended)
+                self.assertEqual(profile.maximum_dbm, maximum)
+
+        # Existing scenario files using the former grouped Heltec label retain
+        # the same PA-class behavior after migration to the named V4 profile.
+        legacy = hardware_power_profile("Heltec PA models (29 dBm)")
+        self.assertIn("WiFi LoRa 32 V4 HP", legacy.key)
+        self.assertEqual(legacy.recommended_dbm, 28.0)
+
+    def test_hardware_power_profiles_include_popular_device_families(self):
+        labels = "\n".join(HARDWARE_POWER_PROFILE_KEYS)
+        for model in ("T114", "RAK4631", "T-Beam", "T-Deck", "T-Echo", "T1000-E", "XIAO"):
+            self.assertIn(model, labels)
+
+        cases = {
+            "HELTEC_MESH_NODE_T114": ("Heltec Mesh Node T114", 21.0, 22.0),
+            "HELTEC_V3": ("Heltec LoRa 32 V3", 21.0, 22.0),
+            "RAK4631": ("RAK WisBlock RAK4631", 22.0, 22.0),
+            "TBEAM": ("LILYGO T-Beam /", 22.0, 22.0),
+            "T_DECK_PRO": ("LILYGO T-Deck", 22.0, 22.0),
+            "T_ECHO_PLUS": ("LILYGO T-Echo", 22.0, 22.0),
+            "SENSECAP_CARD_TRACKER_T1000_E": ("Seeed SenseCAP T1000-E", 22.0, 22.0),
+            "SEEED_XIAO_NRF52840_KIT": ("Seeed XIAO", 22.0, 22.0),
+        }
+        for hardware_name, (label, recommended, maximum) in cases.items():
+            with self.subTest(hardware_name=hardware_name):
+                profile = hardware_power_profile(hardware_name)
+                self.assertIn(label, profile.key)
+                self.assertEqual(profile.recommended_dbm, recommended)
+                self.assertEqual(profile.maximum_dbm, maximum)
+
+    def test_specific_and_amplified_names_beat_shorter_family_aliases(self):
+        self.assertIn("T-Beam 1W", hardware_power_profile("LILYGO_TBEAM_1_WATT").key)
+        self.assertEqual(hardware_power_profile("LILYGO_TBEAM_1_WATT").recommended_dbm, 30.0)
+        self.assertIn("T114", hardware_power_profile("HELTEC_MESH_NODE_T114_SX1262").key)
+        self.assertIn("Generic SX1262", hardware_power_profile("custom SX1262 module").key)
+
     def test_one_watt_source_has_eight_db_more_link_margin_than_sx1262(self):
         target = Node(name="Target", x=10_000, y=0)
         standard = Node(name="Standard", x=0, y=0, tx_power_dbm=22)
@@ -87,6 +156,59 @@ class ModelTests(unittest.TestCase):
 
     def test_zoom_limit_supports_continental_view(self):
         self.assertLessEqual(MIN_CANVAS_ZOOM, 0.001)
+
+    def test_sidebar_tab_selection_stays_in_the_main_window(self):
+        class Root:
+            def __init__(self):
+                self.after_idle_calls = 0
+
+            def after_idle(self, callback):
+                self.after_idle_calls += 1
+                callback()
+
+        class Tabs:
+            def __init__(self):
+                self.selected: list[int] = []
+
+            def select(self, index):
+                self.selected.append(index)
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.root = Root()
+        app.sidebar_tabs = Tabs()
+        renders: list[str] = []
+        app.render_canvas = lambda: renders.append("render")
+
+        app.show_sidebar_tab("Live Radio")
+
+        self.assertEqual(app.sidebar_tabs.selected, [4])
+        self.assertEqual(renders, ["render"])
+
+    def test_property_change_reveals_sticky_apply_bar_until_applied(self):
+        class ApplyBar:
+            def __init__(self):
+                self.shown = False
+
+            def grid(self):
+                self.shown = True
+
+            def grid_remove(self):
+                self.shown = False
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.object_form_dirty = False
+        app.object_apply_bar = ApplyBar()
+        app.get_selected = lambda: object()
+
+        app._object_form_value_changed()
+
+        self.assertTrue(app.object_form_dirty)
+        self.assertTrue(app.object_apply_bar.shown)
+
+        app._set_object_form_clean()
+
+        self.assertFalse(app.object_form_dirty)
+        self.assertFalse(app.object_apply_bar.shown)
 
     def test_zoom_can_continue_past_the_old_twenty_times_cap(self):
         app = MeshSimulatorApp.__new__(MeshSimulatorApp)
@@ -701,6 +823,114 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(PRESETS["LONG_FAST"], (250.0, 11, 5))
         self.assertEqual(PRESETS["SHORT_TURBO"], (500.0, 7, 5))
         self.assertEqual(PRESETS["LONG_MODERATE"], (125.0, 11, 8))
+
+    def test_firmware_preset_automatically_uses_meshtastic_region_frequency(self):
+        node = Node()
+        self.assertEqual(node.radio.region, "US")
+        self.assertEqual(node.radio.preset, "LONG_FAST")
+        self.assertEqual(node.channel, "LongFast")
+        self.assertAlmostEqual(node.radio.frequency_mhz, 906.875, places=6)
+
+        node.radio.apply_preset("LONG_SLOW")
+
+        self.assertEqual(node.radio.preset, "LONG_SLOW")
+        self.assertAlmostEqual(node.radio.frequency_mhz, 905.3125, places=6)
+        self.assertAlmostEqual(meshtastic_default_frequency_mhz("LONG_FAST"), 906.875, places=6)
+        self.assertAlmostEqual(meshtastic_default_frequency_mhz("SHORT_TURBO"), 926.75, places=6)
+
+        node.radio.apply_region("EU_868", "LongSlow")
+        self.assertEqual(node.radio.region, "EU_868")
+        self.assertEqual(node.radio.preset, "LONG_SLOW")
+        self.assertAlmostEqual(node.radio.frequency_mhz, 869.4625, places=6)
+
+        node.radio.apply_region("EU_866")
+        self.assertEqual(node.radio.region, "EU_866")
+        self.assertEqual(node.radio.preset, "LITE_FAST")
+        self.assertAlmostEqual(node.radio.frequency_mhz, 866.3, places=6)
+
+    def test_region_band_plans_cover_wide_lora_and_fixed_amateur_slots(self):
+        self.assertIn("LORA_24", REGION_BANDS)
+        self.assertEqual(preset_parameters("LONG_FAST", "LORA_24"), (812.5, 11, 5))
+        self.assertAlmostEqual(
+            meshtastic_default_frequency_mhz("LONG_FAST", region="LORA_24"),
+            2420.71875,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            meshtastic_default_frequency_mhz("TINY_FAST", region="ITU2_2M"),
+            145.01,
+            places=6,
+        )
+
+    def test_region_frequency_is_used_by_propagation_and_radio_compatibility(self):
+        low_source = Node(x=0, y=0)
+        low_target = Node(x=1000, y=0)
+        low_source.radio.apply_region("EU_433")
+        low_target.radio.apply_region("EU_433")
+        low_model = PropagationModel(Scenario(nodes=[low_source, low_target]))
+
+        high_source = Node(x=0, y=0)
+        high_target = Node(x=1000, y=0)
+        high_source.radio.apply_region("LORA_24")
+        high_target.radio.apply_region("LORA_24")
+        high_model = PropagationModel(Scenario(nodes=[high_source, high_target]))
+
+        self.assertGreater(low_model.link(low_source, low_target).rssi_dbm, high_model.link(high_source, high_target).rssi_dbm)
+        self.assertEqual(
+            PropagationModel.radios_compatible(low_source, high_target),
+            (False, "frequency mismatch"),
+        )
+
+    def test_preset_preview_updates_default_channel_and_frequency_but_preserves_custom_name(self):
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.object_vars = {
+            "region": Value("US"),
+            "preset": Value("LONG_SLOW"),
+            "channel": Value("LongFast"),
+            "frequency_mhz": Value("906.875"),
+            "bandwidth_khz": Value("250"),
+            "spreading_factor": Value("11"),
+            "coding_rate": Value("5"),
+        }
+
+        app._preset_preview()
+
+        self.assertEqual(app.object_vars["channel"].get(), "LongSlow")
+        self.assertEqual(app.object_vars["frequency_mhz"].get(), "905.3125")
+
+        app.object_vars["preset"].set("MEDIUM_FAST")
+        app.object_vars["channel"].set("NeighborhoodPrivate")
+        app._preset_preview()
+
+        self.assertEqual(app.object_vars["channel"].get(), "NeighborhoodPrivate")
+        self.assertEqual(
+            float(app.object_vars["frequency_mhz"].get()),
+            meshtastic_default_frequency_mhz("MEDIUM_FAST", "NeighborhoodPrivate"),
+        )
+
+        app.object_vars["channel"].set("MediumFast")
+        app.object_vars["region"].set("EU_866")
+        app._region_preview()
+
+        self.assertEqual(app.object_vars["preset"].get(), "LITE_FAST")
+        self.assertEqual(app.object_vars["channel"].get(), "LiteFast")
+        self.assertAlmostEqual(float(app.object_vars["frequency_mhz"].get()), 866.3, places=6)
+
+        app.object_vars["preset"].set("NARROW_SLOW")
+        app._preset_preview()
+
+        self.assertEqual(app.object_vars["region"].get(), "EU_N_868")
+        self.assertAlmostEqual(float(app.object_vars["frequency_mhz"].get()), 869.44165, places=6)
 
     def test_airtime_slow_is_longer(self):
         fast = Node()
@@ -1367,6 +1597,31 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(converted.size, (4, 4))
         minimum, maximum = converted.getextrema()
         self.assertLess(minimum, maximum)
+
+    def test_hidden_map_uses_a_light_neutral_canvas(self):
+        class Hidden:
+            @staticmethod
+            def get():
+                return False
+
+        class Canvas:
+            @staticmethod
+            def winfo_width():
+                return 24
+
+            @staticmethod
+            def winfo_height():
+                return 16
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.map_visible = Hidden()
+        app.scenario = Scenario()
+
+        layer = app._compose_map_layer(Canvas())
+
+        expected = ImageColor.getrgb(MAPLESS_BACKGROUND)
+        self.assertEqual(layer.getpixel((0, 0)), expected)
+        self.assertEqual(layer.getpixel((23, 15)), expected)
 
     def test_overture_buildings_convert_polygon_and_height_metadata(self):
         first = Polygon(

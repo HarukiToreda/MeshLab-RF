@@ -25,7 +25,11 @@ The app starts with a map but no nodes. Internet access is needed for new map ti
 7. Open **Results** for delivery details, RF values, drops, and collisions.
 8. Select **Beacon** (or press **B**) and click the map to drop a beacon that continuously pulses a node’s live coverage.
 
-Use the mouse wheel to zoom, right-drag to pan, and **Fit** to frame the current nodes. **Panels** opens or hides the side tabs.
+Use the mouse wheel to zoom, right-drag to pan, and **Fit** to frame the current nodes. The scene, properties, world, packet, radio, and results tabs remain docked beside the map.
+
+The node **Device / radio power** selector includes common Heltec, RAK, LILYGO, Seeed, and high-power 1 W families as well as generic radio-chip and measured-output choices. Selecting a model applies its normal conducted power and hardware ceiling; antenna gain and cable loss remain separate fields.
+
+New nodes default to Meshtastic **LONG_FAST** in the US region. Each node has a regulatory-region selector covering Meshtastic's active sub-GHz, 2.4 GHz, and licensed amateur band plans. Selecting a region or firmware preset automatically updates bandwidth, spreading factor, coding rate, default channel name, and the matching regional frequency slot. Region-specific spacing, padding, wide-LoRa bandwidths, fixed amateur slots, and Meshtastic's European preset/region switching are included. A manually entered custom channel name is retained and hashed to its matching regional slot; **CUSTOM** leaves the RF fields editable. The resolved frequency is used by link compatibility and every propagation, beacon, live-mesh, and packet simulation.
 
 ## Reading the simulation
 

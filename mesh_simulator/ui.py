@@ -47,6 +47,8 @@ from .model import (
     LiveMeshConfig,
     OBSTACLE_DEFAULTS,
     PRESETS,
+    PRESET_DISPLAY_NAMES,
+    REGION_BANDS,
     REBROADCAST_MODES,
     ROLE_COLORS,
     ROLES,
@@ -61,7 +63,11 @@ from .model import (
     dbm_to_watts,
     dm_route_key,
     hardware_power_profile,
+    meshtastic_default_frequency_mhz,
     new_id,
+    preset_parameters,
+    region_for_preset,
+    region_preset_options,
     scenario_from_file,
     scenario_to_file,
 )
@@ -93,6 +99,7 @@ GREEN = "#31d58b"
 AMBER = "#ffbd4a"
 RED = "#fb6376"
 BORDER = "#233752"
+MAPLESS_BACKGROUND = "#d9dde2"
 HOP_COLORS = {
     0: "#27b3ff",
     1: "#31d58b",
@@ -718,7 +725,6 @@ class MeshSimulatorApp:
         # clear it and continue the normal hop animation (reached another node).
         self.static_coverage_then_animate = False
         self.animation_frame_count = 1
-        self.sidebar_visible = False
         self.render_after: str | None = None
         self.zoom_render_after: str | None = None
         self.zoom_preview_after: str | None = None
@@ -794,6 +800,7 @@ class MeshSimulatorApp:
         self.results_stale = False
         self.status_var = tk.StringVar(value="Ready")
         self.object_vars: dict[str, tk.Variable] = {}
+        self.object_form_dirty = False
         self.env_vars: dict[str, tk.Variable] = {}
         self.packet_vars: dict[str, tk.Variable] = {}
         self.map_service = MapDataService()
@@ -879,22 +886,95 @@ class MeshSimulatorApp:
         style.configure("Title.TLabel", font=("Segoe UI Semibold", 12), foreground="#f5f9ff")
         style.configure("Section.TLabel", font=("Segoe UI Semibold", 9), foreground="#8fdcff")
         style.configure("Metric.TLabel", font=("Segoe UI Semibold", 15), foreground="#f7fbff")
+        disabled_text = "#71839a"
+        selected_indicator = "#168cd1"
         style.configure("TButton", background=PANEL_2, foreground=TEXT, borderwidth=0, padding=(9, 6))
-        style.map("TButton", background=[("active", "#1d3553"), ("pressed", "#244465")])
+        style.map(
+            "TButton",
+            background=[("active", "#1d3553"), ("pressed", "#244465"), ("disabled", "#101a29")],
+            foreground=[("disabled", disabled_text)],
+        )
         style.configure("Accent.TButton", background="#168cd1", foreground="white", padding=(12, 7))
-        style.map("Accent.TButton", background=[("active", "#22a9ef"), ("pressed", "#117ab7")])
+        style.map(
+            "Accent.TButton",
+            background=[("active", "#22a9ef"), ("pressed", "#117ab7"), ("disabled", "#17415c")],
+            foreground=[("disabled", "#9bb4c8")],
+        )
         style.configure("Danger.TButton", background="#4b2130", foreground="#ffb6c0")
-        style.map("Danger.TButton", background=[("active", "#713044")])
+        style.map(
+            "Danger.TButton",
+            background=[("active", "#713044"), ("disabled", "#291923")],
+            foreground=[("disabled", "#9b7880")],
+        )
         style.configure("Tool.TButton", background="#0d1b2e", padding=(9, 7))
         style.configure("ActiveTool.TButton", background="#164c70", foreground="#dff6ff", padding=(9, 7))
         style.configure("Tool.TMenubutton", background="#0d1b2e", foreground=TEXT, padding=(9, 7))
-        style.configure("TEntry", fieldbackground=ENTRY, foreground=TEXT, insertcolor=TEXT, bordercolor=BORDER, padding=5)
+        style.map(
+            "Tool.TMenubutton",
+            background=[("active", "#1d3553"), ("pressed", "#244465"), ("disabled", "#101a29")],
+            foreground=[("disabled", disabled_text)],
+            arrowcolor=[("disabled", disabled_text), ("!disabled", TEXT)],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground=ENTRY,
+            foreground=TEXT,
+            insertcolor=TEXT,
+            bordercolor=BORDER,
+            padding=5,
+        )
+        style.map(
+            "TEntry",
+            fieldbackground=[("disabled", "#101a29")],
+            foreground=[("disabled", disabled_text)],
+            selectbackground=[("!disabled", "#1b638d")],
+            selectforeground=[("!disabled", "#ffffff")],
+        )
         style.configure("TCombobox", fieldbackground=ENTRY, background=ENTRY, foreground=TEXT, arrowcolor=TEXT, padding=4)
-        style.map("TCombobox", fieldbackground=[("readonly", ENTRY)], selectbackground=[("readonly", ENTRY)])
-        style.configure("TCheckbutton", background=PANEL, foreground=TEXT)
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", ENTRY), ("disabled", "#101a29")],
+            background=[("readonly", ENTRY), ("disabled", "#101a29")],
+            foreground=[("readonly", TEXT), ("disabled", disabled_text)],
+            selectbackground=[("readonly", ENTRY)],
+            selectforeground=[("readonly", TEXT)],
+            arrowcolor=[("disabled", disabled_text), ("!disabled", TEXT)],
+        )
+        style.configure(
+            "TCheckbutton",
+            background=PANEL,
+            foreground=TEXT,
+            indicatorbackground=ENTRY,
+            indicatorforeground="#ffffff",
+        )
+        style.map(
+            "TCheckbutton",
+            background=[("active", PANEL_2)],
+            foreground=[("disabled", disabled_text), ("!disabled", TEXT)],
+            indicatorbackground=[("selected", selected_indicator), ("active", "#245178"), ("!selected", ENTRY)],
+            indicatorforeground=[("selected", "#ffffff"), ("disabled", disabled_text)],
+        )
+        style.configure(
+            "TRadiobutton",
+            background=PANEL,
+            foreground=TEXT,
+            indicatorbackground=ENTRY,
+            indicatorforeground="#ffffff",
+        )
+        style.map(
+            "TRadiobutton",
+            background=[("active", PANEL_2)],
+            foreground=[("disabled", disabled_text), ("!disabled", TEXT)],
+            indicatorbackground=[("selected", selected_indicator), ("active", "#245178"), ("!selected", ENTRY)],
+            indicatorforeground=[("selected", "#ffffff"), ("disabled", disabled_text)],
+        )
         style.configure("TNotebook", background=PANEL, borderwidth=0)
         style.configure("TNotebook.Tab", background="#0c1726", foreground=MUTED, padding=(12, 7), borderwidth=0)
-        style.map("TNotebook.Tab", background=[("selected", PANEL_2)], foreground=[("selected", TEXT)])
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", PANEL_2), ("active", "#152b45"), ("disabled", "#0a1320")],
+            foreground=[("selected", TEXT), ("active", "#d9e8f8"), ("disabled", disabled_text)],
+        )
         style.configure(
             "Treeview",
             background="#0b1625",
@@ -904,13 +984,34 @@ class MeshSimulatorApp:
             borderwidth=0,
         )
         style.configure("Treeview.Heading", background="#15253a", foreground="#a9c1dc", relief="flat", padding=4)
+        style.map(
+            "Treeview.Heading",
+            background=[("active", "#1d3553"), ("pressed", "#244465")],
+            foreground=[("active", "#ffffff")],
+        )
         style.map("Treeview", background=[("selected", "#174e72")], foreground=[("selected", "white")])
         style.configure("TPanedwindow", background=BORDER)
         style.configure("Vertical.TScrollbar", background=PANEL_2, troughcolor=PANEL, borderwidth=0, arrowcolor=MUTED)
         style.configure("Horizontal.TScrollbar", background=PANEL_2, troughcolor=PANEL, borderwidth=0, arrowcolor=MUTED)
 
+    @staticmethod
+    def _dark_menu(parent: tk.Misc, *, tearoff: bool = False) -> tk.Menu:
+        """Menu whose indicators and every interaction state remain visible."""
+        return tk.Menu(
+            parent,
+            tearoff=tearoff,
+            bg=PANEL_2,
+            fg=TEXT,
+            activebackground="#1d4f73",
+            activeforeground="#ffffff",
+            selectcolor=ACCENT,
+            disabledforeground="#71839a",
+            borderwidth=1,
+            relief="flat",
+        )
+
     def _create_hop_lines_menu(self, parent: tk.Misc) -> tk.Menu:
-        menu = tk.Menu(parent, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
+        menu = self._dark_menu(parent)
         for hop in range(1, 8):
             menu.add_checkbutton(
                 label=f"Hop {hop} lines",
@@ -956,8 +1057,8 @@ class MeshSimulatorApp:
         self.status_var.set(f"{self.unit_system.get()} units active")
 
     def _build_menu(self) -> None:
-        menubar = tk.Menu(self.root, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73", activeforeground="white")
-        file_menu = tk.Menu(menubar, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
+        menubar = self._dark_menu(self.root)
+        file_menu = self._dark_menu(menubar)
         file_menu.add_command(label="New scenario", accelerator="Ctrl+N", command=self.new_scenario)
         file_menu.add_command(label="Open…", accelerator="Ctrl+O", command=self.open_scenario)
         file_menu.add_separator()
@@ -969,7 +1070,7 @@ class MeshSimulatorApp:
         file_menu.add_command(label="Exit", command=self.on_close)
         menubar.add_cascade(label="File", menu=file_menu)
 
-        edit_menu = tk.Menu(menubar, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
+        edit_menu = self._dark_menu(menubar)
         edit_menu.add_command(label="Add node", accelerator="N", command=lambda: self.set_tool("node"))
         edit_menu.add_command(label="Drop beacon", accelerator="B", command=lambda: self.set_tool("beacon"))
         edit_menu.add_command(label="Add random nodesâ€¦", command=self.add_random_nodes)
@@ -978,7 +1079,7 @@ class MeshSimulatorApp:
         edit_menu.add_command(label="Delete selected", accelerator="Del", command=self.delete_selected)
         menubar.add_cascade(label="Edit", menu=edit_menu)
 
-        view_menu = tk.Menu(menubar, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
+        view_menu = self._dark_menu(menubar)
         view_menu.add_command(label="Fit environment", accelerator="F", command=self.fit_view)
         view_menu.add_checkbutton(
             label="Show map tiles", variable=self.map_visible, command=self._map_visibility_changed
@@ -989,7 +1090,7 @@ class MeshSimulatorApp:
             command=self._terrain_only_changed,
         )
         view_menu.add_command(label="Refresh terrain data", command=self.load_topography)
-        units_menu = tk.Menu(view_menu, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
+        units_menu = self._dark_menu(view_menu)
         for units in ("Imperial", "Metric"):
             units_menu.add_radiobutton(
                 label=units, value=units, variable=self.unit_system, command=self._units_changed
@@ -998,11 +1099,10 @@ class MeshSimulatorApp:
         view_menu.add_checkbutton(label="Show failed receptions", variable=self.show_drops, command=self.render_canvas)
         self.view_hop_menu = self._create_hop_lines_menu(view_menu)
         view_menu.add_cascade(label="Hop line visibility", menu=self.view_hop_menu)
-        view_menu.add_command(label="Show / hide panels", accelerator="Tab", command=self.toggle_sidebar)
         view_menu.add_command(label="Clear packet traces", command=self.clear_results)
         menubar.add_cascade(label="View", menu=view_menu)
 
-        sim_menu = tk.Menu(menubar, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
+        sim_menu = self._dark_menu(menubar)
         sim_menu.add_command(label="Run packet", accelerator="Ctrl+Enter", command=self.run_simulation)
         sim_menu.add_command(label="Run live mesh traffic", command=self.start_live_mesh)
         sim_menu.add_command(label="Stop live mesh traffic", command=self.stop_live_mesh)
@@ -1014,7 +1114,7 @@ class MeshSimulatorApp:
         sim_menu.add_command(label="Stop animation", command=self.stop_animation)
         menubar.add_cascade(label="Simulation", menu=sim_menu)
 
-        help_menu = tk.Menu(menubar, tearoff=False, bg=PANEL_2, fg=TEXT, activebackground="#1d4f73")
+        help_menu = self._dark_menu(menubar)
         help_menu.add_command(label="Model assumptions", command=self.show_model_info)
         help_menu.add_command(label="About MeshLab RF", command=self.show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -1064,7 +1164,6 @@ class MeshSimulatorApp:
             bar, text="Clear hops", style="Tool.TButton", command=self.clear_results, state="disabled"
         )
         self.clear_hops_button.pack(side="right", padx=2)
-        ttk.Button(bar, text="☰  Panels", style="Tool.TButton", command=self.toggle_sidebar).pack(side="right", padx=2)
         ttk.Button(
             bar,
             text="COM Radio",
@@ -1088,27 +1187,39 @@ class MeshSimulatorApp:
         self.workspace = ttk.Frame(self.root, style="Root.TFrame")
         self.workspace.pack(fill="both", expand=True)
         self.canvas_panel = ttk.Frame(self.workspace)
-        self.canvas_panel.pack(fill="both", expand=True)
-        self.panel_window = tk.Toplevel(self.root)
-        self.panel_window.title("MeshLab RF — Panels")
-        self.panel_window.geometry("420x760")
-        self.panel_window.minsize(340, 460)
-        self.panel_window.resizable(True, True)
-        self.panel_window.protocol("WM_DELETE_WINDOW", self._hide_panel_window)
-        self.sidebar = ttk.Frame(self.panel_window, width=390)
-        self.sidebar.pack(fill="both", expand=True)
-        self.panel_window.withdraw()
+        self.canvas_panel.pack(side="left", fill="both", expand=True)
+        self.sidebar = ttk.Frame(self.workspace, width=390)
+        self.sidebar.pack_propagate(False)
+        self.sidebar.pack(side="right", fill="y")
         self.sidebar_tabs = ttk.Notebook(self.sidebar)
         self.sidebar_tabs.pack(fill="both", expand=True)
 
         self.scene_panel = ttk.Frame(self.sidebar_tabs)
-        self.object_scroll = ScrollFrame(self.sidebar_tabs)
+        self.property_panel = ttk.Frame(self.sidebar_tabs)
+        self.property_panel.columnconfigure(0, weight=1)
+        self.property_panel.rowconfigure(0, weight=1)
+        self.object_scroll = ScrollFrame(self.property_panel)
+        self.object_scroll.grid(row=0, column=0, sticky="nsew")
+        self.object_apply_bar = ttk.Frame(self.property_panel, style="Toolbar.TFrame")
+        ttk.Separator(self.object_apply_bar, orient="horizontal").pack(fill="x")
+        apply_row = ttk.Frame(self.object_apply_bar, style="Toolbar.TFrame")
+        apply_row.pack(fill="x", padx=10, pady=9)
+        ttk.Label(apply_row, text="Changes ready", style="Muted.TLabel").pack(side="left")
+        self.object_apply_button = ttk.Button(
+            apply_row,
+            text="Apply changes",
+            style="Accent.TButton",
+            command=self.apply_object,
+        )
+        self.object_apply_button.pack(side="right")
+        self.object_apply_bar.grid(row=1, column=0, sticky="ew")
+        self.object_apply_bar.grid_remove()
         self.environment_scroll = ScrollFrame(self.sidebar_tabs)
         self.packet_scroll = ScrollFrame(self.sidebar_tabs)
         self.live_panel = ttk.Frame(self.sidebar_tabs)
         self.results_panel = ttk.Frame(self.sidebar_tabs)
         self.sidebar_tabs.add(self.scene_panel, text="Scene")
-        self.sidebar_tabs.add(self.object_scroll, text="Properties")
+        self.sidebar_tabs.add(self.property_panel, text="Properties")
         self.sidebar_tabs.add(self.environment_scroll, text="World")
         self.sidebar_tabs.add(self.packet_scroll, text="Packet")
         self.sidebar_tabs.add(self.live_panel, text="Live Radio")
@@ -1130,28 +1241,10 @@ class MeshSimulatorApp:
         )
         status.pack(fill="x")
 
-    def toggle_sidebar(self) -> None:
-        if self.sidebar_visible:
-            self._hide_panel_window()
-        else:
-            self._show_panel_window()
-
     def show_sidebar_tab(self, name: str) -> None:
-        if not self.sidebar_visible:
-            self._show_panel_window()
         tabs = {"Scene": 0, "Properties": 1, "World": 2, "Packet": 3, "Live Radio": 4, "Results": 5}
         self.sidebar_tabs.select(tabs[name])
-        self.panel_window.lift()
-
-    def _show_panel_window(self) -> None:
-        self.panel_window.deiconify()
-        self.panel_window.lift()
-        self.panel_window.focus_set()
-        self.sidebar_visible = True
-
-    def _hide_panel_window(self) -> None:
-        self.panel_window.withdraw()
-        self.sidebar_visible = False
+        self.root.after_idle(self.render_canvas)
 
     def show_mesh_graph(self) -> None:
         """Open a separate time-series view of the shared mesh channel."""
@@ -2000,29 +2093,12 @@ class MeshSimulatorApp:
         self.canvas.pack(fill="both", expand=True)
         search = tk.Frame(self.canvas, bg="#081321", highlightbackground=BORDER, highlightthickness=1)
         search.place(x=16, y=14)
-        entry = ttk.Entry(search, textvariable=self.map_search_var, width=34)
-        entry.grid(row=0, column=0, columnspan=2, padx=(7, 3), pady=(7, 4), sticky="ew")
+        search.columnconfigure(0, weight=1)
+        entry = ttk.Entry(search, textvariable=self.map_search_var, width=24)
+        entry.grid(row=0, column=0, padx=7, pady=(7, 3), sticky="ew")
         entry.bind("<Return>", lambda _event: self.search_map())
         self.map_search_button = ttk.Button(search, text="Search map", command=self.search_map)
-        self.map_search_button.grid(row=0, column=2, padx=(3, 7), pady=(7, 4))
-        layer = ttk.Combobox(
-            search,
-            textvariable=self.map_layer_var,
-            values=["Topographic", "Street"],
-            state="readonly",
-            width=14,
-        )
-        layer.grid(row=1, column=0, padx=(7, 3), pady=(3, 7), sticky="w")
-        layer.bind("<<ComboboxSelected>>", self._map_layer_changed)
-        self.osm_import_button = ttk.Button(search, text="Import obstacles", command=self.import_osm_obstacles)
-        self.osm_import_button.grid(
-            row=1,
-            column=1,
-            columnspan=2,
-            padx=(3, 7),
-            pady=(3, 7),
-            sticky="ew",
-        )
+        self.map_search_button.grid(row=1, column=0, padx=7, pady=3, sticky="ew")
         self.map_canvas_toggle = tk.Checkbutton(
             search,
             text="Show map tiles",
@@ -2032,21 +2108,13 @@ class MeshSimulatorApp:
             fg=TEXT,
             activebackground="#081321",
             activeforeground=TEXT,
-            selectcolor="#081321",
+            selectcolor="#168cd1",
+            disabledforeground="#71839a",
             highlightthickness=0,
             borderwidth=0,
             font=("Segoe UI Semibold", 9),
         )
-        self.map_canvas_toggle.grid(row=2, column=0, columnspan=2, padx=7, pady=(0, 7), sticky="w")
-        units = ttk.Combobox(
-            search,
-            textvariable=self.unit_system,
-            values=["Imperial", "Metric"],
-            state="readonly",
-            width=9,
-        )
-        units.grid(row=2, column=2, padx=(3, 7), pady=(0, 7), sticky="e")
-        units.bind("<<ComboboxSelected>>", self._units_changed)
+        self.map_canvas_toggle.grid(row=2, column=0, padx=7, pady=(3, 1), sticky="w")
         self.terrain_only_toggle = tk.Checkbutton(
             search,
             text="Terrain only · hide streets, highways, and labels",
@@ -2056,14 +2124,19 @@ class MeshSimulatorApp:
             fg=TEXT,
             activebackground="#081321",
             activeforeground=TEXT,
-            selectcolor="#081321",
+            selectcolor="#168cd1",
+            disabledforeground="#71839a",
             highlightthickness=0,
             borderwidth=0,
             font=("Segoe UI Semibold", 9),
+            justify="left",
+            wraplength=205,
         )
-        self.terrain_only_toggle.grid(row=3, column=0, columnspan=3, padx=7, pady=(0, 7), sticky="w")
+        self.terrain_only_toggle.grid(row=3, column=0, padx=7, pady=(1, 4), sticky="w")
+        self.osm_import_button = ttk.Button(search, text="Import obstacles", command=self.import_osm_obstacles)
+        self.osm_import_button.grid(row=4, column=0, padx=7, pady=(3, 7), sticky="ew")
         self.obstacle_progress_frame = tk.Frame(search, bg="#081321")
-        self.obstacle_progress_frame.grid(row=4, column=0, columnspan=3, padx=7, pady=(0, 7), sticky="ew")
+        self.obstacle_progress_frame.grid(row=5, column=0, padx=7, pady=(0, 7), sticky="ew")
         self.obstacle_progress_frame.columnconfigure(0, weight=1)
         self.obstacle_progress_var = tk.StringVar(value="")
         ttk.Label(
@@ -2076,7 +2149,7 @@ class MeshSimulatorApp:
             orient="horizontal",
             mode="determinate",
             maximum=100,
-            length=320,
+            length=205,
         )
         self.obstacle_progress_bar.grid(row=1, column=0, sticky="ew")
         self.obstacle_progress_frame.grid_remove()
@@ -2234,16 +2307,6 @@ class MeshSimulatorApp:
             f"{self.format_distance(env.initial_view_height_m)}"
         )
         self.load_topography()
-
-    def _map_layer_changed(self, _event: tk.Event | None = None) -> None:
-        layer = self.map_layer_var.get()
-        if layer not in {"Topographic", "Street"}:
-            return
-        self.scenario.environment.map_layer = layer
-        self.map_tile_images.clear()
-        self.map_tile_failures.clear()
-        self.mark_dirty()
-        self.render_canvas()
 
     def _clear_terrain_grid(self) -> None:
         env = self.scenario.environment
@@ -3187,7 +3250,6 @@ class MeshSimulatorApp:
         self.root.bind("<Delete>", lambda _e: self.delete_selected())
         self.root.bind("<Control-Return>", lambda _e: self.run_simulation())
         self.root.bind("<Key-f>", lambda _e: self.fit_view())
-        self.root.bind("<Tab>", lambda _e: (self.toggle_sidebar(), "break")[1])
         self.root.bind("<Escape>", lambda _e: self.set_tool("select"))
         self.root.bind("<Key-n>", lambda _e: self.set_tool("node"))
         self.root.bind("<Key-b>", lambda _e: self.set_tool("beacon"))
@@ -3234,6 +3296,7 @@ class MeshSimulatorApp:
         body = self.object_scroll.body
         self._clear_frame(body)
         self.object_vars = {}
+        self._set_object_form_clean()
         obj = self.get_selected()
         if obj is None:
             self._form_header(body, "Nothing selected", "Select a node or obstruction on the map to edit all of its settings.")
@@ -3245,6 +3308,23 @@ class MeshSimulatorApp:
             self._build_node_form(body, obj)
         else:
             self._build_obstacle_form(body, obj)
+        self._watch_object_form_changes()
+
+    def _watch_object_form_changes(self) -> None:
+        for key, variable in self.object_vars.items():
+            if key != "power_summary":
+                variable.trace_add("write", self._object_form_value_changed)
+
+    def _object_form_value_changed(self, *_args: object) -> None:
+        if not self.object_form_dirty and self.get_selected() is not None:
+            self.object_form_dirty = True
+            self.object_apply_bar.grid()
+
+    def _set_object_form_clean(self) -> None:
+        self.object_form_dirty = False
+        apply_bar = getattr(self, "object_apply_bar", None)
+        if apply_bar is not None:
+            apply_bar.grid_remove()
 
     def _build_node_form(self, body: ttk.Frame, node: Node) -> None:
         self._form_header(body, node.name, f"Node !{node.node_num:08x} · {node.role}")
@@ -3266,6 +3346,7 @@ class MeshSimulatorApp:
             "antenna_gain_dbi": node.antenna_gain_dbi,
             "cable_loss_db": node.cable_loss_db,
             "noise_figure_db": node.noise_figure_db,
+            "region": node.radio.region,
             "preset": node.radio.preset,
             "frequency_mhz": node.radio.frequency_mhz,
             "bandwidth_khz": node.radio.bandwidth_khz,
@@ -3355,12 +3436,21 @@ class MeshSimulatorApp:
             ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 4))
 
         section = self._section(body, "LoRa modem")
-        preset_widget = self._field(section, 0, "Firmware preset", self.object_vars["preset"], list(PRESETS))
+        region_widget = self._field(section, 0, "Regulatory region", self.object_vars["region"], list(REGION_BANDS))
+        region_widget.bind("<<ComboboxSelected>>", self._region_preview)
+        preset_widget = self._field(
+            section,
+            1,
+            "Firmware preset",
+            self.object_vars["preset"],
+            list(region_preset_options(node.radio.region)),
+        )
+        self.object_preset_widget = preset_widget
         preset_widget.bind("<<ComboboxSelected>>", self._preset_preview)
-        self._field(section, 1, "Frequency (MHz)", self.object_vars["frequency_mhz"])
-        self._field(section, 2, "Bandwidth (kHz)", self.object_vars["bandwidth_khz"])
-        self._field(section, 3, "Spreading factor", self.object_vars["spreading_factor"])
-        self._field(section, 4, "Coding rate 4/", self.object_vars["coding_rate"])
+        self._field(section, 2, "Frequency (MHz)", self.object_vars["frequency_mhz"])
+        self._field(section, 3, "Bandwidth (kHz)", self.object_vars["bandwidth_khz"])
+        self._field(section, 4, "Spreading factor", self.object_vars["spreading_factor"])
+        self._field(section, 5, "Coding rate 4/", self.object_vars["coding_rate"])
 
         section = self._section(body, "RF chain")
         profile_widget = self._field(
@@ -3419,10 +3509,38 @@ class MeshSimulatorApp:
     def _preset_preview(self, _event: tk.Event | None = None) -> None:
         preset = str(self.object_vars["preset"].get())
         if preset != "CUSTOM" and preset in PRESETS:
-            bw, sf, cr = PRESETS[preset]
+            region_var = self.object_vars.get("region")
+            region = str(region_var.get()) if region_var is not None else "US"
+            region = region_for_preset(region, preset)
+            if region_var is not None:
+                region_var.set(region)
+            preset_widget = getattr(self, "object_preset_widget", None)
+            if preset_widget is not None:
+                preset_widget.configure(values=list(region_preset_options(region)))
+            bw, sf, cr = preset_parameters(preset, region)
             self.object_vars["bandwidth_khz"].set(str(bw))
             self.object_vars["spreading_factor"].set(str(sf))
             self.object_vars["coding_rate"].set(str(cr))
+            channel_name = str(self.object_vars["channel"].get()).strip()
+            if not channel_name or channel_name in PRESET_DISPLAY_NAMES.values():
+                channel_name = PRESET_DISPLAY_NAMES[preset]
+                self.object_vars["channel"].set(channel_name)
+            frequency = meshtastic_default_frequency_mhz(preset, channel_name, region=region)
+            self.object_vars["frequency_mhz"].set(f"{frequency:.6f}".rstrip("0").rstrip("."))
+
+    def _region_preview(self, _event: tk.Event | None = None) -> None:
+        region = str(self.object_vars["region"].get())
+        if region not in REGION_BANDS:
+            region = "US"
+            self.object_vars["region"].set(region)
+        options = region_preset_options(region)
+        preset_widget = getattr(self, "object_preset_widget", None)
+        if preset_widget is not None:
+            preset_widget.configure(values=list(options))
+        current_preset = str(self.object_vars["preset"].get())
+        if current_preset != "CUSTOM" and current_preset not in REGION_BANDS[region].presets:
+            self.object_vars["preset"].set(REGION_BANDS[region].default_preset)
+        self._preset_preview()
 
     def _hardware_power_preview(self, _event: tk.Event | None = None) -> None:
         profile = hardware_power_profile(str(self.object_vars["power_profile"].get()))
@@ -3545,8 +3663,7 @@ class MeshSimulatorApp:
     def _form_actions(self, body: ttk.Frame) -> None:
         actions = ttk.Frame(body)
         actions.pack(fill="x", padx=12, pady=15)
-        ttk.Button(actions, text="Apply changes", style="Accent.TButton", command=self.apply_object).pack(side="left")
-        ttk.Button(actions, text="Duplicate", command=self.duplicate_selected).pack(side="left", padx=5)
+        ttk.Button(actions, text="Duplicate", command=self.duplicate_selected).pack(side="left")
         ttk.Button(actions, text="Delete", style="Danger.TButton", command=self.delete_selected).pack(side="right")
 
     def _build_environment_form(self) -> None:
@@ -3795,6 +3912,7 @@ class MeshSimulatorApp:
                 for key in ["antenna_gain_dbi", "cable_loss_db", "noise_figure_db"]:
                     setattr(obj, key, float(self.object_vars[key].get()))
                 obj.radio.preset = str(self.object_vars["preset"].get())
+                obj.radio.region = str(self.object_vars["region"].get())
                 obj.radio.frequency_mhz = float(self.object_vars["frequency_mhz"].get())
                 obj.radio.bandwidth_khz = float(self.object_vars["bandwidth_khz"].get())
                 obj.radio.spreading_factor = int(self.object_vars["spreading_factor"].get())
@@ -3819,6 +3937,7 @@ class MeshSimulatorApp:
         except (ValueError, TypeError) as error:
             messagebox.showerror("Invalid value", f"One of the fields is not a valid number.\n\n{error}", parent=self.root)
             return
+        self._set_object_form_clean()
         self.mark_dirty()
         self._mark_results_stale()
         self._refresh_scene_change(
@@ -5696,7 +5815,7 @@ class MeshSimulatorApp:
         c = self.canvas
         c.delete("all")
         env = self.scenario.environment
-        c.configure(bg=env.background)
+        c.configure(bg=MAPLESS_BACKGROUND if not self.map_visible.get() else env.background)
         selected = self.get_selected()
         selected_obstacle_id = selected.id if isinstance(selected, Obstacle) else None
         geographic_key = (
@@ -5976,7 +6095,8 @@ class MeshSimulatorApp:
     def _compose_map_layer(self, c: tk.Canvas) -> Image.Image:
         canvas_width = max(1, c.winfo_width())
         canvas_height = max(1, c.winfo_height())
-        composed = Image.new("RGB", (canvas_width, canvas_height), "#0a1524")
+        background = MAPLESS_BACKGROUND if not self.map_visible.get() else "#0a1524"
+        composed = Image.new("RGB", (canvas_width, canvas_height), background)
         env = self.scenario.environment
         if not self.map_visible.get():
             return composed

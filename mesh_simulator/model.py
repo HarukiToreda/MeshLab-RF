@@ -29,6 +29,172 @@ PRESETS: dict[str, tuple[float, int, int]] = {
     "CUSTOM": (250.0, 11, 5),
 }
 
+PRESET_DISPLAY_NAMES: dict[str, str] = {
+    "LONG_FAST": "LongFast",
+    "LONG_SLOW": "LongSlow",
+    "MEDIUM_SLOW": "MediumSlow",
+    "MEDIUM_FAST": "MediumFast",
+    "SHORT_SLOW": "ShortSlow",
+    "SHORT_FAST": "ShortFast",
+    "LONG_MODERATE": "LongMod",
+    "SHORT_TURBO": "ShortTurbo",
+    "LONG_TURBO": "LongTurbo",
+    "LITE_FAST": "LiteFast",
+    "LITE_SLOW": "LiteSlow",
+    "NARROW_FAST": "NarrowFast",
+    "NARROW_SLOW": "NarrowSlow",
+    "TINY_FAST": "TinyFast",
+    "TINY_SLOW": "TinySlow",
+    "MEDIUM_TURBO": "MediumTurbo",
+}
+
+
+@dataclass(frozen=True)
+class RegionBand:
+    frequency_start_mhz: float
+    frequency_end_mhz: float
+    presets: tuple[str, ...]
+    default_preset: str = "LONG_FAST"
+    spacing_mhz: float = 0.0
+    padding_mhz: float = 0.0
+    wide_lora: bool = False
+    override_slot: int = 0
+
+
+STANDARD_REGION_PRESETS = (
+    "LONG_FAST",
+    "LONG_SLOW",
+    "MEDIUM_SLOW",
+    "MEDIUM_FAST",
+    "SHORT_SLOW",
+    "SHORT_FAST",
+    "LONG_MODERATE",
+    "SHORT_TURBO",
+    "LONG_TURBO",
+    "MEDIUM_TURBO",
+)
+EU_868_PRESETS = STANDARD_REGION_PRESETS[:7]
+LITE_PRESETS = ("LITE_FAST", "LITE_SLOW")
+NARROW_PRESETS = ("NARROW_FAST", "NARROW_SLOW")
+TINY_PRESETS = ("TINY_FAST", "TINY_SLOW")
+
+# Kept in sync with the active RegionInfo table in Meshtastic's
+# src/mesh/RadioInterface.cpp. UNSET is intentionally omitted because it is a
+# radio-silent configuration state, not a regulatory domain.
+REGION_BANDS: dict[str, RegionBand] = {
+    "US": RegionBand(902.0, 928.0, STANDARD_REGION_PRESETS),
+    "EU_433": RegionBand(433.0, 434.0, STANDARD_REGION_PRESETS),
+    "EU_868": RegionBand(869.4, 869.65, EU_868_PRESETS),
+    "EU_866": RegionBand(865.6, 867.6, LITE_PRESETS, "LITE_FAST", 0.4, 0.0375),
+    "EU_N_868": RegionBand(869.4, 869.65, NARROW_PRESETS, "NARROW_SLOW", padding_mhz=0.0104, override_slot=1),
+    "CN": RegionBand(470.0, 510.0, STANDARD_REGION_PRESETS),
+    "JP": RegionBand(920.5, 923.5, STANDARD_REGION_PRESETS),
+    "ANZ": RegionBand(915.0, 928.0, STANDARD_REGION_PRESETS),
+    "ANZ_433": RegionBand(433.05, 434.79, STANDARD_REGION_PRESETS),
+    "RU": RegionBand(868.7, 869.2, STANDARD_REGION_PRESETS),
+    "KR": RegionBand(920.0, 923.0, STANDARD_REGION_PRESETS),
+    "TW": RegionBand(920.0, 925.0, STANDARD_REGION_PRESETS),
+    "IN": RegionBand(865.0, 867.0, STANDARD_REGION_PRESETS),
+    "NZ_865": RegionBand(864.0, 868.0, STANDARD_REGION_PRESETS),
+    "TH": RegionBand(920.0, 925.0, STANDARD_REGION_PRESETS),
+    "UA_433": RegionBand(433.0, 434.7, STANDARD_REGION_PRESETS),
+    "MY_433": RegionBand(433.0, 435.0, STANDARD_REGION_PRESETS),
+    "MY_919": RegionBand(919.0, 924.0, STANDARD_REGION_PRESETS),
+    "SG_923": RegionBand(917.0, 925.0, STANDARD_REGION_PRESETS),
+    "PH_433": RegionBand(433.0, 434.7, STANDARD_REGION_PRESETS),
+    "PH_868": RegionBand(868.0, 869.4, STANDARD_REGION_PRESETS),
+    "PH_915": RegionBand(915.0, 918.0, STANDARD_REGION_PRESETS),
+    "KZ_433": RegionBand(433.075, 434.775, STANDARD_REGION_PRESETS),
+    "KZ_863": RegionBand(863.0, 868.0, STANDARD_REGION_PRESETS),
+    "NP_865": RegionBand(865.0, 868.0, STANDARD_REGION_PRESETS),
+    "BR_902": RegionBand(902.0, 907.5, STANDARD_REGION_PRESETS),
+    "ITU1_2M": RegionBand(144.0, 146.0, TINY_PRESETS, "TINY_FAST", padding_mhz=0.0022, override_slot=26),
+    "ITU2_2M": RegionBand(144.0, 148.0, TINY_PRESETS, "TINY_FAST", padding_mhz=0.0022, override_slot=51),
+    "ITU3_2M": RegionBand(144.0, 148.0, TINY_PRESETS, "TINY_FAST", padding_mhz=0.0022, override_slot=33),
+    "ITU2_125CM": RegionBand(220.0, 225.0, NARROW_PRESETS, "NARROW_SLOW", padding_mhz=0.01875, override_slot=37),
+    "ITU1_70CM": RegionBand(430.0, 440.0, NARROW_PRESETS, "NARROW_SLOW", padding_mhz=0.01875, override_slot=37),
+    "ITU2_70CM": RegionBand(420.0, 450.0, NARROW_PRESETS, "NARROW_SLOW", padding_mhz=0.01875, override_slot=137),
+    "ITU3_70CM": RegionBand(430.0, 450.0, NARROW_PRESETS, "NARROW_SLOW", padding_mhz=0.01875, override_slot=37),
+    "LORA_24": RegionBand(2400.0, 2483.5, STANDARD_REGION_PRESETS, wide_lora=True),
+}
+
+EU_SWAPPABLE_REGIONS = ("EU_868", "EU_866", "EU_N_868")
+
+
+def _meshtastic_djb2(value: str) -> int:
+    result = 5381
+    for character in value:
+        result = ((result * 33) + ord(character)) & 0xFFFFFFFF
+    return result
+
+
+def preset_parameters(preset: str, region: str = "US") -> tuple[float, int, int]:
+    """Return firmware preset parameters, including 2.4 GHz wide-LoRa bandwidths."""
+    if preset not in PRESETS:
+        raise ValueError(f"Unknown modem preset {preset!r}")
+    bandwidth_khz, spreading_factor, coding_rate = PRESETS[preset]
+    if REGION_BANDS.get(region, REGION_BANDS["US"]).wide_lora:
+        if preset in {"SHORT_TURBO", "MEDIUM_TURBO", "LONG_TURBO"}:
+            bandwidth_khz = 1625.0
+        elif preset in {"SHORT_FAST", "SHORT_SLOW", "MEDIUM_FAST", "MEDIUM_SLOW", "LONG_FAST"}:
+            bandwidth_khz = 812.5
+        elif preset in {"LONG_MODERATE", "LONG_SLOW"}:
+            bandwidth_khz = 406.25
+    return bandwidth_khz, spreading_factor, coding_rate
+
+
+def region_for_preset(region: str, preset: str) -> str:
+    """Mirror firmware's automatic sibling-region swap for European preset families."""
+    selected = region if region in REGION_BANDS else "US"
+    if preset in REGION_BANDS[selected].presets:
+        return selected
+    if selected in EU_SWAPPABLE_REGIONS:
+        for sibling in EU_SWAPPABLE_REGIONS:
+            if preset in REGION_BANDS[sibling].presets:
+                return sibling
+    return selected
+
+
+def region_preset_options(region: str) -> tuple[str, ...]:
+    selected = region if region in REGION_BANDS else "US"
+    if selected in EU_SWAPPABLE_REGIONS:
+        return EU_868_PRESETS + LITE_PRESETS + NARROW_PRESETS + ("CUSTOM",)
+    return REGION_BANDS[selected].presets + ("CUSTOM",)
+
+
+def meshtastic_default_frequency_mhz(
+    preset: str,
+    channel_name: str | None = None,
+    *,
+    region: str = "US",
+) -> float:
+    """Return the firmware-selected center frequency for a region and preset."""
+    if preset not in PRESET_DISPLAY_NAMES:
+        raise ValueError(f"{preset!r} does not have an automatic frequency")
+    selected_region = region_for_preset(region, preset)
+    band = REGION_BANDS[selected_region]
+    if preset not in band.presets:
+        raise ValueError(f"Preset {preset!r} is not available in region {selected_region!r}")
+    bandwidth_khz = preset_parameters(preset, selected_region)[0]
+    slot_width_mhz = band.spacing_mhz + (band.padding_mhz * 2.0) + (bandwidth_khz / 1000.0)
+    slot_count = max(
+        1,
+        int(
+            math.floor(
+                (((band.frequency_end_mhz - band.frequency_start_mhz) + band.spacing_mhz) / slot_width_mhz)
+                + 0.5
+            )
+        ),
+    )
+    effective_name = (channel_name or PRESET_DISPLAY_NAMES[preset]).strip() or PRESET_DISPLAY_NAMES[preset]
+    if band.override_slot > 0:
+        slot = band.override_slot - 1
+    elif band.override_slot == -1:
+        slot = _meshtastic_djb2(PRESET_DISPLAY_NAMES[preset]) % slot_count
+    else:
+        slot = _meshtastic_djb2(effective_name) % slot_count
+    return band.frequency_start_mhz + (bandwidth_khz / 2000.0) + band.padding_mhz + (slot * slot_width_mhz)
+
 ROLES = [
     "CLIENT",
     "CLIENT_MUTE",
@@ -113,7 +279,85 @@ HARDWARE_POWER_PROFILES: tuple[HardwarePowerProfile, ...] = (
         22.0,
         22.0,
         "Most current sub-GHz Meshtastic radios · about 158 mW",
-        ("SX1262", "SX1268", "LR1110", "LR1121", "RAK4631", "HELTEC_V3", "HELTEC T114"),
+        ("SX1262", "SX1268", "LR1110", "LR1121"),
+    ),
+    HardwarePowerProfile(
+        "Heltec Mesh Node T114 (21 dBm)",
+        21.0,
+        22.0,
+        "Mesh Node T114 / T114 Rev. 2 nominal output - about 126 mW (21 +/- 1 dBm)",
+        ("HELTEC_MESH_NODE_T114", "MESH_NODE_T114", "HELTEC T114", "T114 REV 2"),
+    ),
+    HardwarePowerProfile(
+        "Heltec LoRa 32 V3 family (21 dBm)",
+        21.0,
+        22.0,
+        "WiFi LoRa 32 V3, Wireless Stick Lite V3, and related standard-power Heltec boards",
+        (
+            "HELTEC_V3",
+            "HELTEC LORA 32 V3",
+            "WIFI_LORA_32_V3",
+            "HELTEC_WIRELESS_STICK_LITE_V3",
+            "WIRELESS STICK LITE V3",
+            "HELTEC_WIRELESS_TRACKER_V1_1",
+            "WIRELESS TRACKER V1.1",
+            "HELTEC_WIRELESS_PAPER",
+        ),
+    ),
+    HardwarePowerProfile(
+        "RAK WisBlock RAK4631 / WisMesh (22 dBm)",
+        22.0,
+        22.0,
+        "RAK4631 and standard-power WisBlock/WisMesh devices - about 158 mW",
+        (
+            "RAK4631",
+            "RAK4630",
+            "WISMESH POCKET",
+            "WISMESH TAP",
+            "WISMESH TAG",
+            "WISMESH REPEATER MINI",
+        ),
+    ),
+    HardwarePowerProfile(
+        "LILYGO T-Beam / T-Beam Supreme (22 dBm)",
+        22.0,
+        22.0,
+        "Standard-power T-Beam, T-Beam Supreme, and T3-S3 boards - about 158 mW",
+        ("TBEAM", "T-BEAM", "TBEAM_S3_CORE", "T-BEAM SUPREME", "TLORA_T3_S3", "T3-S3"),
+    ),
+    HardwarePowerProfile(
+        "LILYGO T-Deck family (22 dBm)",
+        22.0,
+        22.0,
+        "T-Deck, T-Deck Plus, and T-Deck Pro - about 158 mW",
+        ("T_DECK", "T-DECK", "TDECK", "T_DECK_PLUS", "T_DECK_PRO"),
+    ),
+    HardwarePowerProfile(
+        "LILYGO T-Echo family (22 dBm)",
+        22.0,
+        22.0,
+        "T-Echo and T-Echo Plus - about 158 mW",
+        ("T_ECHO", "T-ECHO", "TECHO", "T_ECHO_PLUS"),
+    ),
+    HardwarePowerProfile(
+        "Seeed SenseCAP T1000-E (22 dBm)",
+        22.0,
+        22.0,
+        "SenseCAP Card Tracker T1000-E / LR1110 - about 158 mW",
+        ("SENSECAP_CARD_TRACKER_T1000_E", "SENSECAP T1000-E", "T1000_E", "T1000-E"),
+    ),
+    HardwarePowerProfile(
+        "Seeed XIAO + Wio-SX1262 kits (22 dBm)",
+        22.0,
+        22.0,
+        "XIAO nRF52840 or ESP32-S3 with the Wio-SX1262 radio - about 158 mW",
+        (
+            "SEEED_XIAO_NRF52840_KIT",
+            "SEEED_XIAO_S3",
+            "XIAO NRF52840 WIO SX1262",
+            "XIAO ESP32S3 WIO SX1262",
+            "WIO-SX1262",
+        ),
     ),
     HardwarePowerProfile(
         "Generic SX127x / RF95 (20 dBm)",
@@ -130,11 +374,21 @@ HARDWARE_POWER_PROFILES: tuple[HardwarePowerProfile, ...] = (
         ("SX1280", "SX1281", "SX128X", "LR1120", "LORA_24", "2.4GHZ"),
     ),
     HardwarePowerProfile(
-        "RAK3401 / RAK13302 1W (30 dBm)",
+        "RAK WisMesh 1W / RAK3401+RAK13302 (30 dBm)",
         30.0,
         30.0,
-        "Amplifier-equipped RAK3401 and WisMesh Repeater Mini V2 HP · 1 W",
-        ("RAK3401", "RAK13302", "RAK_WISMESH_REPEATER_MINI_HP", "REPEATER MINI V2 HP"),
+        "WisMesh 1W Booster, Station HP, and Repeater Mini V2 HP - 1 W",
+        (
+            "RAK3401",
+            "RAK13302",
+            "RAK3401 / RAK13302 1W (30 dBm)",
+            "RAK_WISMESH_1W_BOOSTER",
+            "WISMESH 1W BOOSTER",
+            "RAK_WISMESH_STATION_HP",
+            "WISMESH STATION HIGH POWER",
+            "RAK_WISMESH_REPEATER_MINI_HP",
+            "REPEATER MINI V2 HP",
+        ),
     ),
     HardwarePowerProfile(
         "LILYGO T-Beam 1W (30 dBm)",
@@ -151,11 +405,45 @@ HARDWARE_POWER_PROFILES: tuple[HardwarePowerProfile, ...] = (
         ("STATION_G2", "STATION G2"),
     ),
     HardwarePowerProfile(
-        "Heltec PA models (29 dBm)",
+        "NULLHOP MeshToad V3 (30 dBm / 1 W)",
+        30.0,
+        30.0,
+        "Linux-hosted Meshtastic radio with an integrated 1 W PA",
+        ("NULLHOP_MESHTOAD_V3", "MESHTOAD V3", "MESHTOAD_V3", "MESHTOAD"),
+    ),
+    HardwarePowerProfile(
+        "Heltec WiFi LoRa 32 V4 HP (28 dBm)",
+        28.0,
         29.0,
+        "High-power V4/R8 variant - about 631 mW nominal (28 +/- 1 dBm)",
+        (
+            "HELTEC_V4_R8",
+            "HELTEC_V4_HIGH_POWER",
+            "WIFI_LORA_32_V4_HP",
+            "HELTEC V4 28DBM",
+            "Heltec PA models (29 dBm)",
+        ),
+    ),
+    HardwarePowerProfile(
+        "Heltec Wireless Tracker V2 (28 dBm)",
+        28.0,
         29.0,
-        "Wireless Tracker V2, Mesh Node T096, and Heltec V4 PA variants · about 0.8 W",
-        ("HELTEC_WIRELESS_TRACKER_V2", "HELTEC_MESH_NODE_T096", "HELTEC_V4_R8"),
+        "Wireless Tracker V2 with integrated PA - about 631 mW nominal (28 +/- 1 dBm)",
+        ("HELTEC_WIRELESS_TRACKER_V2", "WIRELESS TRACKER V2"),
+    ),
+    HardwarePowerProfile(
+        "Heltec Mesh Node T096 (28 dBm)",
+        28.0,
+        29.0,
+        "Mesh Node T096 with integrated PA - about 631 mW nominal (28 +/- 1 dBm)",
+        ("HELTEC_MESH_NODE_T096", "MESH NODE T096", "T096"),
+    ),
+    HardwarePowerProfile(
+        "Heltec MeshTower V2 (30 dBm / 1 W)",
+        30.0,
+        30.0,
+        "Outdoor solar MeshTower V2 with 1 W LoRa output",
+        ("HELTEC_MESHTOWER_V2", "MESHTOWER V2", "MESH_TOWER_V2", "MESHTOWER"),
     ),
     HardwarePowerProfile(
         "E22-900M30S PA (29 dBm)",
@@ -182,11 +470,28 @@ def _normalized_hardware_name(value: str) -> str:
 def hardware_power_profile(value: str) -> HardwarePowerProfile:
     """Return the closest conducted-output profile for a device, enum name, or radio family."""
     normalized = _normalized_hardware_name(value)
+
+    # Exact names must win before substring matching. This preserves serialized
+    # profile keys and prevents a generic radio-chip alias from hiding a board.
     for profile in HARDWARE_POWER_PROFILES:
         if normalized == _normalized_hardware_name(profile.key):
             return profile
-        if any(_normalized_hardware_name(alias) in normalized for alias in profile.aliases):
+
+    aliases = [
+        (_normalized_hardware_name(alias), profile)
+        for profile in HARDWARE_POWER_PROFILES
+        for alias in profile.aliases
+        if _normalized_hardware_name(alias)
+    ]
+    for alias, profile in aliases:
+        if normalized == alias:
             return profile
+
+    # Prefer the longest model alias. For example, TBEAM_1_WATT must resolve to
+    # its amplified profile instead of the shorter standard TBEAM family alias.
+    matches = [(len(alias), profile) for alias, profile in aliases if alias in normalized]
+    if matches:
+        return max(matches, key=lambda match: match[0])[1]
     return HARDWARE_POWER_PROFILES[0]
 
 
@@ -196,16 +501,35 @@ def dbm_to_watts(dbm: float) -> float:
 
 @dataclass
 class RadioConfig:
+    region: str = "US"
     preset: str = "LONG_FAST"
     frequency_mhz: float = 906.875
     bandwidth_khz: float = 250.0
     spreading_factor: int = 11
     coding_rate: int = 5
 
-    def apply_preset(self, preset: str) -> None:
+    def apply_preset(self, preset: str, channel_name: str | None = None) -> None:
+        self.region = region_for_preset(self.region, preset)
+        if preset != "CUSTOM" and preset not in REGION_BANDS[self.region].presets:
+            preset = REGION_BANDS[self.region].default_preset
         self.preset = preset
         if preset in PRESETS and preset != "CUSTOM":
-            self.bandwidth_khz, self.spreading_factor, self.coding_rate = PRESETS[preset]
+            self.bandwidth_khz, self.spreading_factor, self.coding_rate = preset_parameters(preset, self.region)
+            self.frequency_mhz = meshtastic_default_frequency_mhz(preset, channel_name, region=self.region)
+
+    def apply_region(self, region: str, channel_name: str | None = None) -> None:
+        if region not in REGION_BANDS:
+            raise ValueError(f"Unknown regulatory region {region!r}")
+        self.region = region
+        if self.preset != "CUSTOM" and self.preset not in REGION_BANDS[region].presets:
+            self.preset = REGION_BANDS[region].default_preset
+        if self.preset != "CUSTOM":
+            self.bandwidth_khz, self.spreading_factor, self.coding_rate = preset_parameters(
+                self.preset, self.region
+            )
+            self.frequency_mhz = meshtastic_default_frequency_mhz(
+                self.preset, channel_name, region=self.region
+            )
 
 
 @dataclass
