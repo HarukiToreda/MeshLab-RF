@@ -7415,6 +7415,19 @@ class MeshSimulatorApp:
         point_x, point_y, _kind = contour[index]
         return math.hypot(point_x - source.x, point_y - source.y)
 
+    @staticmethod
+    def _halo_line(c: tk.Canvas, *coordinates: float, width: float = 2) -> None:
+        """A black line with a white outline so it reads on any background."""
+        c.create_line(*coordinates, fill="white", width=width + 2)
+        c.create_line(*coordinates, fill="black", width=width)
+
+    @staticmethod
+    def _halo_text(c: tk.Canvas, x: float, y: float, **kwargs: Any) -> None:
+        """Black text ringed with a white halo so it reads on any background."""
+        for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            c.create_text(x + offset_x, y + offset_y, fill="white", **kwargs)
+        c.create_text(x, y, fill="black", **kwargs)
+
     def _draw_scale(self, c: tk.Canvas) -> None:
         scale = self._base_scale() * self.zoom
         desired_pixels = 120
@@ -7431,11 +7444,23 @@ class MeshSimulatorApp:
         nice_meters = nice_units * unit_meters
         pixels = nice_meters * scale
         x, y = 20, c.winfo_height() - 24
-        c.create_line(x, y, x + pixels, y, fill="black", width=2)
-        c.create_line(x, y - 4, x, y + 4, fill="black", width=2)
-        c.create_line(x + pixels, y - 4, x + pixels, y + 4, fill="black", width=2)
-        c.create_text(
-            x + pixels / 2, y - 9, text=self.format_distance(nice_meters), fill="black", font=("Segoe UI", 8)
+
+        cx, cy = c.winfo_width() / 2.0, c.winfo_height() / 2.0
+        wx, wy = self.screen_to_world(cx, cy)
+        env = self.scenario.environment
+        coordinates = f"X {self.format_distance(wx)} · Y {self.format_distance(wy)}"
+        if env.map_configured:
+            latitude, longitude = world_to_latlon(wx, wy, env.map_center_lat, env.map_center_lon)
+            coordinates += f" · {latitude:.5f}, {longitude:.5f}"
+
+        self._halo_line(c, x, y, x + pixels, y)
+        self._halo_line(c, x, y - 4, x, y + 4)
+        self._halo_line(c, x + pixels, y - 4, x + pixels, y + 4)
+        self._halo_text(
+            c, x + pixels / 2, y - 9, text=self.format_distance(nice_meters), font=("Segoe UI", 8)
+        )
+        self._halo_text(
+            c, x + pixels + 12, y, text=coordinates, anchor="w", font=("Segoe UI", 8)
         )
 
     def _draw_center_crosshair(self, c: tk.Canvas) -> None:
