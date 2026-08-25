@@ -27,7 +27,7 @@ from .geography import (
     TILE_LAYERS,
     WEB_MERCATOR_WORLD_M,
     choose_tile_zoom,
-    grayscale_map_tile,
+    decode_grayscale_tile,
     latlon_to_mercator,
     latlon_to_world,
     mercator_to_latlon,
@@ -99,7 +99,7 @@ GREEN = "#31d58b"
 AMBER = "#ffbd4a"
 RED = "#fb6376"
 BORDER = "#233752"
-MAPLESS_BACKGROUND = "#d9dde2"
+MAPLESS_BACKGROUND = "#ffffff"
 HOP_COLORS = {
     0: "#27b3ff",
     1: "#31d58b",
@@ -806,6 +806,12 @@ class MeshSimulatorApp:
         self.map_service = MapDataService()
         self.map_tile_bytes: dict[tuple[str, int, int, int], bytes] = {}
         self.map_tile_images: dict[tuple[str, int, int, int, int], Image.Image] = {}
+        # Decoded once per tile, independent of the requested pixel size, so a
+        # continuous zoom only ever pays for a cheap resize instead of
+        # re-decoding + re-enhancing every tile on every settle-render -- that
+        # repeated decode cost was long enough to flash the bare canvas
+        # background between the old raster and the new one.
+        self.map_tile_decoded: dict[tuple[str, int, int, int], Image.Image] = {}
         self.map_tile_failures: set[tuple[str, int, int, int]] = set()
         self.obstacle_layer_image: ImageTk.PhotoImage | None = None
         self.obstacle_layer_source: Image.Image | None = None
@@ -1989,6 +1995,7 @@ class MeshSimulatorApp:
         self._clear_terrain_grid()
         self.map_visible.set(True)
         self.map_tile_images.clear()
+        self.map_tile_decoded.clear()
         self.map_tile_failures.clear()
 
         if old_configured:
@@ -2288,6 +2295,7 @@ class MeshSimulatorApp:
         self._clear_terrain_grid()
         self.map_tile_failures.clear()
         self.map_tile_images.clear()
+        self.map_tile_decoded.clear()
         self.map_search_button.configure(state="normal")
         self.mark_dirty()
         self._mark_results_stale()
@@ -5833,7 +5841,7 @@ class MeshSimulatorApp:
         c = self.canvas
         c.delete("all")
         env = self.scenario.environment
-        c.configure(bg=MAPLESS_BACKGROUND if not self.map_visible.get() else env.background)
+        c.configure(bg=MAPLESS_BACKGROUND)
         selected = self.get_selected()
         selected_obstacle_id = selected.id if isinstance(selected, Obstacle) else None
         geographic_key = (
@@ -6111,11 +6119,22 @@ class MeshSimulatorApp:
         self._draw_live_mesh_overlay(c)
         self._tag_items_created_since(c, wave_start, CURRENT_WAVE_TAG)
 
+    def _resized_map_tile(
+        self, key: tuple[str, int, int, int], data: bytes, pixel_size: int
+    ) -> Image.Image:
+        """Resize an already-decoded tile to `pixel_size`, decoding only once
+        per (layer, zoom, tile) regardless of how many different pixel sizes
+        a continuous zoom asks for."""
+        decoded = self.map_tile_decoded.get(key)
+        if decoded is None:
+            decoded = decode_grayscale_tile(data)
+            self.map_tile_decoded[key] = decoded
+        return decoded.resize((pixel_size, pixel_size), Image.Resampling.BILINEAR)
+
     def _compose_map_layer(self, c: tk.Canvas) -> Image.Image:
         canvas_width = max(1, c.winfo_width())
         canvas_height = max(1, c.winfo_height())
-        background = MAPLESS_BACKGROUND if not self.map_visible.get() else "#0a1524"
-        composed = Image.new("RGB", (canvas_width, canvas_height), background)
+        composed = Image.new("RGB", (canvas_width, canvas_height), MAPLESS_BACKGROUND)
         env = self.scenario.environment
         if not self.map_visible.get():
             return composed
@@ -6163,7 +6182,7 @@ class MeshSimulatorApp:
                         image_key = (*key, pixel_size)
                         tile_image = self.map_tile_images.get(image_key)
                         if tile_image is None:
-                            tile_image = grayscale_map_tile(data, pixel_size).convert("RGB")
+                            tile_image = self._resized_map_tile(key, data, pixel_size).convert("RGB")
                             self.map_tile_images[image_key] = tile_image
                         composed.paste(tile_image, (round(screen_x), round(screen_y)))
                     else:
@@ -6172,7 +6191,7 @@ class MeshSimulatorApp:
                         image_key = (*key, 256)
                         tile_image = self.map_tile_images.get(image_key)
                         if tile_image is None:
-                            tile_image = grayscale_map_tile(data, 256).convert("RGB")
+                            tile_image = self._resized_map_tile(key, data, 256).convert("RGB")
                             self.map_tile_images[image_key] = tile_image
                         self._paste_clipped_map_tile(
                             composed,
@@ -6192,6 +6211,11 @@ class MeshSimulatorApp:
                 if key[0] == layer and key[1] == zoom and key[4] == active_pixel_size
             }
             self.map_tile_images = {key: image for key, image in self.map_tile_images.items() if key in current_keys}
+        if len(self.map_tile_decoded) > 300:
+            current_decoded_keys = {key for key in self.map_tile_decoded if key[0] == layer and key[1] == zoom}
+            self.map_tile_decoded = {
+                key: image for key, image in self.map_tile_decoded.items() if key in current_decoded_keys
+            }
         return composed
 
     @staticmethod
@@ -7704,7 +7728,7 @@ class MeshSimulatorApp:
         scale_ratio = source_scale / destination_scale
         source_x = (self.view_x - source_view_x) * source_scale
         source_y = (self.view_y - source_view_y) * source_scale
-        fill = (0, 0, 0, 0) if source.mode == "RGBA" else self.scenario.environment.background
+        fill = (0, 0, 0, 0) if source.mode == "RGBA" else MAPLESS_BACKGROUND
         return source.transform(
             (width, height),
             Image.Transform.AFFINE,
@@ -7782,7 +7806,9 @@ class MeshSimulatorApp:
         self.render_canvas()
 
     def _render_zoom_preview(self) -> None:
-        """Render one preview for the latest wheel state, capped near 60 FPS."""
+        """Render one cheap raster preview for the latest wheel state, called
+        synchronously on every wheel tick so it never lags the vector items
+        canvas.scale() already moved."""
         self.zoom_preview_after = None
         if not hasattr(self, "canvas"):
             return
@@ -7823,20 +7849,19 @@ class MeshSimulatorApp:
             return
         self.canvas.scale("all", event.x, event.y, applied_factor, applied_factor)
         self.canvas.scale(HUD_LAYER_TAG, event.x, event.y, 1.0 / applied_factor, 1.0 / applied_factor)
-        if self.beacon_profile is not None:
-            # Keep the map, cached coverage, ripple, and center marker on the same
-            # transform for every wheel event. Deferring this preview by one frame
-            # made the vector marker appear to drift over the older raster before
-            # snapping back at the final redraw.
-            if self.zoom_preview_after is not None:
-                try:
-                    self.root.after_cancel(self.zoom_preview_after)
-                except tk.TclError:
-                    pass
-                self.zoom_preview_after = None
-            self._render_zoom_preview()
-        elif self.zoom_preview_after is None:
-            self.zoom_preview_after = self.root.after(16, self._render_zoom_preview)
+        # Keep the map/obstacle raster, cached coverage, and every vector item
+        # (nodes, obstacle outlines) on the same transform for every wheel
+        # event. canvas.scale() above moves vector items instantly; deferring
+        # this raster preview by even one frame let it lag behind them, which
+        # reads as jitter/flicker on every tick -- worst with nodes/obstacles
+        # on screen since they're the vectors visibly racing ahead of it.
+        if self.zoom_preview_after is not None:
+            try:
+                self.root.after_cancel(self.zoom_preview_after)
+            except tk.TclError:
+                pass
+            self.zoom_preview_after = None
+        self._render_zoom_preview()
         if self.render_after is not None:
             try:
                 self.root.after_cancel(self.render_after)
@@ -8153,10 +8178,10 @@ class MeshSimulatorApp:
         if not tree.exists("_nodes") or not tree.exists("_obstacles"):
             tree.delete(*tree.get_children())
             tree.insert("", "end", iid="_nodes", open=True)
-            tree.insert("", "end", iid="_obstacles", open=True)
+            tree.insert("", "end", iid="_obstacles", open=False)
             self._scene_tree_signatures = {}
         tree.item("_nodes", text=f"  Nodes  ({len(self.scenario.nodes)})", open=True)
-        tree.item("_obstacles", text=f"  Obstructions  ({len(self.scenario.obstacles)})", open=True)
+        tree.item("_obstacles", text=f"  Obstructions  ({len(self.scenario.obstacles)})")
 
         desired: list[tuple[str, str, tuple[object, ...], str]] = []
         for node in self.scenario.nodes:
@@ -8334,6 +8359,7 @@ class MeshSimulatorApp:
         self.selected_id = None
         self.dirty = False
         self.map_tile_images.clear()
+        self.map_tile_decoded.clear()
         self.map_tile_failures.clear()
         self.clear_results()
         self.refresh_all()
@@ -8363,6 +8389,7 @@ class MeshSimulatorApp:
         self.selected_id = None
         self.dirty = False
         self.map_tile_images.clear()
+        self.map_tile_decoded.clear()
         self.map_tile_failures.clear()
         self.clear_results()
         self.refresh_all()

@@ -255,7 +255,14 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(app.canvas.coordinates, [(17, 0, 0)])
 
-    def test_wheel_events_coalesce_expensive_zoom_previews(self):
+    def test_wheel_events_refresh_the_preview_immediately_every_tick(self):
+        """A deferred-by-one-frame preview let the map raster lag one tick
+        behind the vector items canvas.scale() moves instantly, which read as
+        jitter/flicker on every wheel tick -- most visible with nodes and
+        obstacles on screen since those are the vectors racing ahead of it.
+        Every wheel event must repaint the preview synchronously, matching
+        the beacon-active path, so nothing is ever left trailing behind."""
+
         class Root:
             def __init__(self) -> None:
                 self.callbacks: list[tuple[int, object]] = []
@@ -288,17 +295,15 @@ class ModelTests(unittest.TestCase):
             app.view_x + x / app.zoom,
             app.view_y + y / app.zoom,
         )
+        preview_calls: list[str] = []
+        app._render_zoom_preview = lambda: preview_calls.append("preview")
         event = type("WheelEvent", (), {"x": 500, "y": 300, "delta": 120})()
 
         app._canvas_wheel(event)
         app._canvas_wheel(event)
 
-        preview_callbacks = [
-            callback
-            for delay, callback in app.root.callbacks
-            if delay == 16 and callback == app._render_zoom_preview
-        ]
-        self.assertEqual(len(preview_callbacks), 1)
+        self.assertEqual(preview_calls, ["preview", "preview"])
+        self.assertFalse(any(delay == 16 for delay, _callback in app.root.callbacks))
 
     def test_active_beacon_zoom_refreshes_preview_without_anchor_delay(self):
         class Root:
@@ -1649,6 +1654,28 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(converted.size, (4, 4))
         minimum, maximum = converted.getextrema()
         self.assertLess(minimum, maximum)
+
+    def test_resized_map_tile_decodes_once_across_a_continuous_zoom(self):
+        """A continuous zoom asks for a new pixel size on nearly every tick.
+        Re-running the full decode/contrast-enhance pipeline for each one was
+        slow enough to flash the bare canvas background between the old and
+        new raster on the settle-render. Only the resize should repeat."""
+        source = Image.new("RGB", (2, 1))
+        source.putdata([(255, 0, 0), (0, 128, 255)])
+        buffer = io.BytesIO()
+        source.save(buffer, format="PNG")
+        data = buffer.getvalue()
+        key = ("Topographic", 10, 5, 5)
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.map_tile_decoded = {}
+
+        first = app._resized_map_tile(key, data, 4)
+        second = app._resized_map_tile(key, data, 6)
+
+        self.assertEqual(len(app.map_tile_decoded), 1)
+        self.assertEqual(first.size, (4, 4))
+        self.assertEqual(second.size, (6, 6))
 
     def test_hidden_map_uses_a_light_neutral_canvas(self):
         class Hidden:

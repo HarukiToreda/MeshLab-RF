@@ -633,7 +633,6 @@ class Environment:
     stochastic: bool = True
     seed: int = 42
     grid_m: float = 500.0
-    background: str = "#0b1220"
     map_configured: bool = True
     map_center_lat: float = DEFAULT_MAP_CENTER_LAT
     map_center_lon: float = DEFAULT_MAP_CENTER_LON

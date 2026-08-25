@@ -140,12 +140,23 @@ def choose_tile_zoom(screen_pixels_per_meter: float, max_zoom: int) -> int:
     return max(1, min(max_zoom, int(math.floor(ideal))))
 
 
-def grayscale_map_tile(data: bytes, pixel_size: int) -> Image.Image:
+def decode_grayscale_tile(data: bytes) -> Image.Image:
+    """Decode + contrast-enhance a raw tile once, at its natural resolution.
+
+    This is the expensive step (JPEG/PNG decode, alpha compositing, contrast
+    enhancement). Callers that need many different output sizes from the same
+    source bytes -- e.g. re-resizing on every tick of a continuous zoom --
+    should cache this result and resize it themselves rather than repeating
+    the decode.
+    """
     source_rgba = Image.open(io.BytesIO(data)).convert("RGBA")
     white = Image.new("RGBA", source_rgba.size, (255, 255, 255, 255))
     source = Image.alpha_composite(white, source_rgba).convert("RGB")
-    source = ImageEnhance.Contrast(source).enhance(1.15).convert("L")
-    return source.resize((pixel_size, pixel_size), Image.Resampling.BILINEAR)
+    return ImageEnhance.Contrast(source).enhance(1.15).convert("L")
+
+
+def grayscale_map_tile(data: bytes, pixel_size: int) -> Image.Image:
+    return decode_grayscale_tile(data).resize((pixel_size, pixel_size), Image.Resampling.BILINEAR)
 
 
 def overture_rows_to_elements(
