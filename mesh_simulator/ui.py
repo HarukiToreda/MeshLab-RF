@@ -3321,6 +3321,11 @@ class MeshSimulatorApp:
 
     def _build_node_form(self, body: ttk.Frame, node: Node) -> None:
         self._form_header(body, node.name, f"Node !{node.node_num:08x} · {node.role}")
+        env = self.scenario.environment
+        if env.map_configured:
+            latitude, longitude = world_to_latlon(node.x, node.y, env.map_center_lat, env.map_center_lon)
+        else:
+            latitude, longitude = 0.0, 0.0
         values: dict[str, Any] = {
             "name": node.name,
             "node_num": f"{node.node_num:08x}",
@@ -3331,6 +3336,8 @@ class MeshSimulatorApp:
             "x": self._display_length(node.x),
             "y": self._display_length(node.y),
             "elevation_m": self._display_length(node.elevation_m),
+            "latitude": f"{latitude:.6f}",
+            "longitude": f"{longitude:.6f}",
             "elevation_override": node.elevation_override,
             "antenna_height_m": self._display_length(node.antenna_height_m),
             "use_live_altitude": node.use_live_altitude,
@@ -3362,8 +3369,12 @@ class MeshSimulatorApp:
 
         section = self._section(body, "Position & installation height")
         length_unit = self._length_unit()
-        self._field(section, 0, f"X ({length_unit})", self.object_vars["x"])
-        self._field(section, 1, f"Y ({length_unit})", self.object_vars["y"])
+        if env.map_configured:
+            self._field(section, 0, "Latitude", self.object_vars["latitude"])
+            self._field(section, 1, "Longitude", self.object_vars["longitude"])
+        else:
+            self._field(section, 0, f"X ({length_unit})", self.object_vars["x"])
+            self._field(section, 1, f"Y ({length_unit})", self.object_vars["y"])
         self._field(section, 2, f"Terrain elevation MSL ({length_unit})", self.object_vars["elevation_m"])
         self._check(section, 3, "Manually override terrain elevation", self.object_vars["elevation_override"])
         self._field(
@@ -3385,16 +3396,6 @@ class MeshSimulatorApp:
             wraplength=300,
             justify="left",
         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 4))
-        env = self.scenario.environment
-        if env.map_configured:
-            latitude, longitude = world_to_latlon(
-                node.x, node.y, env.map_center_lat, env.map_center_lon
-            )
-            ttk.Label(
-                section,
-                text=f"Latitude {latitude:.6f} · Longitude {longitude:.6f}",
-                style="Muted.TLabel",
-            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(5, 2))
         if node.reported_altitude_m is not None:
             accuracy = (
                 f" · estimated ±{self.format_distance(node.reported_altitude_accuracy_m)}"
@@ -3415,7 +3416,7 @@ class MeshSimulatorApp:
                 style="Muted.TLabel",
                 wraplength=285,
                 justify="left",
-            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 4))
+            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 4))
         elif node.reported_altitude_hae_m is not None:
             ttk.Label(
                 section,
@@ -3426,7 +3427,7 @@ class MeshSimulatorApp:
                 style="Muted.TLabel",
                 wraplength=285,
                 justify="left",
-            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 4))
+            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(2, 4))
 
         section = self._section(body, "LoRa modem")
         region_widget = self._field(section, 0, "Regulatory region", self.object_vars["region"], list(REGION_BANDS))
@@ -3872,8 +3873,17 @@ class MeshSimulatorApp:
                 obj.online = bool(self.object_vars["online"].get())
                 obj.favorite = bool(self.object_vars["favorite"].get())
                 old_elevation = obj.elevation_m
-                obj.x = self._meters_from_display(float(self.object_vars["x"].get()))
-                obj.y = self._meters_from_display(float(self.object_vars["y"].get()))
+                env = self.scenario.environment
+                if env.map_configured:
+                    obj.x, obj.y = latlon_to_world(
+                        float(self.object_vars["latitude"].get()),
+                        float(self.object_vars["longitude"].get()),
+                        env.map_center_lat,
+                        env.map_center_lon,
+                    )
+                else:
+                    obj.x = self._meters_from_display(float(self.object_vars["x"].get()))
+                    obj.y = self._meters_from_display(float(self.object_vars["y"].get()))
                 submitted_elevation = self._meters_from_display(float(self.object_vars["elevation_m"].get()))
                 elevation_was_edited = not math.isclose(
                     submitted_elevation,
@@ -7876,10 +7886,6 @@ class MeshSimulatorApp:
             y=y,
         )
         self._set_auto_node_elevation(node)
-        if self.scenario.nodes:
-            template = self.scenario.nodes[0]
-            node.radio = type(template.radio)(**vars(template.radio))
-            node.channel = template.channel
         self.scenario.nodes.append(node)
         if not self.scenario.packet.source_id:
             self.scenario.packet.source_id = node.id
