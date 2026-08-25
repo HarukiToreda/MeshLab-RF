@@ -1367,20 +1367,20 @@ class PropagationModel:
         worst_intrusion = 0.0
         source_grid_ground = environment.terrain_elevation(source.x, source.y)
         target_grid_ground = environment.terrain_elevation(target.x, target.y)
-        source_ground_offset = (
-            source.elevation_m - source_grid_ground
-            if source_grid_ground is not None and not source.elevation_override
-            else 0.0
-        )
-        target_ground_offset = (
-            target.elevation_m - target_grid_ground
-            if target_grid_ground is not None and not target.elevation_override
-            else 0.0
-        )
         dx = target.x - source.x
         dy = target.y - source.y
         source_z = source.antenna_z
         target_z = target.antenna_z
+        # A node may have a newer, higher-resolution ground sample than the
+        # bounded RF terrain grid. Never smear that endpoint difference across
+        # the path: doing so fabricates a sloping ridge that does not exist in
+        # either DEM. Only protect automatically grounded endpoints from being
+        # placed below a coarser grid cell. Manual and reported absolute
+        # elevations remain authoritative.
+        if source_grid_ground is not None and not source.elevation_override and not source.uses_reported_altitude:
+            source_z = max(source_z, source_grid_ground + source.antenna_height_m)
+        if target_grid_ground is not None and not target.elevation_override and not target.uses_reported_altitude:
+            target_z = max(target_z, target_grid_ground + target.antenna_height_m)
         terrain_elevation = environment.terrain_elevation
         for index in range(1, samples):
             t = index / samples
@@ -1389,10 +1389,6 @@ class PropagationModel:
             terrain_z = terrain_elevation(x, y)
             if terrain_z is None:
                 continue
-            # Exact viewport DEM samples can differ slightly from the bounded RF
-            # terrain grid. Blend that endpoint offset through the profile so an
-            # automatically grounded antenna is never placed below its own terrain.
-            terrain_z += source_ground_offset * (1.0 - t) + target_ground_offset * t
             los_z = source_z + (target_z - source_z) * t
             if terrain_z >= los_z:
                 return 0.0, f"Topography blocks line of sight at {terrain_z:.0f} m elevation"
@@ -1587,9 +1583,35 @@ class PropagationModel:
         # have reached" against the capped range too, not the full link budget.
         clear_reference = max(1.0, min(clear_range, maximum_range))
 
+        # The bounded RF terrain grid interpolates over cells far coarser than a
+        # surveyed node's own recorded elevation. Snap onto that node's reading
+        # whenever the probe lands on top of it, so the coverage sweep agrees
+        # with the direct link budget computed for that same real node.
+        left, top, right, bottom = environment.terrain_bounds()
+        cell_x = (right - left) / max(1.0, environment.terrain_columns - 1)
+        cell_y = (bottom - top) / max(1.0, environment.terrain_rows - 1)
+        snap_radius_m = max(5.0, min(cell_x, cell_y) / 2.0)
+        snap_radius_sq = snap_radius_m * snap_radius_m
+
+        def nearby_node_elevation(x: float, y: float) -> float | None:
+            best_elevation: float | None = None
+            best_distance_sq = snap_radius_sq
+            for node in compatible_receivers:
+                node_dx = node.x - x
+                node_dy = node.y - y
+                distance_sq = node_dx * node_dx + node_dy * node_dy
+                if distance_sq <= best_distance_sq:
+                    best_distance_sq = distance_sq
+                    best_elevation = node.elevation_m
+            return best_elevation
+
         def position(dx: float, dy: float, distance: float) -> None:
             probe.x = source.x + dx * distance
             probe.y = source.y + dy * distance
+            node_elevation = nearby_node_elevation(probe.x, probe.y)
+            if node_elevation is not None:
+                probe.elevation_m = node_elevation
+                return
             elevation = environment.terrain_elevation(probe.x, probe.y)
             probe.elevation_m = source.elevation_m if elevation is None else elevation
 
@@ -1606,8 +1628,26 @@ class PropagationModel:
         blocking: list[str] = []
         weakening: list[str] = []
         samples = max(8, angular_samples)
-        for index in range(samples):
-            angle = math.tau * index / samples
+        base_angles = [math.tau * index / samples for index in range(samples)]
+        # Evenly spaced rays can straddle a real node without ever landing on it
+        # (the node-elevation snap above never fires for that direction), so add
+        # its exact bearing as its own ray whenever it isn't already covered.
+        min_angle_gap = (math.tau / samples) * 0.2
+        node_angles: list[float] = []
+        for node in compatible_receivers:
+            node_dx = node.x - source.x
+            node_dy = node.y - source.y
+            node_distance = math.hypot(node_dx, node_dy)
+            if node_distance < 1.0 or node_distance > maximum_range:
+                continue
+            bearing = math.atan2(node_dy, node_dx) % math.tau
+            if all(
+                min(abs(bearing - existing), math.tau - abs(bearing - existing)) >= min_angle_gap
+                for existing in base_angles
+            ):
+                node_angles.append(bearing)
+        angles = sorted(base_angles + node_angles)
+        for angle in angles:
             dx, dy = math.cos(angle), math.sin(angle)
             probe.x = source.x + dx * maximum_range
             probe.y = source.y + dy * maximum_range

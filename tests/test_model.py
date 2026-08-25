@@ -1400,6 +1400,58 @@ class ModelTests(unittest.TestCase):
         self.assertTrue(link.compatible, link.reason)
         self.assertNotIn("Topography blocks", link.reason)
 
+    def test_higher_resolution_endpoint_does_not_create_a_synthetic_terrain_slope(self):
+        environment = Environment(
+            initial_view_width_m=1000,
+            initial_view_height_m=1000,
+            stochastic=False,
+            terrain_columns=2,
+            terrain_rows=2,
+            terrain_values=[100.0, 100.0, 100.0, 100.0],
+        )
+        source = Node(x=0, y=500, elevation_m=100.0, antenna_height_m=2.0)
+        target = Node(x=1000, y=500, elevation_m=124.0, antenna_height_m=2.0)
+        model = PropagationModel(Scenario(environment=environment, nodes=[source, target]))
+
+        terrain_loss, blocked_reason = model._terrain_effects(source, target)
+
+        self.assertEqual(terrain_loss, 0.0)
+        self.assertEqual(blocked_reason, "")
+
+    def test_beacon_coverage_sweep_snaps_to_a_real_receiver_s_own_elevation(self):
+        """The bounded RF terrain grid is far coarser than a surveyed node's own
+        elevation reading.  A ray that reaches all the way to that node's exact
+        position must judge clearance using ITS elevation, not the coarse grid
+        cell underneath it -- otherwise the coverage heatmap and the direct
+        node-to-node link disagree over the exact same spot."""
+        environment = Environment(
+            initial_view_width_m=2000,
+            initial_view_height_m=1000,
+            stochastic=False,
+            terrain_columns=3,
+            terrain_rows=2,
+            # A modest ridge sits halfway between the two nodes. Grid elevation
+            # at the receiver's own column reads 0 m -- 5 m below what the node
+            # itself recorded on placement.
+            terrain_values=[8.0, 7.0, 0.0, 8.0, 7.0, 0.0],
+        )
+        source = Node(x=0, y=500, elevation_m=8.0, antenna_height_m=2.0)
+        target = Node(x=2000, y=500, elevation_m=5.0, antenna_height_m=2.0)
+        scenario = Scenario(environment=environment, nodes=[source, target])
+        model = PropagationModel(scenario)
+
+        # Using the receiver's own (higher) elevation, the ridge is cleared.
+        terrain_loss, blocked_reason = model._terrain_effects(source, target)
+        self.assertEqual(blocked_reason, "")
+
+        # The coverage sweep, capped exactly at the receiver's own distance,
+        # must reach it rather than reporting the ridge as blocking -- which is
+        # what the coarse grid's own elevation at that spot (0 m) would do.
+        profile = model.beacon_profile(source, angular_samples=8, max_range_m=2000)
+        east_ray = min(profile.rays, key=lambda ray: abs(ray.angle))
+        self.assertEqual(east_ray.kind, "clear")
+        self.assertAlmostEqual(east_ray.reach_m, 2000.0, delta=1.0)
+
     def test_manual_below_ground_override_remains_physically_blocked(self):
         environment = Environment(
             initial_view_width_m=1000,

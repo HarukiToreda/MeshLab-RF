@@ -2252,13 +2252,6 @@ class MeshSimulatorApp:
         query_text = self.map_search_var.get().strip()
         if not query_text:
             return
-        if (self.scenario.nodes or self.scenario.obstacles) and not messagebox.askyesno(
-            "Move geographic reference?",
-            "Searching a new location reanchors the existing objects to that map. "
-            "Their relative positions are preserved, but their real-world coordinates change.",
-            parent=self.root,
-        ):
-            return
         self.map_search_button.configure(state="disabled")
         self.status_var.set(f"Searching OpenStreetMap for {query_text}…")
 
@@ -5164,6 +5157,21 @@ class MeshSimulatorApp:
         self._draw_static_coverage(c)
         self._tag_items_created_since(c, start, STATIC_COVERAGE_TAG)
 
+    @staticmethod
+    def _ray_half_widths(rays: list[BeaconRay]) -> list[tuple[float, float]]:
+        """Each ray's (left, right) half-angle to its neighbour, not an assumed
+        uniform step -- rays are no longer evenly spaced once a real node's
+        exact bearing is inserted between two evenly-spaced samples."""
+        count = len(rays)
+        widths: list[tuple[float, float]] = []
+        for index, ray in enumerate(rays):
+            previous_angle = rays[(index - 1) % count].angle
+            next_angle = rays[(index + 1) % count].angle
+            left_gap = (ray.angle - previous_angle) % math.tau
+            right_gap = (next_angle - ray.angle) % math.tau
+            widths.append((left_gap / 2.0, right_gap / 2.0))
+        return widths
+
     def _draw_segmented_coverage(
         self,
         c: tk.Canvas,
@@ -5219,14 +5227,14 @@ class MeshSimulatorApp:
             outer_points: list[tuple[float, float] | None] = []
             outer_distances: list[float] = []
             directions: list[tuple[float, float, float, float]] = []
-            half_step = math.pi / ray_count
-            for ray in profile.rays:
+            half_widths = self._ray_half_widths(profile.rays)
+            for ray, (left_half, right_half) in zip(profile.rays, half_widths):
                 reachable = [sample.distance_m for sample in ray.samples if sample.reachable]
                 outer = max(reachable) if reachable else 0.0
                 outer_distances.append(outer)
                 cosine, sine = math.cos(ray.angle), math.sin(ray.angle)
-                left_angle = ray.angle - half_step
-                right_angle = ray.angle + half_step
+                left_angle = ray.angle - left_half
+                right_angle = ray.angle + right_half
                 directions.append(
                     (
                         math.cos(left_angle),
@@ -5390,13 +5398,13 @@ class MeshSimulatorApp:
 
         weakening_ids = {obstacle.id for obstacle in weakening}
         blocking_ids = {obstacle.id for obstacle in blocking}
-        half_step = math.pi / max(1, len(profile.rays))
+        half_widths = self._ray_half_widths(profile.rays)
 
         def ray_mask(wanted_ids: set[str]) -> Image.Image:
             mask = Image.new("L", layer.size, 0)
             mask_drawing = ImageDraw.Draw(mask)
             source = point(profile.x, profile.y)
-            for ray in profile.rays:
+            for ray, (left_half, right_half) in zip(profile.rays, half_widths):
                 if not wanted_ids.intersection(ray.obstacle_ids):
                     continue
                 reachable = [sample.distance_m for sample in ray.samples if sample.reachable]
@@ -5404,12 +5412,12 @@ class MeshSimulatorApp:
                     continue
                 distance = min(profile.max_reach_m, max(reachable) + 60.0) * grow
                 left = point(
-                    profile.x + math.cos(ray.angle - half_step) * distance,
-                    profile.y + math.sin(ray.angle - half_step) * distance,
+                    profile.x + math.cos(ray.angle - left_half) * distance,
+                    profile.y + math.sin(ray.angle - left_half) * distance,
                 )
                 right = point(
-                    profile.x + math.cos(ray.angle + half_step) * distance,
-                    profile.y + math.sin(ray.angle + half_step) * distance,
+                    profile.x + math.cos(ray.angle + right_half) * distance,
+                    profile.y + math.sin(ray.angle + right_half) * distance,
                 )
                 mask_drawing.polygon((source, left, right), fill=255)
             return mask
@@ -5894,6 +5902,7 @@ class MeshSimulatorApp:
             c.create_rectangle(sx1, sy1, sx2, sy2, outline="#76dcff", width=2, dash=(5, 3), fill="#153a55", stipple="gray50")
         scale_start = len(c.find_all())
         self._draw_scale(c)
+        self._draw_center_crosshair(c)
         self._tag_items_created_since(c, scale_start, HUD_LAYER_TAG)
         static_start = len(c.find_all())
         self._draw_static_coverage(c)
@@ -7412,12 +7421,20 @@ class MeshSimulatorApp:
         nice_meters = nice_units * unit_meters
         pixels = nice_meters * scale
         x, y = 20, c.winfo_height() - 24
-        c.create_line(x, y, x + pixels, y, fill="#b9cbe0", width=2)
-        c.create_line(x, y - 4, x, y + 4, fill="#b9cbe0", width=2)
-        c.create_line(x + pixels, y - 4, x + pixels, y + 4, fill="#b9cbe0", width=2)
+        c.create_line(x, y, x + pixels, y, fill="black", width=2)
+        c.create_line(x, y - 4, x, y + 4, fill="black", width=2)
+        c.create_line(x + pixels, y - 4, x + pixels, y + 4, fill="black", width=2)
         c.create_text(
-            x + pixels / 2, y - 9, text=self.format_distance(nice_meters), fill=MUTED, font=("Segoe UI", 8)
+            x + pixels / 2, y - 9, text=self.format_distance(nice_meters), fill="black", font=("Segoe UI", 8)
         )
+
+    def _draw_center_crosshair(self, c: tk.Canvas) -> None:
+        """Mark the exact centre of the view."""
+        cx, cy = c.winfo_width() / 2.0, c.winfo_height() / 2.0
+        size = 10
+        c.create_line(cx - size, cy, cx + size, cy, fill="black", width=1)
+        c.create_line(cx, cy - size, cx, cy + size, fill="black", width=1)
+        c.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, outline="black", width=1)
 
     def _canvas_down(self, event: tk.Event) -> None:
         self.drag_start_screen = (event.x, event.y)
