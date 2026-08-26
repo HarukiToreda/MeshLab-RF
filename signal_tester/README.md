@@ -15,7 +15,7 @@ python -m platformio run -e t114-survey-mobile
 python -m platformio run -e t114-survey-base
 ```
 
-The generated UF2 files are named `heltec-t114-signal-mobile.uf2` and `heltec-t114-signal-base.uf2` inside their corresponding `.pio/build` directories. Checked-in ready-to-flash copies are in [`artifacts/t114-signal-tester`](../artifacts/t114-signal-tester); those binaries are outputs, while this directory contains the editable source.
+The generated UF2 files are named `heltec-t114-signal-mobile.uf2` and `heltec-t114-signal-base.uf2` inside their corresponding `.pio/build` directories. Checked-in ready-to-flash copies are in [`artifacts/signal-tester`](../artifacts/signal-tester); those binaries are outputs, while this directory contains the editable source.
 
 Logging is paused at boot. Tap the T114 user button to open the popup menu, tap to move its highlight between items, and hold for 500 ms to select, matching Meshtastic's screened-device button timing. A short click registers on release; a long selection activates at the threshold while the button is still held. The menu can start/stop logging, show storage use, mute/unmute the mobile buzzer, wipe logs with confirmation, restart, or enter system-off. Power-off is accepted at the threshold and then waits for button release so the same press cannot wake the board. Press the user button again to wake from system-off. Logs are retained unless `WIPE ALL LOGS` is confirmed.
 

@@ -2,7 +2,7 @@
 
 This project includes a purpose-built signal tester for two Heltec Mesh Node T114 radios. It is not Meshtastic firmware and does not contain a mesh stack, routing, Bluetooth, telemetry, a node database, or Meshtastic background traffic.
 
-The source is in [`t114_signal_tester`](../t114_signal_tester). Two builds are produced from the same code:
+The source is in [`signal_tester`](../signal_tester). Two builds are produced from the same code:
 
 - `heltec-t114-signal-mobile.uf2` sends a direct LoRa probe from each trusted, meaningfully changed GPS location, no faster than every five seconds.
 - `heltec-t114-signal-base.uf2` listens at a fixed location and immediately returns a direct LoRa reply.
@@ -20,7 +20,7 @@ The checked-in build matches MeshLab RF's current US915 LongFast default:
 - 22 dBm SX1262 output
 - private LoRa sync word `0x12`
 
-These are standalone tester packets, not Meshtastic packets. Do not transmit this build outside a region where this profile is legal. For another region, change the constants in `t114_signal_tester/include/survey_config.h` and rebuild both roles.
+These are standalone tester packets, not Meshtastic packets. Do not transmit this build outside a region where this profile is legal. For another region, change the constants in `signal_tester/include/survey_config.h` and rebuild both roles.
 
 The custom linker layout limits the application to `0x26000..0x4CFFF` and reserves `0x4D000..0xECFFF` exclusively for logs. Firmware growth cannot enter the log partition: an oversized build fails at link time. Each compact record is programmed once into erased space, avoiding a page erase for every sample. Erasure happens only when `WIPE ALL LOGS` is confirmed.
 
@@ -57,11 +57,11 @@ The separate logs are essential. A mobile timeout alone cannot distinguish an ou
 Build both images from the project root:
 
 ```powershell
-cd t114_signal_tester
+cd signal_tester
 python -m platformio run
 ```
 
-Checked-in ready-to-flash UF2 files are in `artifacts/t114-signal-tester`. Put each T114 into its UF2 bootloader, then copy the correctly labeled image to that board. Flash one mobile and one base. Rebuilding creates fresh UF2 files under `t114_signal_tester/.pio/build`; copy them into `artifacts` only when intentionally refreshing the checked-in binaries.
+Checked-in ready-to-flash UF2 files are in `artifacts/signal-tester`. Put each T114 into its UF2 bootloader, then copy the correctly labeled image to that board. Flash one mobile and one base. Rebuilding creates fresh UF2 files under `signal_tester/.pio/build`; copy them into `artifacts` only when intentionally refreshing the checked-in binaries.
 
 ## Collect useful calibration data
 

@@ -4,9 +4,11 @@ MeshLab RF is an unreleased Windows desktop tool for planning Meshtastic network
 
 Use it to explore coverage, find likely dead spots, compare node locations and heights, and understand how hop limits and node roles affect a mesh. It is a planning aid, not a replacement for an RF site survey.
 
-## Heltec T114 signal tester firmware
+## Field survey firmware
 
-The complete editable C++ firmware is in [`t114_signal_tester/`](t114_signal_tester/), not in `artifacts/`. Follow [Build and modify the Heltec T114 signal tester](BUILD_T114_FIRMWARE.md) to change its radio settings or behavior and compile the mobile and base UF2 files yourself.
+MeshLab RF's building-attenuation model is only as good as the real-world data it's calibrated against. The [`signal_tester/`](signal_tester/) firmware turns a pair of LoRa boards into a purpose-built RF survey tool: one radio walks a route with GPS, the other sits at a fixed base, and they exchange direct probes every few seconds, logging RSSI/SNR for both directions straight to onboard flash — no phone, server, or Meshtastic mesh involved. Walk a route that crosses buildings at different distances and angles, then export both radios' logs into MeshLab RF's **Survey logs** viewer and apply **Calibrate buildings** to fit the model's attenuation value to what you actually measured.
+
+It currently targets the Heltec Mesh Node T114 (GPS, display, and battery already on one board), with the project structured to add other boards later. See [Build and modify the signal tester firmware](BUILD_FIRMWARE.md).
 
 ## Run it
 

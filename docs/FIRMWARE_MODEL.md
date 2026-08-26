@@ -1,6 +1,6 @@
 # Firmware and RF model
 
-MeshLab RF's mesh simulation is informed by the Meshtastic firmware checkout at `C:\firmware`. It models behavior that affects visible packet reach and timing; it is not a full firmware emulator. The paired T114 field-survey firmware in this repository is a separate purpose-built signal tester and does not contain Meshtastic.
+MeshLab RF's mesh simulation is informed by the Meshtastic firmware checkout at `C:\firmware`. It models behavior that affects visible packet reach and timing; it is not a full firmware emulator. The paired field-survey firmware in this repository (currently built for the Heltec Mesh Node T114) is a separate purpose-built signal tester and does not contain Meshtastic.
 
 ## Firmware behavior
 
