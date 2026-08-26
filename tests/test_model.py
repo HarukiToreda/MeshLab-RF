@@ -1523,6 +1523,117 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(len(profile.rays), 8)
 
+    def test_horizon_panorama_finds_the_tallest_feature_in_each_direction(self):
+        environment = Environment(
+            initial_view_width_m=2000,
+            initial_view_height_m=2000,
+            stochastic=False,
+            terrain_columns=2,
+            terrain_rows=2,
+            terrain_values=[100.0, 100.0, 100.0, 100.0],
+        )
+        source = Node(x=1000, y=1000, elevation_m=100.0, antenna_height_m=2.0)
+        tower = Obstacle(
+            id="tower", name="Tower", kind="Building", color="#8b5e4a",
+            x1=1490, y1=990, x2=1510, y2=1010, height_m=40, base_elevation_m=100.0,
+            behavior="ATTENUATE",
+        )
+        scenario = Scenario(environment=environment, nodes=[source], obstacles=[tower])
+        model = PropagationModel(scenario)
+
+        panorama = model.horizon_panorama(source, bearing_samples=36, max_range_m=800, radial_steps=40)
+
+        self.assertEqual(len(panorama.points), 36)
+        # Bearing 90 is due east in this app's world coordinates (dx=sin, dy=-cos).
+        east_point = min(panorama.points, key=lambda point: abs(point.bearing_deg - 90))
+        self.assertEqual(east_point.kind, "Building")
+        self.assertGreater(east_point.angle_deg, 0.0)
+        # A direction with no feature at all stays a flat, open horizon.
+        west_point = min(panorama.points, key=lambda point: abs(point.bearing_deg - 270))
+        self.assertEqual(west_point.kind, "terrain")
+
+    def test_horizon_panorama_depth_layers_show_near_and_far_features_separately(self):
+        """The overall skyline envelope only shows the single tallest thing
+        per bearing, so a near building sitting in front of a far mountain
+        would vanish entirely if the mountain reads taller. Each depth layer
+        must resolve independently within its own distance zone so a narrow
+        building's footprint isn't missed just because it doesn't land on
+        one exact sample point."""
+        environment = Environment(
+            initial_view_width_m=2000, initial_view_height_m=2000, stochastic=False,
+            terrain_columns=2, terrain_rows=2, terrain_values=[100.0] * 4,
+        )
+        source = Node(x=1000, y=1000, elevation_m=100.0, antenna_height_m=2.0)
+        near_building = Obstacle(
+            id="near", name="Near", kind="Building", color="#33302b",
+            x1=1090, y1=990, x2=1110, y2=1010, height_m=20, base_elevation_m=100.0,
+            behavior="ATTENUATE",
+        )
+        far_mountain = Obstacle(
+            id="far", name="Far", kind="Mountain", color="#64748b",
+            x1=1690, y1=940, x2=1710, y2=1060, height_m=100, base_elevation_m=100.0,
+            behavior="BLOCK",
+        )
+        scenario = Scenario(environment=environment, nodes=[source], obstacles=[near_building, far_mountain])
+        model = PropagationModel(scenario)
+
+        panorama = model.horizon_panorama(source, bearing_samples=36, max_range_m=800, radial_steps=40)
+
+        self.assertEqual(len(panorama.layers), len(PropagationModel.HORIZON_LAYER_FRACTIONS))
+        east_points_by_layer = [
+            min(layer.points, key=lambda point: abs(point.bearing_deg - 90)) for layer in panorama.layers
+        ]
+        kinds_east = [point.kind for point in east_points_by_layer]
+        # The near building (90-110 m) and the far mountain (~1690-1710 m)
+        # fall in different distance zones -- some (nearer) layer must show
+        # the building and a different (farther) layer must show the
+        # mountain, resolved independently rather than one hiding the other.
+        self.assertIn("Building", kinds_east)
+        self.assertIn("Mountain", kinds_east)
+        self.assertLess(kinds_east.index("Building"), kinds_east.index("Mountain"))
+
+    def test_path_profile_reports_a_hard_block_as_incompatible(self):
+        source = Node(x=0, y=0, antenna_height_m=2.0)
+        target = Node(x=500, y=0, antenna_height_m=2.0)
+        wall = Obstacle(
+            id="wall", name="Wall", kind="Wall", color="#ef4444",
+            x1=245, y1=-50, x2=255, y2=50, height_m=30, behavior="BLOCK",
+        )
+        scenario = Scenario(nodes=[source, target], obstacles=[wall])
+        scenario.environment.stochastic = False
+        model = PropagationModel(scenario)
+
+        profile = model.path_profile(source, target)
+
+        self.assertFalse(profile.compatible)
+        self.assertIn("Wall", profile.reason)
+        self.assertEqual(len(profile.obstacles), 1)
+        self.assertEqual(profile.obstacles[0].kind, "Wall")
+
+    def test_path_profile_status_reflects_cumulative_loss_not_just_hard_blocks(self):
+        """Many ATTENUATE-only obstacles (e.g. a dense row of buildings) can
+        sum to a hopeless loss without any single one of them qualifying as a
+        hard BLOCK. The profile must not call that link 'clear' just because
+        nothing individually blocked it -- it needs the real link margin."""
+        source = Node(x=0, y=0, antenna_height_m=2.0)
+        target = Node(x=2000, y=0, antenna_height_m=2.0)
+        buildings = [
+            Obstacle(
+                id=f"b{index}", name=f"Building {index}", kind="Building", color="#33302b",
+                x1=100.0 * index, y1=-10, x2=100.0 * index + 20, y2=10,
+                height_m=12, behavior="ATTENUATE",
+            )
+            for index in range(15)
+        ]
+        scenario = Scenario(nodes=[source, target], obstacles=buildings)
+        scenario.environment.stochastic = False
+        model = PropagationModel(scenario)
+
+        profile = model.path_profile(source, target)
+
+        self.assertEqual(len(profile.obstacles), 15)
+        self.assertLess(profile.margin_db, MIN_DECODE_MARGIN_DB)
+
     def test_manual_below_ground_override_remains_physically_blocked(self):
         environment = Environment(
             initial_view_width_m=1000,

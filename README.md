@@ -24,6 +24,8 @@ The app starts with a map but no nodes. Internet access is needed for new map ti
 6. Open **Packet**, choose the source and destination, set the hop limit, and select **Send packet**.
 7. Open **Results** for delivery details, RF values, drops, and collisions.
 8. Select **Beacon** (or press **B**) and click the map to drop a beacon that continuously pulses a node’s live coverage.
+9. Select **Horizon** and click a node (uses its real installed height) or a bare point to see a 360° panorama of the terrain and obstacle skyline visible from there, including any other node that's geometrically visible.
+10. Select **Profile** and click two nodes or points to see the terrain/obstacle cross-section between them. Both Horizon and Profile open in a panel docked under the map; click a spot in either chart to locate that exact point back on the map.
 
 Use the mouse wheel to zoom, right-drag to pan, and **Fit** to frame the current nodes. The scene, properties, world, packet, radio, and results tabs remain docked beside the map.
 

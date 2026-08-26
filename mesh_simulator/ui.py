@@ -43,8 +43,12 @@ from .live_mesh import LiveMeshEngine, LiveMeshFrame, LiveMeshResult, LiveMeshTe
 from .model import (
     CORE_PORTS,
     HARDWARE_POWER_PROFILE_KEYS,
+    MIN_DECODE_MARGIN_DB,
     BeaconProfile,
+    HorizonPanorama,
+    HorizonPoint,
     LiveMeshConfig,
+    PathProfile,
     OBSTACLE_DEFAULTS,
     PRESETS,
     PRESET_DISPLAY_NAMES,
@@ -791,6 +795,30 @@ class MeshSimulatorApp:
         self.mesh_graph_show_utilization = tk.BooleanVar(value=True)
         self.mesh_graph_refresh_after: str | None = None
         self.mesh_graph_last_refresh = 0.0
+        self._bottom_dock_active: str | None = None
+        self.horizon_canvas: tk.Canvas | None = None
+        self.horizon_panorama: HorizonPanorama | None = None
+        self.horizon_source_name = ""
+        self.horizon_source_xy: tuple[float, float] | None = None
+        self.map_picked_xy: tuple[float, float] | None = None
+        self.map_picked_label: str | None = None
+        self.horizon_show_buildings = tk.BooleanVar(value=True)
+        self.horizon_show_forests = tk.BooleanVar(value=True)
+        self.horizon_info_var = tk.StringVar(value="")
+        self.horizon_redraw_after: str | None = None
+        self._horizon_layout: tuple[float, float, float, float, float, float] | None = None
+        self.horizon_view_center = 0.0
+        self.horizon_view_span = self.HORIZON_DEFAULT_FOV_DEG
+        self._horizon_drag_start: tuple[int, int, float] | None = None
+        self._horizon_dragged = False
+        self.profile_point_a: Node | tuple[float, float] | None = None
+        self.path_profile_canvas: tk.Canvas | None = None
+        self.path_profile_data: PathProfile | None = None
+        self.path_profile_names = ("", "")
+        self.path_profile_endpoints: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self.path_profile_info_var = tk.StringVar(value="")
+        self.path_profile_redraw_after: str | None = None
+        self._path_profile_layout: tuple[float, float, float, float, float, float] | None = None
         self.results_populated = True
         self.show_drops = tk.BooleanVar(value=True)
         self.map_visible = tk.BooleanVar(value=True)
@@ -1147,6 +1175,8 @@ class MeshSimulatorApp:
             ("select", "↖  Select"),
             ("node", "●  Node"),
             ("beacon", "📡  Beacon"),
+            ("horizon", "⛰  Horizon"),
+            ("profile", "↔  Profile"),
         ]
         for key, label in tools:
             button = ttk.Button(bar, text=label, style="Tool.TButton", command=lambda k=key: self.set_tool(k))
@@ -1232,6 +1262,7 @@ class MeshSimulatorApp:
         self.sidebar_tabs.add(self.results_panel, text="Results")
         self._build_scene_panel()
         self._build_live_panel()
+        self._build_bottom_dock()
         self._build_canvas()
         self._build_results(self.results_panel)
 
@@ -1246,6 +1277,47 @@ class MeshSimulatorApp:
             font=("Segoe UI", 8),
         )
         status.pack(fill="x")
+
+    def _build_bottom_dock(self) -> None:
+        """The shared bottom-docked panel Horizon and Profile both render
+        into -- one at a time, replacing each other -- instead of each
+        popping its own floating Toplevel window. Built once, hidden until
+        a tool has something to show. No separate title bar: each tool's own
+        top row carries a close button instead, so the dock spends no extra
+        height on a row that just repeats what's already on the toolbar."""
+        self.bottom_dock = ttk.Frame(self.canvas_panel, style="Toolbar.TFrame", height=340)
+        self.bottom_dock.pack_propagate(False)
+        self.bottom_dock_body = ttk.Frame(self.bottom_dock, style="Root.TFrame")
+        self.bottom_dock_body.pack(fill="both", expand=True)
+
+    def _show_bottom_dock(self, tool: str) -> ttk.Frame:
+        """Claim the dock for `tool`, clearing out whatever the other tool
+        left behind first. Returns the empty body frame to build into."""
+        previous = self._bottom_dock_active
+        if previous == "horizon" and tool != "horizon":
+            self._reset_horizon_state()
+        elif previous == "profile" and tool != "profile":
+            self._reset_path_profile_state()
+        for child in self.bottom_dock_body.winfo_children():
+            child.destroy()
+        self._bottom_dock_active = tool
+        if not self.bottom_dock.winfo_ismapped():
+            self.bottom_dock.pack(side="bottom", fill="x")
+        return self.bottom_dock_body
+
+    def _hide_bottom_dock(self) -> None:
+        if self.bottom_dock.winfo_ismapped():
+            self.bottom_dock.pack_forget()
+        self._bottom_dock_active = None
+
+    def _close_bottom_dock(self) -> None:
+        active = self._bottom_dock_active
+        if active == "horizon":
+            self._close_horizon_window()
+        elif active == "profile":
+            self._close_path_profile_window()
+        else:
+            self._hide_bottom_dock()
 
     def show_sidebar_tab(self, name: str) -> None:
         tabs = {"Scene": 0, "Properties": 1, "World": 2, "Packet": 3, "Live Radio": 4, "Results": 5}
@@ -1438,6 +1510,1103 @@ class MeshSimulatorApp:
             + (f" · {len(weak):,} weak/blocked nearby links" if self.mesh_graph_show_weak_links.get() else "")
             + (f" · {len(self.scenario.learned_routes):,} learned DM routes" if self.scenario.learned_routes else "")
         )
+
+    def show_horizon_panorama(self, point: Node | tuple[float, float]) -> None:
+        """Compute and open the 360° terrain/obstacle skyline from one clicked
+        point -- an existing node (its own real antenna height, not the
+        ground) if that's what was clicked, otherwise a throwaway
+        auto-grounded point. A geometric horizon sweep (no radio math) stays
+        fast even over a large, obstacle-heavy scene, so this runs
+        synchronously."""
+        node, label = self._resolve_map_point(point)
+        self.horizon_source_name = label
+        self.horizon_source_xy = (node.x, node.y)
+        model = PropagationModel(self.scenario)
+        self.horizon_panorama = model.horizon_panorama(node, max_range_m=self._coverage_range_cap())
+        self.horizon_view_center = 0.0
+        self.horizon_view_span = self.HORIZON_DEFAULT_FOV_DEG
+        self.status_var.set(f"Horizon panorama ready for {label}")
+        self._open_horizon_window()
+        self.schedule_render()
+
+    def _open_horizon_window(self) -> None:
+        if self._bottom_dock_active == "horizon" and self.horizon_canvas is not None:
+            self._refresh_horizon_panorama()
+            return
+
+        window = self._show_bottom_dock("horizon")
+
+        controls = ttk.Frame(window, style="Toolbar.TFrame")
+        controls.pack(fill="x")
+        ttk.Button(
+            controls, text="◀", style="Tool.TButton", width=3,
+            command=lambda: self._pan_horizon(-1),
+        ).pack(side="left", padx=(8, 2), pady=6)
+        ttk.Button(
+            controls, text="▶", style="Tool.TButton", width=3,
+            command=lambda: self._pan_horizon(1),
+        ).pack(side="left", padx=2, pady=6)
+        ttk.Button(
+            controls, text="Zoom in", style="Tool.TButton", command=lambda: self._zoom_horizon(0.5)
+        ).pack(side="left", padx=(10, 2), pady=6)
+        ttk.Button(
+            controls, text="Zoom out", style="Tool.TButton", command=lambda: self._zoom_horizon(2.0)
+        ).pack(side="left", padx=2, pady=6)
+        ttk.Button(
+            controls, text="Full 360°", style="Tool.TButton", command=self._reset_horizon_view
+        ).pack(side="left", padx=2, pady=6)
+        ttk.Checkbutton(
+            controls, text="Buildings", variable=self.horizon_show_buildings,
+            command=self._refresh_horizon_panorama,
+        ).pack(side="left", padx=(14, 2), pady=6)
+        ttk.Checkbutton(
+            controls, text="Forests", variable=self.horizon_show_forests,
+            command=self._refresh_horizon_panorama,
+        ).pack(side="left", padx=2, pady=6)
+        ttk.Button(
+            controls, text="✕", style="Tool.TButton", width=3, command=self._close_bottom_dock,
+        ).pack(side="right", padx=(2, 8), pady=6)
+        ttk.Label(
+            controls,
+            text="Drag to spin, scroll to zoom, click a feature to locate it on the map.",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=12)
+
+        ttk.Label(
+            window,
+            textvariable=self.horizon_info_var,
+            style="Muted.TLabel",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(4, 4))
+
+        self.horizon_canvas = tk.Canvas(window, bg=MAPLESS_BACKGROUND, highlightthickness=0, borderwidth=0)
+        self.horizon_canvas.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.horizon_canvas.bind("<Configure>", self._schedule_horizon_redraw)
+        self.horizon_canvas.bind("<Motion>", self._horizon_canvas_motion)
+        self.horizon_canvas.bind("<ButtonPress-1>", self._horizon_drag_start_event)
+        self.horizon_canvas.bind("<B1-Motion>", self._horizon_drag_motion)
+        self.horizon_canvas.bind("<ButtonRelease-1>", self._horizon_click_release)
+        self.horizon_canvas.bind("<MouseWheel>", self._horizon_mousewheel)
+        self.horizon_canvas.configure(cursor="fleur")
+
+        ttk.Label(
+            window,
+            text=(
+                "Terrain shaded by distance, obstacles coloured by kind. Red markers show bearings "
+                "where something blocks a level shot nearby."
+            ),
+            style="Muted.TLabel",
+            anchor="w",
+            wraplength=620,
+        ).pack(fill="x", padx=12, pady=(0, 8))
+        self._refresh_horizon_panorama()
+
+    def _reset_horizon_state(self) -> None:
+        if self.horizon_redraw_after is not None:
+            try:
+                self.root.after_cancel(self.horizon_redraw_after)
+            except tk.TclError:
+                pass
+            self.horizon_redraw_after = None
+        self.horizon_canvas = None
+        self.horizon_source_xy = None
+        self.map_picked_xy = None
+        self.map_picked_label = None
+        self.schedule_render()
+
+    def _close_horizon_window(self) -> None:
+        self._reset_horizon_state()
+        if self._bottom_dock_active == "horizon":
+            self._hide_bottom_dock()
+
+    def _schedule_horizon_redraw(self, _event: tk.Event | None = None) -> None:
+        if self.horizon_redraw_after is not None:
+            try:
+                self.root.after_cancel(self.horizon_redraw_after)
+            except tk.TclError:
+                pass
+        self.horizon_redraw_after = self.root.after(80, self._refresh_horizon_panorama)
+
+    def _pan_horizon(self, direction: int) -> None:
+        self.horizon_view_center = (self.horizon_view_center + direction * self.horizon_view_span * 0.6) % 360.0
+        self._refresh_horizon_panorama()
+
+    def _zoom_horizon(self, factor: float) -> None:
+        self.horizon_view_span = max(20.0, min(360.0, self.horizon_view_span * factor))
+        self._refresh_horizon_panorama()
+
+    def _reset_horizon_view(self) -> None:
+        self.horizon_view_center = 0.0
+        self.horizon_view_span = self.HORIZON_DEFAULT_FOV_DEG
+        self._refresh_horizon_panorama()
+
+    def _horizon_drag_start_event(self, event: tk.Event) -> None:
+        self._horizon_drag_start = (event.x, event.y, self.horizon_view_center)
+        self._horizon_dragged = False
+
+    def _horizon_drag_motion(self, event: tk.Event) -> None:
+        if self._horizon_drag_start is None:
+            return
+        layout = self._horizon_layout
+        if layout is None:
+            return
+        plot_left, plot_right, *_rest = layout
+        plot_width = max(1.0, plot_right - plot_left)
+        start_x, start_y, start_center = self._horizon_drag_start
+        if abs(event.x - start_x) > 3 or abs(event.y - start_y) > 3:
+            self._horizon_dragged = True
+        # Dragging right reveals bearings that were to the left of centre.
+        delta_bearing = (event.x - start_x) / plot_width * self.horizon_view_span
+        self.horizon_view_center = (start_center - delta_bearing) % 360.0
+        self._refresh_horizon_panorama()
+
+    def _horizon_mousewheel(self, event: tk.Event) -> None:
+        self._zoom_horizon(0.85 if event.delta > 0 else 1 / 0.85)
+
+    def _horizon_click_release(self, event: tk.Event) -> None:
+        dragged = self._horizon_dragged
+        self._horizon_drag_start = None
+        self._horizon_dragged = False
+        if dragged:
+            return
+        self._pick_horizon_point(event.x, event.y)
+
+    def _refresh_horizon_panorama(self) -> None:
+        self.horizon_redraw_after = None
+        canvas = self.horizon_canvas
+        panorama = self.horizon_panorama
+        if canvas is None or panorama is None or not canvas.winfo_exists():
+            return
+        canvas.delete("all")
+        width, height = max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
+        self._draw_horizon_panorama(canvas, width, height, panorama)
+        self.horizon_info_var.set(f"From {self.horizon_source_name}")
+        # Keep the map's direction cone in sync with pans/zooms of this view.
+        self.schedule_render()
+
+    @staticmethod
+    def _draw_horizon_curve(
+        canvas: tk.Canvas,
+        visible: list[tuple[float, "HorizonPoint"]],
+        point_xy: Callable[[float, float], tuple[float, float]],
+        color_fn: Callable[["HorizonPoint"], str],
+        width_fn: Callable[["HorizonPoint"], float],
+        dash: tuple[int, int] | None = None,
+    ) -> None:
+        """Draw one polyline per contiguous same-colour/width run.
+
+        Real terrain is jagged, not flowing -- spline-smoothing the sampled
+        points erased the actual relief detail (small ridges, individual
+        rooflines) instead of preserving it, which read as artificially flat.
+        One continuous unsmoothed polyline per run still avoids the seams
+        many separate two-point segments left at run boundaries.
+        """
+        if len(visible) < 2:
+            return
+        runs: list[tuple[str, float, list[float]]] = []
+        for bearing, point in visible:
+            color, width = color_fn(point), width_fn(point)
+            coords = list(point_xy(bearing, point.angle_deg))
+            if runs and runs[-1][0] == color and runs[-1][1] == width:
+                runs[-1][2].extend(coords)
+            else:
+                if runs:
+                    coords = runs[-1][2][-2:] + coords
+                runs.append((color, width, coords))
+        for color, width, coords in runs:
+            if len(coords) >= 4:
+                if dash:
+                    canvas.create_line(*coords, fill=color, width=width, dash=dash)
+                else:
+                    canvas.create_line(*coords, fill=color, width=width, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+
+    def _draw_horizon_natural_run(
+        self,
+        canvas: tk.Canvas,
+        top_pts: list[tuple[float, float]],
+        ground_pts: list[tuple[float, float]],
+        color: str,
+    ) -> None:
+        """A mountain, body of water, or other non-boxy/non-canopy feature:
+        one coherent 3D block following its own real (organically sloped)
+        silhouette -- a lit roofline band and one shadowed trailing edge,
+        not a flat cutout. Shading is applied once per run, not once per
+        sample, so the block reads as one solid shape and the only strong
+        edges are real boundaries -- where this run starts and ends -- not
+        sampling artifacts partway through it."""
+        fill_poly: list[float] = []
+        for x, y in top_pts:
+            fill_poly.extend((x, y))
+        for x, y in reversed(ground_pts):
+            fill_poly.extend((x, y))
+        canvas.create_polygon(*fill_poly, fill=color, outline="")
+
+        cap = 4.0
+        cap_poly: list[float] = []
+        for x, y in top_pts:
+            cap_poly.extend((x, y))
+        for x, y in reversed(top_pts):
+            cap_poly.extend((x, y + cap))
+        canvas.create_polygon(*cap_poly, fill=self._lighten(color), outline="")
+
+        last_x, last_top_y = top_pts[-1]
+        last_ground_y = ground_pts[-1][1]
+        prev_x = top_pts[-2][0] if len(top_pts) >= 2 else last_x - 6.0
+        side = min(4.0, max(0.0, last_x - prev_x) * 0.5)
+        if side > 0:
+            inset_x = last_x - side
+            canvas.create_polygon(
+                inset_x, last_top_y, last_x, last_top_y, last_x, last_ground_y, inset_x, last_ground_y,
+                fill=self._darken(color), outline="",
+            )
+
+        canvas.create_polygon(*fill_poly, fill="", outline=self._darken(color, 45), width=1)
+
+    @staticmethod
+    def _interp_y(points: list[tuple[float, float]], x: float) -> float:
+        """Linear-interpolate the y of a sorted-by-x point list at x, so a
+        block's edges can land at chunk boundaries that fall between
+        actual sampled points instead of only at sample positions."""
+        if not points:
+            return 0.0
+        if x <= points[0][0]:
+            return points[0][1]
+        if x >= points[-1][0]:
+            return points[-1][1]
+        for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            if x0 <= x <= x1:
+                if x1 == x0:
+                    return y0
+                t = (x - x0) / (x1 - x0)
+                return y0 + (y1 - y0) * t
+        return points[-1][1]
+
+    def _draw_horizon_flat_block(
+        self,
+        canvas: tk.Canvas,
+        x1: float, x2: float,
+        roof_y: float,
+        ground_y1: float, ground_y2: float,
+        color: str,
+    ) -> None:
+        """One real rectangular block, seen from the side, the way one face
+        of a cuboid actually looks: a flat roofline, a lit cap catching the
+        light, and a single shadowed edge -- no internal grid or division
+        that could read as more than one structure."""
+        if x2 - x1 < 0.5:
+            return
+        canvas.create_polygon(x1, roof_y, x2, roof_y, x2, ground_y2, x1, ground_y1, fill=color, outline="")
+        avg_height = max(1.0, ((ground_y1 - roof_y) + (ground_y2 - roof_y)) / 2.0)
+        cap = min(4.0, avg_height * 0.25)
+        if cap > 0:
+            canvas.create_rectangle(x1, roof_y, x2, roof_y + cap, fill=self._lighten(color), outline="")
+        side = min(8.0, (x2 - x1) * 0.25)
+        if side > 0:
+            canvas.create_polygon(
+                x2 - side, roof_y, x2, roof_y, x2, ground_y2, x2 - side, ground_y2,
+                fill=self._darken(color), outline="",
+            )
+        canvas.create_polygon(
+            x1, roof_y, x2, roof_y, x2, ground_y2, x1, ground_y1,
+            fill="", outline=self._darken(color, 55), width=1,
+        )
+
+    def _draw_horizon_block_run(
+        self,
+        canvas: tk.Canvas,
+        top_pts: list[tuple[float, float]],
+        ground_pts: list[tuple[float, float]],
+        color: str,
+    ) -> None:
+        """Buildings/walls: the whole run is ONE real building drawn as ONE
+        rectangular block -- a flat roofline at the structure's actual peak
+        height, spanning its full real width -- never chopped into internal
+        chunks, which read as several separate buildings instead of one.
+        A hairline gap is trimmed off each end so that two real, distinct
+        buildings standing right next to each other (a different source
+        object, even with the same colour) still show a sliver of the
+        ground between them instead of fusing into one solid mass."""
+        x0, x1 = top_pts[0][0], top_pts[-1][0]
+        gap = 1.0
+        if x1 - x0 > gap * 2:
+            x0 += gap * 0.5
+            x1 -= gap * 0.5
+        roof_y = min(y for x, y in top_pts if x0 - 0.5 <= x <= x1 + 0.5) if x1 > x0 else min(y for _x, y in top_pts)
+        ground_y1 = self._interp_y(ground_pts, x0)
+        ground_y2 = self._interp_y(ground_pts, x1)
+        self._draw_horizon_flat_block(canvas, x0, x1, roof_y, ground_y1, ground_y2, color)
+
+    def _draw_horizon_forest_run(
+        self,
+        canvas: tk.Canvas,
+        top_pts: list[tuple[float, float]],
+        ground_pts: list[tuple[float, float]],
+        color: str,
+    ) -> None:
+        """Forest: one dense row of trees, every one rooted at the real
+        ground line, each sized to reach up toward the real recorded
+        canopy height at its own spot -- tall trees where the canopy is
+        tall, short ones where it's short. Height varies; the base never
+        leaves the ground, so nothing floats."""
+        x0, x1 = top_pts[0][0], top_pts[-1][0]
+        span = x1 - x0
+        if span <= 0.5:
+            return
+        tree_w = 11.0
+        columns = min(90, max(1, round(span / tree_w)))
+        col_w = span / columns
+        for col in range(columns):
+            cx = x0 + col_w * (col + 0.5)
+            top_y = self._interp_y(top_pts, cx)
+            ground_y = self._interp_y(ground_pts, cx)
+            available = max(6.0, ground_y - top_y)
+            radius = max(3.0, min(10.0, available / 2.3, col_w * 0.75))
+            radius *= 0.82 if col % 3 == 1 else 1.0
+            self._draw_tree_icon(canvas, cx, ground_y, radius, color)
+
+    @staticmethod
+    def _horizon_layer_color(fraction: float) -> str:
+        """Near-to-far depth tint: light teal up close, indigo at range --
+        purely for plain terrain; obstacle segments keep their own kind colour."""
+        near, far = (0x8a, 0xe0, 0xc9), (0x33, 0x33, 0x8a)
+        r = round(near[0] + (far[0] - near[0]) * fraction)
+        g = round(near[1] + (far[1] - near[1]) * fraction)
+        b = round(near[2] + (far[2] - near[2]) * fraction)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    @staticmethod
+    def _visible_horizon_points(
+        points: list[HorizonPoint], low: float, high: float
+    ) -> list[tuple[float, HorizonPoint]]:
+        """(effective_bearing, point) pairs unwrapped and sorted for the
+        current [low, high) view window, including a little slack past each
+        edge so segments crossing the boundary still draw correctly."""
+        if not points:
+            return []
+        step = 360.0 / len(points)
+        slack = step * 1.5
+        result: list[tuple[float, HorizonPoint]] = []
+        for point in points:
+            k_start = math.floor((low - slack - point.bearing_deg) / 360.0)
+            k_end = math.ceil((high + slack - point.bearing_deg) / 360.0)
+            for k in range(k_start, k_end + 1):
+                effective = point.bearing_deg + 360.0 * k
+                if low - slack <= effective <= high + slack:
+                    result.append((effective, point))
+        result.sort(key=lambda item: item[0])
+        return result
+
+    def _apply_horizon_kind_filter(
+        self,
+        visible: list[tuple[float, HorizonPoint]],
+        show_buildings: bool,
+        show_forests: bool,
+    ) -> list[tuple[float, HorizonPoint]]:
+        """A hidden Building/Wall or Forest doesn't just disappear -- it
+        reverts to the plain terrain silhouette sitting under it (using its
+        own ground_angle_deg), the same skyline you'd see if it weren't
+        there, rather than leaving a hole or a still-coloured outline."""
+        if show_buildings and show_forests:
+            return visible
+        result: list[tuple[float, HorizonPoint]] = []
+        for bearing, point in visible:
+            hidden = (point.kind in ("Building", "Wall") and not show_buildings) or (
+                point.kind == "Forest" and not show_forests
+            )
+            if hidden:
+                result.append((
+                    bearing,
+                    HorizonPoint(
+                        point.bearing_deg, point.ground_angle_deg, point.distance_m,
+                        "terrain", self.HORIZON_SILHOUETTE_COLOR, point.ground_angle_deg, None,
+                    ),
+                ))
+            else:
+                result.append((bearing, point))
+        return result
+
+    def _draw_horizon_panorama(
+        self, canvas: tk.Canvas, width: int, height: int, panorama: HorizonPanorama
+    ) -> None:
+        margin_left, margin_right = 46, 16
+        margin_top, margin_bottom = 40, 34
+        plot_left, plot_right = margin_left, width - margin_right
+        plot_top, plot_bottom = margin_top, height - margin_bottom
+        plot_width = max(1.0, plot_right - plot_left)
+        plot_height = max(1.0, plot_bottom - plot_top)
+
+        span = max(20.0, min(360.0, self.horizon_view_span))
+        low, high = self.horizon_view_center - span / 2.0, self.horizon_view_center + span / 2.0
+
+        # The vertical range has to fit everything that actually gets drawn --
+        # the envelope alone isn't enough, since a nearer depth layer can dip
+        # well below it (a valley, low ground between here and the ridge that
+        # forms the skyline) and would otherwise be clipped off the bottom of
+        # the chart instead of shown.
+        angles = [point.angle_deg for point in panorama.points]
+        for layer in panorama.layers:
+            angles.extend(point.angle_deg for point in layer.points)
+        angle_min = min(angles + [0.0])
+        angle_max = max(angles + [0.0])
+        angle_span = max(4.0, (angle_max - angle_min) * 1.2)
+        angle_center = (angle_max + angle_min) / 2.0
+        angle_min, angle_max = angle_center - angle_span / 2.0, angle_center + angle_span / 2.0
+
+        def point_xy(effective_bearing: float, angle: float) -> tuple[float, float]:
+            px = plot_left + (effective_bearing - low) / (high - low) * plot_width
+            py = plot_bottom - (angle - angle_min) / (angle_max - angle_min) * plot_height
+            return px, py
+
+        self._horizon_layout = (plot_left, plot_right, plot_top, plot_bottom, angle_min, angle_max)
+
+        show_buildings = self.horizon_show_buildings.get()
+        show_forests = self.horizon_show_forests.get()
+        visible_envelope = self._apply_horizon_kind_filter(
+            self._visible_horizon_points(panorama.points, low, high), show_buildings, show_forests,
+        )
+
+        # Depth layers (farthest first, so nearer layers draw on top and
+        # correctly occlude them): each is its own real, continuously varying
+        # filled silhouette -- no shared flat baseline standing in for the
+        # actual ground anywhere. A building inside any layer still rises
+        # only from that layer's own real ground at that bearing, never a
+        # bar dropping straight to the chart floor.
+        layer_count = max(1, len(panorama.layers))
+        # Collected here as every run is drawn, then combined with the
+        # envelope peaks below -- a building can be clearly visible in its
+        # own depth layer without ever winning the overall envelope (a
+        # farther mountain at the same bearing can out-angle it), and it
+        # still deserves a height label.
+        run_peaks: list[tuple[float, HorizonPoint]] = []
+        for layer_index, layer in enumerate(reversed(panorama.layers)):
+            depth_fraction = 1.0 - layer_index / max(1, layer_count - 1)
+            depth_color = self._horizon_layer_color(depth_fraction)
+            visible = self._apply_horizon_kind_filter(
+                self._visible_horizon_points(layer.points, low, high), show_buildings, show_forests,
+            )
+            if len(visible) < 2:
+                continue
+            ground_polygon: list[float] = []
+            for bearing, point in visible:
+                ground_polygon.extend(point_xy(bearing, point.ground_angle_deg))
+            layer_first_x, _ = point_xy(visible[0][0], angle_min)
+            layer_last_x, _ = point_xy(visible[-1][0], angle_min)
+            canvas.create_polygon(
+                layer_first_x, plot_bottom, *ground_polygon, layer_last_x, plot_bottom,
+                fill=depth_color, outline=self._darken(depth_color, 25), width=1,
+            )
+            # Group consecutive same-colour, non-terrain samples into one
+            # run per building/mountain/forest before shading -- shading
+            # every tiny bearing-sample segment individually turned each
+            # building into a strobe of near-identical light/dark slices,
+            # which drowned out the real colour-boundary between one
+            # building and the next instead of clarifying it.
+            visible_count = len(visible)
+            index = 0
+            while index < visible_count:
+                point_i = visible[index][1]
+                if point_i.kind == "terrain":
+                    index += 1
+                    continue
+                run_end = index
+                while (
+                    run_end + 1 < visible_count
+                    and visible[run_end + 1][1].kind == point_i.kind
+                    and visible[run_end + 1][1].color == point_i.color
+                    and visible[run_end + 1][1].source_id == point_i.source_id
+                ):
+                    run_end += 1
+                if run_end + 1 >= visible_count:
+                    break
+                run_indices = range(index, run_end + 2)
+                run_points = [visible[k] for k in run_indices]
+                top_pts = [point_xy(b, p.angle_deg) for b, p in run_points]
+                ground_pts = [point_xy(b, p.ground_angle_deg) for b, p in run_points]
+                if point_i.kind in ("Building", "Wall"):
+                    self._draw_horizon_block_run(canvas, top_pts, ground_pts, point_i.color)
+                elif point_i.kind == "Forest":
+                    self._draw_horizon_forest_run(canvas, top_pts, ground_pts, point_i.color)
+                else:
+                    self._draw_horizon_natural_run(canvas, top_pts, ground_pts, point_i.color)
+                run_peaks.append(max(run_points[:-1], key=lambda item: item[1].angle_deg))
+                index = run_end + 1
+
+        # Overall skyline outline on top: the true tallest-per-bearing
+        # boundary against the sky, in each point's own colour (terrain
+        # stays one uniform tone -- its jagged shape alone reads as terrain;
+        # a building/forest/mountain keeps its own colour so it doesn't read
+        # as just another bump). The layers above already provide every
+        # filled shape, so this is a stroke only, not a second fill.
+        self._draw_horizon_curve(
+            canvas, visible_envelope, point_xy,
+            lambda point: point.color if point.kind != "terrain" else self.HORIZON_SILHOUETTE_COLOR,
+            lambda point: 2.5 if point.kind != "terrain" else 2,
+        )
+
+        # Height markers: label the most prominent peaks with how far above
+        # eye level they rise, so "how tall is that" has a real answer.
+        # Every drawn run contributes its own peak (run_peaks, gathered
+        # above) alongside the overall envelope's local maxima -- a
+        # building can be clearly visible in a nearer depth layer without
+        # ever winning the envelope (a farther mountain at the same
+        # bearing can out-angle it) and still needs a label of its own.
+        peaks: list[tuple[float, HorizonPoint]] = list(run_peaks)
+        for index in range(1, len(visible_envelope) - 1):
+            _prev_bearing, prev_point = visible_envelope[index - 1]
+            bearing, point = visible_envelope[index]
+            _next_bearing, next_point = visible_envelope[index + 1]
+            if point.angle_deg > 1.0 and point.angle_deg >= prev_point.angle_deg and point.angle_deg >= next_point.angle_deg:
+                peaks.append((bearing, point))
+        peaks.sort(key=lambda item: item[1].angle_deg, reverse=True)
+        labeled_bearings: list[float] = []
+        for bearing, point in peaks:
+            if len(labeled_bearings) >= 10:
+                break
+            if any(abs(bearing - existing) < span * 0.06 for existing in labeled_bearings):
+                continue
+            labeled_bearings.append(bearing)
+            height_above_eye = point.distance_m * math.tan(math.radians(point.angle_deg))
+            label_x, label_y = point_xy(bearing, point.angle_deg)
+            canvas.create_text(
+                label_x, label_y - 8,
+                text=f"+{self.format_distance(height_above_eye)}",
+                fill="black", font=("Segoe UI", 8, "bold"), anchor="s",
+            )
+
+        # Other mesh nodes that are actually visible from here -- geometry
+        # only, not radio budget -- so "is that node visible from this
+        # point" has a direct answer right on the chart, not just a link
+        # check buried in the simulation results.
+        for marker in panorama.visible_nodes:
+            marker_bearing = None
+            for candidate in (marker.bearing_deg, marker.bearing_deg + 360.0, marker.bearing_deg - 360.0):
+                if low - 1.0 <= candidate <= high + 1.0:
+                    marker_bearing = candidate
+                    break
+            if marker_bearing is None:
+                continue
+            mx, my = point_xy(marker_bearing, marker.angle_deg)
+            canvas.create_polygon(
+                mx, my - 9, mx - 6, my + 4, mx + 6, my + 4,
+                fill="#76dcff", outline=self._darken("#76dcff", 35), width=1,
+            )
+            canvas.create_text(
+                mx, my - 12, text=marker.name,
+                fill="black", font=("Segoe UI Semibold", 8, "bold"), anchor="s",
+            )
+
+        # Eye-level reference line, with markers where something NEARBY
+        # crosses it -- a distant peak is already obviously above the line
+        # from its silhouette alone; the marker's job is flagging a close
+        # obstruction that isn't otherwise obvious, so it's gated on
+        # distance, not just height.
+        _zero_x1, zero_y = point_xy(low, 0.0)
+        canvas.create_line(plot_left, zero_y, plot_right, zero_y, fill="#c026d3", width=2)
+        near_threshold_m = panorama.max_range_m * 0.25
+        for bearing, point in visible_envelope:
+            if point.angle_deg <= 0.0 or point.distance_m > near_threshold_m:
+                continue
+            marker_x, _marker_y = point_xy(bearing, 0.0)
+            canvas.create_polygon(
+                marker_x - 5, zero_y - 9, marker_x + 5, zero_y - 9, marker_x, zero_y - 1,
+                fill="#ef4444", outline="",
+            )
+
+        # Compass labels, only the ones currently in view. A label exactly
+        # opposite the view centre (e.g. S when centred on N at full 360°
+        # span) sits at both edges at once, so check every wrapped position
+        # that could fall in range, not just the nearest one.
+        for base_bearing, label in ((0.0, "N"), (90.0, "E"), (180.0, "S"), (270.0, "W")):
+            k_center = round((self.horizon_view_center - base_bearing) / 360.0)
+            for k in (k_center - 1, k_center, k_center + 1):
+                effective = base_bearing + 360.0 * k
+                if not (low <= effective <= high):
+                    continue
+                label_x, _label_y = point_xy(effective, angle_max)
+                canvas.create_text(label_x, plot_top - 10, text=label, fill="black", font=("Segoe UI Semibold", 10))
+                canvas.create_line(label_x, plot_top, label_x, plot_bottom, fill="#d0d0d0", width=1)
+
+        # Elevation-angle axis.
+        for tick in (angle_min, angle_center, angle_max):
+            _tick_x, tick_y = point_xy(low, tick)
+            canvas.create_line(plot_left, tick_y, plot_right, tick_y, fill="#e2e2e2", width=1)
+            canvas.create_text(
+                plot_left - 6, tick_y, text=f"{tick:+.0f}°", fill="black", anchor="e", font=("Segoe UI", 8)
+            )
+
+        exaggeration = (plot_height / (angle_max - angle_min)) / max(1e-6, plot_width / span)
+        canvas.create_text(
+            plot_left,
+            height - 14,
+            text=f"(vertical scale exaggerated {exaggeration:.1f}× · {span:.0f}° in view)",
+            fill="black",
+            anchor="w",
+            font=("Segoe UI", 8),
+        )
+        canvas.create_text(
+            plot_right,
+            height - 14,
+            text=f"max range {self.format_distance(panorama.max_range_m)}",
+            fill="black",
+            anchor="e",
+            font=("Segoe UI", 8),
+        )
+
+        # Depth-layer key: the dashed near->far colour ramp is the only
+        # colour coding left (the silhouette itself is one uniform tone),
+        # so it's what needs explaining here.
+        legend_x = plot_right
+        legend_y = plot_top - 27
+        for label, color in (("near", self._horizon_layer_color(0.0)), ("far", self._horizon_layer_color(1.0))):
+            canvas.create_text(legend_x, legend_y, text=label, fill="black", anchor="e", font=("Segoe UI", 8))
+            width_estimate = 10 + len(label) * 5.5
+            canvas.create_line(
+                legend_x - width_estimate - 12, legend_y, legend_x - width_estimate - 2, legend_y,
+                fill=color, width=1, dash=(2, 3),
+            )
+            legend_x -= width_estimate + 16
+
+        # Kind key: shape (flat-roofed blocks for buildings, scalloped
+        # canopy bumps for forest, sloped natural silhouette for everything
+        # else) is what makes a feature recognisable at a glance now, but
+        # naming the colour-to-kind mapping still saves a guess.
+        kind_colors: dict[str, str] = {}
+        for point in panorama.points:
+            if point.kind != "terrain" and point.kind not in kind_colors:
+                kind_colors[point.kind] = point.color
+        for layer in panorama.layers:
+            for point in layer.points:
+                if point.kind != "terrain" and point.kind not in kind_colors:
+                    kind_colors[point.kind] = point.color
+        if kind_colors:
+            kind_legend_x = plot_right
+            kind_legend_y = plot_top - 12
+            for kind in reversed(list(kind_colors.keys())):
+                color = kind_colors[kind]
+                canvas.create_text(kind_legend_x, kind_legend_y, text=kind, fill="black", anchor="e", font=("Segoe UI", 8))
+                width_estimate = 10 + len(kind) * 5.5
+                canvas.create_rectangle(
+                    kind_legend_x - width_estimate - 12, kind_legend_y - 5,
+                    kind_legend_x - width_estimate - 2, kind_legend_y + 5,
+                    fill=color, outline=self._darken(color, 40),
+                )
+                kind_legend_x -= width_estimate + 16
+
+    def _horizon_point_at(self, x: float, y: float) -> tuple[float, HorizonPoint] | None:
+        """Whichever shape is actually visible under (x, y). Depth layers
+        are checked nearest first -- the same order the chart draws them,
+        nearest on top -- and the first one whose own silhouette (its real
+        ground line up to its own height) actually covers this pixel wins,
+        so clicking a near feature standing in front of a farther mountain
+        reports the near feature, not whichever candidate's angle happens
+        to be numerically closest. Falls back to closest-angle only when
+        nothing's silhouette covers the click (open sky)."""
+        panorama = self.horizon_panorama
+        layout = self._horizon_layout
+        if panorama is None or layout is None or not panorama.points:
+            return None
+        plot_left, plot_right, plot_top, plot_bottom, angle_min, angle_max = layout
+        plot_width = max(1.0, plot_right - plot_left)
+        plot_height = max(1.0, plot_bottom - plot_top)
+        angle_range = max(1e-6, angle_max - angle_min)
+        view_span = max(20.0, min(360.0, self.horizon_view_span))
+        low = self.horizon_view_center - view_span / 2.0
+        fraction = max(0.0, min(1.0, (x - plot_left) / plot_width))
+        bearing = (low + fraction * view_span) % 360.0
+
+        bearing_count = len(panorama.points)
+        index = min(
+            range(bearing_count),
+            key=lambda i: min(
+                abs(panorama.points[i].bearing_deg - bearing),
+                360.0 - abs(panorama.points[i].bearing_deg - bearing),
+            ),
+        )
+
+        def angle_to_y(angle: float) -> float:
+            return plot_bottom - (angle - angle_min) / angle_range * plot_height
+
+        show_buildings = self.horizon_show_buildings.get()
+        show_forests = self.horizon_show_forests.get()
+
+        # panorama.layers is ordered near-to-far, matching the chart's own
+        # nearest-drawn-last-on-top rule -- so checking it in this order
+        # and taking the first covering hit reproduces real occlusion.
+        for layer in panorama.layers:
+            if index >= len(layer.points):
+                continue
+            raw_point = layer.points[index]
+            filtered_point = self._apply_horizon_kind_filter(
+                [(raw_point.bearing_deg, raw_point)], show_buildings, show_forests,
+            )[0][1]
+            top_y = angle_to_y(filtered_point.angle_deg)
+            ground_y = angle_to_y(filtered_point.ground_angle_deg)
+            span_top, span_bottom = min(top_y, ground_y), max(top_y, ground_y)
+            if span_top - 2.0 <= y <= span_bottom + 2.0:
+                return filtered_point.bearing_deg, filtered_point
+
+        candidates: list[tuple[float, HorizonPoint]] = [(panorama.points[index].bearing_deg, panorama.points[index])]
+        for layer in panorama.layers:
+            if index < len(layer.points):
+                candidates.append((layer.points[index].bearing_deg, layer.points[index]))
+        candidates = self._apply_horizon_kind_filter(candidates, show_buildings, show_forests)
+        return min(candidates, key=lambda item: abs(angle_to_y(item[1].angle_deg) - y))
+
+    def _horizon_canvas_motion(self, event: tk.Event) -> None:
+        found = self._horizon_point_at(event.x, event.y)
+        if found is None:
+            return
+        bearing, point = found
+        compass = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][round(bearing / 45.0) % 8]
+        kind_label = "Terrain" if point.kind == "terrain" else point.kind
+        self.horizon_info_var.set(
+            f"From {self.horizon_source_name} · {bearing:.0f}° {compass} · "
+            f"{point.angle_deg:+.1f}° elevation angle · {self.format_distance(point.distance_m)} · {kind_label} "
+            f"· click to locate on map"
+        )
+
+    def _pick_horizon_point(self, x: int, y: int) -> None:
+        """Clicking a spot on the panorama drops a marker on the main map
+        at that real-world location, so 'what is that shape' has a
+        concrete, verifiable answer instead of just a colour/label guess."""
+        if self.horizon_source_xy is None:
+            return
+        found = self._horizon_point_at(x, y)
+        if found is None:
+            return
+        bearing, point = found
+        source_x, source_y = self.horizon_source_xy
+        angle_rad = math.radians(bearing)
+        dx, dy = math.sin(angle_rad), -math.cos(angle_rad)
+        world_x = source_x + dx * point.distance_m
+        world_y = source_y + dy * point.distance_m
+        compass = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][round(bearing / 45.0) % 8]
+        kind_label = "Terrain" if point.kind == "terrain" else point.kind
+        self._locate_on_map(
+            world_x, world_y,
+            label=f"{kind_label} · {self.format_distance(point.distance_m)} {compass}",
+            status=f"Located on map: {kind_label} · {self.format_distance(point.distance_m)} at {bearing:.0f}° {compass}",
+        )
+
+    def _locate_on_map(self, world_x: float, world_y: float, label: str, status: str) -> None:
+        """Shared by Horizon and Profile: drop a marker on the main map at a
+        real-world location clicked in either chart, so 'what is that
+        exactly' has a concrete, verifiable answer, and recentre the view
+        if the spot isn't already comfortably visible."""
+        self.map_picked_xy = (world_x, world_y)
+        self.map_picked_label = label
+        self.status_var.set(status)
+        if hasattr(self, "canvas") and self.canvas.winfo_width() > 1 and self.canvas.winfo_height() > 1:
+            left, top = self.screen_to_world(0, 0)
+            right, bottom = self.screen_to_world(self.canvas.winfo_width(), self.canvas.winfo_height())
+            margin_x = (right - left) * 0.1
+            margin_y = (bottom - top) * 0.1
+            if not (
+                left + margin_x <= world_x <= right - margin_x
+                and top + margin_y <= world_y <= bottom - margin_y
+            ):
+                visible_width = self.canvas.winfo_width() / max(1e-9, self._base_scale() * self.zoom)
+                visible_height = self.canvas.winfo_height() / max(1e-9, self._base_scale() * self.zoom)
+                self.view_x = world_x - visible_width / 2.0
+                self.view_y = world_y - visible_height / 2.0
+        self.schedule_render()
+
+    def _draw_map_picked_marker(self, c: tk.Canvas) -> None:
+        if self.map_picked_xy is None:
+            return
+        world_x, world_y = self.map_picked_xy
+        marker_x, marker_y = self.world_to_screen(world_x, world_y)
+        c.create_line(marker_x - 11, marker_y, marker_x + 11, marker_y, fill="#facc15", width=2)
+        c.create_line(marker_x, marker_y - 11, marker_x, marker_y + 11, fill="#facc15", width=2)
+        c.create_oval(marker_x - 9, marker_y - 9, marker_x + 9, marker_y + 9, outline="#facc15", width=2)
+        if self.map_picked_label:
+            c.create_text(
+                marker_x, marker_y - 17, text=self.map_picked_label,
+                fill="#facc15", font=("Segoe UI Semibold", 9), anchor="s",
+            )
+
+    def _draw_horizon_view_cone(self, c: tk.Canvas) -> None:
+        """Show where the open Horizon panorama is standing, and a wedge for
+        exactly which bearings its current view spans -- so panning/zooming
+        that window is visible on the map too, not just in its own canvas."""
+        if self.horizon_source_xy is None:
+            return
+        source_x, source_y = self.horizon_source_xy
+        span = max(20.0, min(360.0, self.horizon_view_span))
+        low = self.horizon_view_center - span / 2.0
+        cone_length = self._coverage_range_cap() * 0.6
+
+        source_sx, source_sy = self.world_to_screen(source_x, source_y)
+        c.create_oval(
+            source_sx - 6, source_sy - 6, source_sx + 6, source_sy + 6,
+            outline="#76dcff", width=2, fill="#0b1220",
+        )
+
+        if span < 359.9:
+            steps = max(2, round(span / 6.0))
+            arc_points: list[float] = []
+            for step in range(steps + 1):
+                bearing = low + span * step / steps
+                angle_rad = math.radians(bearing)
+                dx, dy = math.sin(angle_rad), -math.cos(angle_rad)
+                world_x = source_x + dx * cone_length
+                world_y = source_y + dy * cone_length
+                arc_points.extend(self.world_to_screen(world_x, world_y))
+            c.create_polygon(
+                source_sx, source_sy, *arc_points,
+                fill="#76dcff", stipple="gray25", outline="",
+            )
+            c.create_line(
+                source_sx, source_sy, arc_points[0], arc_points[1],
+                fill="#76dcff", width=1, dash=(3, 2),
+            )
+            c.create_line(
+                source_sx, source_sy, arc_points[-2], arc_points[-1],
+                fill="#76dcff", width=1, dash=(3, 2),
+            )
+            c.create_line(*arc_points, fill="#76dcff", width=2)
+        else:
+            c.create_oval(
+                source_sx - cone_length * (self._base_scale() * self.zoom),
+                source_sy - cone_length * (self._base_scale() * self.zoom),
+                source_sx + cone_length * (self._base_scale() * self.zoom),
+                source_sy + cone_length * (self._base_scale() * self.zoom),
+                outline="#76dcff", width=1, dash=(3, 2),
+            )
+
+    def _resolve_map_point(self, point: Node | tuple[float, float]) -> tuple[Node, str]:
+        """Shared by Horizon and Profile: a clicked point may be an existing
+        node (use it exactly, with its own real antenna height/elevation,
+        not the ground) or bare ground (a throwaway point with auto-grounded
+        elevation and the default antenna height)."""
+        if isinstance(point, Node):
+            return point, point.name
+        x, y = point
+        node = Node(x=x, y=y)
+        self._set_auto_node_elevation(node)
+        env = self.scenario.environment
+        if env.map_configured:
+            latitude, longitude = world_to_latlon(x, y, env.map_center_lat, env.map_center_lon)
+            label = f"{latitude:.5f}, {longitude:.5f}"
+        else:
+            label = f"X {self.format_distance(x)} · Y {self.format_distance(y)}"
+        return node, label
+
+    def show_path_profile(
+        self, point_a: Node | tuple[float, float], point_b: Node | tuple[float, float]
+    ) -> None:
+        node_a, name_a = self._resolve_map_point(point_a)
+        node_b, name_b = self._resolve_map_point(point_b)
+        self.path_profile_names = (name_a, name_b)
+        self.path_profile_endpoints = ((node_a.x, node_a.y), (node_b.x, node_b.y))
+        model = PropagationModel(self.scenario)
+        self.path_profile_data = model.path_profile(node_a, node_b)
+        self.status_var.set(f"Path profile ready: {name_a} → {name_b}")
+        self._open_path_profile_window()
+
+    def _open_path_profile_window(self) -> None:
+        if self._bottom_dock_active == "profile" and self.path_profile_canvas is not None:
+            self._refresh_path_profile()
+            return
+
+        window = self._show_bottom_dock("profile")
+
+        info_row = ttk.Frame(window, style="Toolbar.TFrame")
+        info_row.pack(fill="x")
+        ttk.Label(
+            info_row,
+            textvariable=self.path_profile_info_var,
+            style="Muted.TLabel",
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True, padx=12, pady=(8, 4))
+        ttk.Button(
+            info_row, text="✕", style="Tool.TButton", width=3, command=self._close_bottom_dock,
+        ).pack(side="right", padx=(2, 8), pady=(6, 2))
+
+        self.path_profile_canvas = tk.Canvas(window, bg=MAPLESS_BACKGROUND, highlightthickness=0, borderwidth=0)
+        self.path_profile_canvas.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.path_profile_canvas.bind("<Configure>", self._schedule_path_profile_redraw)
+        self.path_profile_canvas.bind("<Button-1>", self._profile_canvas_click)
+
+        ttk.Label(
+            window,
+            text=(
+                "Ground and obstacles between the two points, to scale. The dashed line is the "
+                "straight radio path the simulator itself tests between their antenna heights. "
+                "Click a spot to locate it on the map."
+            ),
+            style="Muted.TLabel",
+            anchor="w",
+            wraplength=620,
+        ).pack(fill="x", padx=12, pady=(0, 8))
+        self._refresh_path_profile()
+
+    def _reset_path_profile_state(self) -> None:
+        if self.path_profile_redraw_after is not None:
+            try:
+                self.root.after_cancel(self.path_profile_redraw_after)
+            except tk.TclError:
+                pass
+            self.path_profile_redraw_after = None
+        self.path_profile_canvas = None
+        self.map_picked_xy = None
+        self.map_picked_label = None
+
+    def _close_path_profile_window(self) -> None:
+        self._reset_path_profile_state()
+        if self._bottom_dock_active == "profile":
+            self._hide_bottom_dock()
+
+    def _schedule_path_profile_redraw(self, _event: tk.Event | None = None) -> None:
+        if self.path_profile_redraw_after is not None:
+            try:
+                self.root.after_cancel(self.path_profile_redraw_after)
+            except tk.TclError:
+                pass
+        self.path_profile_redraw_after = self.root.after(80, self._refresh_path_profile)
+
+    def _refresh_path_profile(self) -> None:
+        self.path_profile_redraw_after = None
+        canvas = self.path_profile_canvas
+        profile = self.path_profile_data
+        if canvas is None or profile is None or not canvas.winfo_exists():
+            return
+        canvas.delete("all")
+        width, height = max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
+        self._draw_path_profile(canvas, width, height, profile)
+        name_a, name_b = self.path_profile_names
+        if not profile.compatible:
+            status = f"Blocked: {profile.reason}"
+        elif profile.margin_db < MIN_DECODE_MARGIN_DB:
+            status = f"Too weak to decode · {profile.margin_db:+.1f} dB margin · {profile.total_loss_db:.1f} dB obstruction loss"
+        else:
+            status = f"Link viable · {profile.margin_db:+.1f} dB margin · {profile.total_loss_db:.1f} dB obstruction loss"
+        self.path_profile_info_var.set(
+            f"{name_a} → {name_b} · {self.format_distance(profile.distance_m)} · {status}"
+        )
+
+    def _profile_canvas_click(self, event: tk.Event) -> None:
+        self._pick_profile_point(event.x)
+
+    def _pick_profile_point(self, x: int) -> None:
+        """Clicking a spot on the profile drops a marker on the main map at
+        that real-world location along the A-to-B line, so 'where exactly
+        is that dip/obstacle' has a concrete answer."""
+        layout = self._path_profile_layout
+        profile = self.path_profile_data
+        endpoints = self.path_profile_endpoints
+        if layout is None or profile is None or endpoints is None:
+            return
+        plot_left, plot_right, *_rest = layout
+        pixel_span = max(1.0, plot_right - plot_left)
+        fraction = max(0.0, min(1.0, (x - plot_left) / pixel_span))
+        distance_along = fraction * profile.distance_m
+        (ax, ay), (bx, by) = endpoints
+        world_x = ax + (bx - ax) * fraction
+        world_y = ay + (by - ay) * fraction
+        name_a, name_b = self.path_profile_names
+        self._locate_on_map(
+            world_x, world_y,
+            label=f"{self.format_distance(distance_along)} from {name_a}",
+            status=f"Located on map: {self.format_distance(distance_along)} along the path from {name_a} to {name_b}",
+        )
+
+    def _draw_path_profile(self, canvas: tk.Canvas, width: int, height: int, profile: PathProfile) -> None:
+        margin_left, margin_right = 56, 16
+        margin_top, margin_bottom = 34, 30
+        plot_left, plot_right = margin_left, width - margin_right
+        plot_top, plot_bottom = margin_top, height - margin_bottom
+        plot_width = max(1.0, plot_right - plot_left)
+        plot_height = max(1.0, plot_bottom - plot_top)
+
+        elevations = [elevation for _distance, elevation in profile.terrain_samples if elevation is not None]
+        elevations.extend([profile.source_antenna_z, profile.target_antenna_z])
+        for obstacle in profile.obstacles:
+            elevations.extend((obstacle.base_elevation_m, obstacle.top_elevation_m))
+        elevation_min = min(elevations)
+        elevation_max = max(elevations)
+        pad = max(2.0, (elevation_max - elevation_min) * 0.12)
+        elevation_min -= pad
+        elevation_max += pad
+        distance = max(1.0, profile.distance_m)
+
+        def point_xy(distance_m: float, elevation_m: float) -> tuple[float, float]:
+            px = plot_left + (distance_m / distance) * plot_width
+            py = plot_bottom - (elevation_m - elevation_min) / (elevation_max - elevation_min) * plot_height
+            return px, py
+
+        self._path_profile_layout = (plot_left, plot_right, plot_top, plot_bottom, elevation_min, elevation_max)
+
+        # Ground fill beneath the sampled terrain, skipping any gaps with no data.
+        run: list[float] = []
+        for sample_distance, elevation in profile.terrain_samples:
+            if elevation is None:
+                if len(run) >= 4:
+                    canvas.create_polygon(
+                        run[0], plot_bottom, *run, run[-2], plot_bottom, fill="#d8dde3", outline=""
+                    )
+                run = []
+                continue
+            run.extend(point_xy(sample_distance, elevation))
+        if len(run) >= 4:
+            canvas.create_polygon(run[0], plot_bottom, *run, run[-2], plot_bottom, fill="#d8dde3", outline="")
+        coordinates = [
+            coordinate
+            for sample_distance, elevation in profile.terrain_samples
+            if elevation is not None
+            for coordinate in point_xy(sample_distance, elevation)
+        ]
+        if len(coordinates) >= 4:
+            canvas.create_line(*coordinates, fill=PropagationModel.TERRAIN_HORIZON_COLOR, width=2)
+
+        # Obstacle footprints, shaded to read as solid blocks on the ground.
+        for obstacle in profile.obstacles:
+            x1, y1 = point_xy(obstacle.start_m, obstacle.top_elevation_m)
+            x2, y2 = point_xy(obstacle.end_m, obstacle.base_elevation_m)
+            if obstacle.kind == "Forest":
+                self._draw_profile_forest_block(canvas, x1, y1, x2, y2, obstacle.color)
+            else:
+                self._draw_shaded_block(canvas, x1, y1, x2, y2, obstacle.color)
+
+        # The straight radio path the simulator tests between the two antennas.
+        los_x1, los_y1 = point_xy(0.0, profile.source_antenna_z)
+        los_x2, los_y2 = point_xy(distance, profile.target_antenna_z)
+        canvas.create_line(los_x1, los_y1, los_x2, los_y2, fill="#c026d3", width=2, dash=(6, 3))
+        name_a, name_b = self.path_profile_names
+        for x, y, label, anchor in ((los_x1, los_y1, name_a, "w"), (los_x2, los_y2, name_b, "e")):
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#c026d3", outline="white")
+            canvas.create_text(
+                x, y - 12, text=label, fill="black", font=("Segoe UI Semibold", 10), anchor=anchor,
+            )
+
+        # Elevation axis.
+        for tick in (elevation_min + pad, (elevation_min + elevation_max) / 2.0, elevation_max - pad):
+            _tick_x, tick_y = point_xy(0.0, tick)
+            canvas.create_line(plot_left, tick_y, plot_right, tick_y, fill="#e2e2e2", width=1)
+            canvas.create_text(
+                plot_left - 6, tick_y, text=self.format_distance(tick), fill="black", anchor="e", font=("Segoe UI", 8)
+            )
+
+        # Distance axis.
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            tick_x, _tick_y = point_xy(distance * fraction, elevation_min)
+            canvas.create_text(
+                tick_x, plot_bottom + 8, text=self.format_distance(distance * fraction),
+                fill="black", anchor="n", font=("Segoe UI", 8),
+            )
+
+        legend_kinds = list(dict.fromkeys(obstacle.kind for obstacle in profile.obstacles))
+        legend_x = plot_right
+        legend_y = plot_top - 16
+        for kind in reversed(legend_kinds):
+            color = next(obstacle.color for obstacle in profile.obstacles if obstacle.kind == kind)
+            canvas.create_text(legend_x, legend_y, text=kind, fill="black", anchor="e", font=("Segoe UI", 8))
+            width_estimate = 10 + len(kind) * 5.5
+            canvas.create_rectangle(
+                legend_x - width_estimate - 12, legend_y - 5, legend_x - width_estimate - 2, legend_y + 5,
+                fill=color, outline="",
+            )
+            legend_x -= width_estimate + 16
 
     def _render_mesh_traffic_chart(self, canvas: tk.Canvas, width: float, height: float) -> None:
         frames = list(self.live_mesh_history_frames)
@@ -2738,6 +3907,14 @@ class MeshSimulatorApp:
 
         threading.Thread(target=worker, name="ObstacleImport", daemon=True).start()
 
+    # A footprint with no real height or floor count anywhere in the source
+    # dataset gets this instead of the generic OBSTACLE_DEFAULTS height (12 m,
+    # ~4 storeys) -- a single unverified building silently modeled as a
+    # 4-storey structure was enough on its own to mark an otherwise-clear
+    # long link as blocked. 6 m (~2 storeys) is a more typical guess for an
+    # arbitrary building when nothing in the data says otherwise.
+    OSM_BUILDING_HEIGHT_FALLBACK_M = 6.0
+
     @staticmethod
     def _osm_height(tags: dict[str, str], default: float) -> float:
         raw_height = tags.get("height", "").strip().lower()
@@ -2824,6 +4001,8 @@ class MeshSimulatorApp:
                 continue
             kind = "Building" if is_building else "Forest"
             color, attenuation, default_height, per_100, behavior, max_beyond = OBSTACLE_DEFAULTS[kind]
+            if is_building:
+                default_height = self.OSM_BUILDING_HEIGHT_FALLBACK_M
             x_values = [point[0] for point in points]
             y_values = [point[1] for point in points]
             center_x = sum(x_values) / len(x_values)
@@ -5634,6 +6813,7 @@ class MeshSimulatorApp:
         self.tool = tool
         self.temp_obstacle = None
         self.temp_forest_points = []
+        self.profile_point_a = None
         for key, button in getattr(self, "tool_buttons", {}).items():
             button.configure(style="ActiveTool.TButton" if key == tool else "Tool.TButton")
         cursors = {"select": "arrow", "node": "crosshair"}
@@ -5645,6 +6825,10 @@ class MeshSimulatorApp:
             self.status_var.set("Node tool stays active: click repeatedly to place nodes")
         elif tool == "beacon":
             self.status_var.set("Beacon tool: click the map to drop a pulsating beacon")
+        elif tool == "horizon":
+            self.status_var.set("Horizon tool: click a node (uses its real height) or a bare point to view its 360° terrain/obstacle skyline")
+        elif tool == "profile":
+            self.status_var.set("Profile tool: click two nodes or points to view the terrain/obstacle cross-section between them")
         elif tool == "Forest":
             self.status_var.set("Forest brush stays active: press and drag to paint forest")
         else:
@@ -5918,6 +7102,21 @@ class MeshSimulatorApp:
             sx1, sy1 = self.world_to_screen(self.temp_obstacle[0], self.temp_obstacle[1])
             sx2, sy2 = self.world_to_screen(self.temp_obstacle[2], self.temp_obstacle[3])
             c.create_rectangle(sx1, sy1, sx2, sy2, outline="#76dcff", width=2, dash=(5, 3), fill="#153a55", stipple="gray50")
+        if self.profile_point_a is not None:
+            point = self.profile_point_a
+            world_x, world_y = (point.x, point.y) if isinstance(point, Node) else point
+            marker_x, marker_y = self.world_to_screen(world_x, world_y)
+            c.create_oval(
+                marker_x - 7, marker_y - 7, marker_x + 7, marker_y + 7,
+                outline="#76dcff", width=2, dash=(3, 2),
+            )
+            c.create_text(
+                marker_x, marker_y - 14, text="A", fill="#76dcff", font=("Segoe UI Semibold", 10)
+            )
+        if self.horizon_source_xy is not None:
+            self._draw_horizon_view_cone(c)
+        if self.map_picked_xy is not None:
+            self._draw_map_picked_marker(c)
         scale_start = len(c.find_all())
         self._draw_scale(c)
         self._draw_center_crosshair(c)
@@ -6866,28 +8065,6 @@ class MeshSimulatorApp:
             c.create_text(x + offset_x, y + offset_y, text=text, fill="#05080d", font=font)
         c.create_text(x, y, text=text, fill=fill, font=font)
 
-    def _draw_probe_links(self, c: tk.Canvas) -> None:
-        selected = self.get_selected()
-        if not isinstance(selected, Node):
-            return
-        model = PropagationModel(self.scenario)
-        for target in self.scenario.nodes:
-            if target.id == selected.id:
-                continue
-            link = model.link(selected, target)
-            x1, y1 = self.world_to_screen(selected.x, selected.y)
-            x2, y2 = self.world_to_screen(target.x, target.y)
-            color = GREEN if link.margin_db >= 6 and link.compatible else AMBER if link.margin_db >= 0 and link.compatible else RED
-            c.create_line(x1, y1, x2, y2, fill=color, width=1, dash=(4, 4))
-            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-            c.create_text(
-                mx,
-                my,
-                text=f"{link.margin_db:+.1f} dB · {link.rssi_dbm:.0f} RSSI",
-                fill=color,
-                font=("Consolas", 7),
-            )
-
     def _draw_packet_links(self, c: tk.Canvas) -> None:
         if not self.animation_seen_edges:
             return
@@ -7100,6 +8277,8 @@ class MeshSimulatorApp:
                 fill=color, font=("Segoe UI Bold", 9),
             )
 
+    HORIZON_SILHOUETTE_COLOR = "#3d3d3d"  # one uniform tone for the whole skyline shape
+    HORIZON_DEFAULT_FOV_DEG = 90.0  # a normal-lens field of view, not the full 360° sweep
     _BEACON_BLOCK = "#ff2d55"   # red: obstacles that BLOCK the signal
     _BEACON_SLOW = "#ffd23f"    # yellow: obstacles that SLOW / weaken the signal
     _BEACON_EDGE = "#38e1ff"    # cyan: live ripple + beacon centre
@@ -7513,6 +8692,26 @@ class MeshSimulatorApp:
                 self.load_topography()
             self.set_tool("select")
             self.start_beacon()
+            return
+        if self.tool == "horizon":
+            hit = self.hit_test(event.x, event.y)
+            point: Node | tuple[float, float] = hit if isinstance(hit, Node) else self.drag_start_world
+            self.set_tool("select")
+            self.show_horizon_panorama(point)
+            return
+        if self.tool == "profile":
+            hit = self.hit_test(event.x, event.y)
+            point: Node | tuple[float, float] = hit if isinstance(hit, Node) else self.drag_start_world
+            label = f"node {hit.name}" if isinstance(hit, Node) else "a ground point (missed the node?)"
+            if self.profile_point_a is None:
+                self.profile_point_a = point
+                self.status_var.set(f"Profile point A: {label} · click a second node or point")
+                self.schedule_render()
+            else:
+                point_a = self.profile_point_a
+                self.profile_point_a = None
+                self.set_tool("select")
+                self.show_path_profile(point_a, point)
             return
         if self.tool == "Forest":
             x, y = self.drag_start_world
@@ -9119,6 +10318,94 @@ class MeshSimulatorApp:
             return f"#{r:02x}{g:02x}{b:02x}"
         except (ValueError, IndexError):
             return "#9fb1c7"
+
+    @staticmethod
+    def _darken(color: str, amount: int = 45) -> str:
+        try:
+            color = color.lstrip("#")
+            r, g, b = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+            r, g, b = max(0, r - amount), max(0, g - amount), max(0, b - amount)
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except (ValueError, IndexError):
+            return "#1a1a1a"
+
+    def _draw_shaded_block(
+        self, canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, color: str
+    ) -> None:
+        """A flat-filled rectangle reads as a silhouette against the ground
+        line; a lit top edge and a shadowed side give it just enough depth to
+        read as a solid block standing on the ground, not an outline."""
+        left, right = min(x1, x2), max(x1, x2)
+        top, bottom = min(y1, y2), max(y1, y2)
+        canvas.create_rectangle(left, top, right, bottom, fill=color, outline="")
+        cap = min(6.0, (bottom - top) * 0.3)
+        if cap > 0:
+            canvas.create_rectangle(left, top, right, top + cap, fill=self._lighten(color), outline="")
+        side = min(5.0, (right - left) * 0.3)
+        if side > 0:
+            canvas.create_rectangle(right - side, top, right, bottom, fill=self._darken(color), outline="")
+        canvas.create_rectangle(left, top, right, bottom, outline=self._darken(color, 70), width=1)
+
+    def _draw_tree_icon(
+        self, canvas: tk.Canvas, cx: float, base_y: float, radius: float, color: str
+    ) -> None:
+        """One recognizable tree: a short brown trunk topped by a pointed,
+        tapered conifer canopy (two stacked triangular tiers) -- the
+        classic pine silhouette that reads as an actual tree, not a round
+        abstract blob."""
+        trunk_w = max(1.5, radius * 0.28)
+        trunk_h = radius * 0.6
+        canvas.create_rectangle(
+            cx - trunk_w / 2, base_y - trunk_h, cx + trunk_w / 2, base_y + 1,
+            fill="#5c4128", outline="",
+        )
+        canopy_base = base_y - trunk_h
+        tier_h = radius * 1.3
+        lower_top = canopy_base - tier_h
+        canvas.create_polygon(
+            cx - radius, canopy_base,
+            cx + radius, canopy_base,
+            cx, lower_top,
+            fill=self._darken(color, 15), outline=self._darken(color, 45), width=1,
+        )
+        upper_base = lower_top + tier_h * 0.45
+        upper_w = radius * 0.7
+        tip_y = upper_base - tier_h * 0.95
+        canvas.create_polygon(
+            cx - upper_w, upper_base,
+            cx + upper_w, upper_base,
+            cx, tip_y,
+            fill=color, outline=self._darken(color, 45), width=1,
+        )
+        canvas.create_polygon(
+            cx, tip_y,
+            cx - upper_w * 0.4, upper_base - tier_h * 0.25,
+            cx, upper_base - tier_h * 0.1,
+            fill=self._lighten(color), outline="",
+        )
+
+    def _draw_profile_forest_block(
+        self, canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, color: str
+    ) -> None:
+        """A rectangle reads as a building no matter what colour it's
+        filled -- one dense row of trees, every one rooted at the real
+        ground line and sized to reach up toward the canopy top, is what
+        makes a forest read as trees instead of a green box. Height
+        varies; the base never leaves the ground, so nothing floats."""
+        left, right = min(x1, x2), max(x1, x2)
+        top, bottom = min(y1, y2), max(y1, y2)
+        width = right - left
+        height = max(1.0, bottom - top)
+        if width < 1:
+            return
+        tree_w = 12.0
+        columns = min(90, max(1, round(width / tree_w)))
+        col_w = width / columns
+        for col in range(columns):
+            cx = left + col_w * (col + 0.5)
+            radius = max(3.0, min(11.0, height / 2.3, col_w * 0.75))
+            radius *= 0.82 if col % 3 == 1 else 1.0
+            self._draw_tree_icon(canvas, cx, bottom, radius, color)
 
 
 def run() -> None:

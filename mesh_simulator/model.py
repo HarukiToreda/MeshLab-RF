@@ -768,6 +768,99 @@ class BeaconProfile:
 
 
 @dataclass
+class HorizonPoint:
+    """The single highest skyline point along one compass bearing."""
+
+    bearing_deg: float
+    angle_deg: float
+    distance_m: float
+    kind: str
+    color: str
+    # The plain-terrain angle at this bearing, ignoring any obstacle that won
+    # the envelope -- the ground a building/tower actually sits on, used as
+    # the fill baseline so a building renders as a spike on the terrain
+    # instead of a bar reaching all the way to the bottom of the chart.
+    ground_angle_deg: float = 0.0
+    # Identity of the winning obstacle (id() of the Obstacle instance), or
+    # None for terrain. Two adjacent same-kind obstacles (e.g. two plain
+    # Buildings) share the same colour, so colour alone can't tell a
+    # rendering run where one structure ends and the next begins -- this
+    # can.
+    source_id: int | None = None
+
+
+@dataclass
+class HorizonLayer:
+    """The skyline at one fixed distance ring -- a 'depth slice' rather than
+    the overall envelope, so nearer terrain/buildings show through even when
+    something taller sits further away in the same direction."""
+
+    distance_m: float
+    points: list[HorizonPoint]
+
+
+@dataclass
+class HorizonNodeMarker:
+    """Another mesh node that's geometrically visible from the panorama's
+    source point -- terrain and obstacles clear, independent of radio
+    compatibility, matching the rest of the panorama's own geometric-only
+    semantics."""
+
+    node_id: str
+    name: str
+    bearing_deg: float
+    angle_deg: float
+    distance_m: float
+
+
+@dataclass
+class HorizonPanorama:
+    """A full 360° skyline around one point: terrain and obstacle tops,
+    whichever sits at the greatest elevation angle in each direction."""
+
+    source_id: str
+    eye_z: float
+    max_range_m: float
+    points: list[HorizonPoint]
+    layers: list[HorizonLayer] = field(default_factory=list)
+    visible_nodes: list[HorizonNodeMarker] = field(default_factory=list)
+
+
+@dataclass
+class PathProfileObstacle:
+    """One obstacle's footprint across a two-point terrain/obstacle profile."""
+
+    obstacle_id: str
+    name: str
+    kind: str
+    color: str
+    behavior: str
+    start_m: float
+    end_m: float
+    base_elevation_m: float
+    top_elevation_m: float
+
+
+@dataclass
+class PathProfile:
+    """A ground-level cross-section between two arbitrary map points, plus
+    every obstacle footprint and the straight line-of-sight the RF model
+    itself would test between them."""
+
+    distance_m: float
+    terrain_samples: list[tuple[float, float | None]]
+    obstacles: list[PathProfileObstacle]
+    source_elevation_m: float
+    source_antenna_z: float
+    target_elevation_m: float
+    target_antenna_z: float
+    total_loss_db: float
+    compatible: bool
+    margin_db: float
+    reason: str
+
+
+@dataclass
 class SimEvent:
     time_ms: float
     kind: str
@@ -963,6 +1056,7 @@ class PropagationModel:
     # makes a large flood (many nodes, most of them out of each other's range)
     # tractable instead of paying full ray/terrain geometry for every pair.
     HOPELESS_MARGIN_DEFICIT_DB = 40.0
+    TERRAIN_HORIZON_COLOR = "#3a6b64"
 
     def __init__(self, scenario: Scenario):
         self.scenario = scenario
@@ -1313,7 +1407,6 @@ class PropagationModel:
         hit_names: list[str] = []
         segment_distance = math.hypot(target.x - source.x, target.y - source.y)
         planar_distance = max(1.0, segment_distance)
-        wavelength = self.SPEED_OF_LIGHT / (source.radio.frequency_mhz * 1_000_000.0)
         source_z = source.antenna_z
         target_z = target.antenna_z
         candidates = (
@@ -1336,17 +1429,26 @@ class PropagationModel:
             los_z = source_z + (target_z - source_z) * midpoint_t
             top_z = obstacle.base_elevation_m + obstacle.height_m
             if los_z > top_z:
-                d1 = planar_distance * midpoint_t
-                d2 = planar_distance - d1
-                fresnel = math.sqrt(max(0.0, wavelength * d1 * d2 / planar_distance))
-                clearance = los_z - top_z
-                if clearance >= 0.6 * fresnel:
-                    continue
-                height_factor = max(0.1, 1.0 - clearance / max(0.1, 0.6 * fresnel))
-            else:
-                height_factor = 1.0
-            loss = obstacle.attenuation_db * height_factor
-            loss += obstacle.loss_per_100m_db * (inside_length / 100.0) * height_factor
+                # The ray clears this obstacle's rooftop -- no look-through
+                # loss applies. A path that merely grazes near the edge of
+                # its Fresnel zone isn't physically passing through the
+                # building, and charging it anyway is what let a long
+                # mountaintop-to-mountaintop link rack up 100+ dB from a
+                # cluster of rooftops it was actually flying well above:
+                # each one added its own near-miss penalty independently,
+                # when in reality clearing a skyline doesn't re-attenuate
+                # the signal once per rooftop it happens to pass near.
+                continue
+            # A genuine below-rooftop intersection is a real obstruction --
+            # the full flat penalty applies regardless of how much of the
+            # footprint the ray happens to cross. This matters most exactly
+            # where several buildings stack up close together: each one
+            # really is in the way, and the combined loss needs to add up
+            # to an effective dead zone at ground level (forcing the signal
+            # up and over the skyline), not get discounted down to near
+            # nothing because each individual footprint was only grazed.
+            loss = obstacle.attenuation_db
+            loss += obstacle.loss_per_100m_db * (inside_length / 100.0)
             total += loss
             hit_names.append(f"{obstacle.name} ({loss:.1f} dB)")
             if obstacle.behavior == "BLOCK":
@@ -1370,7 +1472,7 @@ class PropagationModel:
             return 0.0, ""
         wavelength = self.SPEED_OF_LIGHT / (source.radio.frequency_mhz * 1_000_000.0)
         samples = max(12, min(96, math.ceil(planar_distance / 100.0)))
-        worst_intrusion = 0.0
+        worst_v = -math.inf
         source_grid_ground = environment.terrain_elevation(source.x, source.y)
         target_grid_ground = environment.terrain_elevation(target.x, target.y)
         dx = target.x - source.x
@@ -1401,11 +1503,25 @@ class PropagationModel:
             d1 = planar_distance * t
             d2 = planar_distance - d1
             fresnel = math.sqrt(max(0.0, wavelength * d1 * d2 / planar_distance))
-            required_clearance = 0.6 * fresnel
-            if required_clearance > 0:
-                intrusion = max(0.0, 1.0 - (los_z - terrain_z) / required_clearance)
-                worst_intrusion = max(worst_intrusion, intrusion)
-        return 24.0 * worst_intrusion, ""
+            if fresnel <= 0:
+                continue
+            clearance = los_z - terrain_z
+            v = -clearance * math.sqrt(2.0) / fresnel
+            worst_v = max(worst_v, v)
+        return self._knife_edge_loss_db(worst_v), ""
+
+    @staticmethod
+    def _knife_edge_loss_db(v: float) -> float:
+        """Single knife-edge diffraction loss (ITU-R P.526 approximation).
+
+        v is the normalized Fresnel clearance parameter: v <= -0.78 means
+        ample clearance (negligible loss); v = 0 means the obstruction sits
+        exactly on the line of sight (~6 dB, the standard grazing-incidence
+        result -- not a much larger number, since anything taller than that
+        already triggers a hard block above, not a partial-loss sample)."""
+        if v <= -0.78:
+            return 0.0
+        return 6.9 + 20.0 * math.log10(math.sqrt((v - 0.1) ** 2 + 1.0) + v - 0.1)
 
     def obstacle_loss(self, source: Node, target: Node) -> tuple[float, list[str]]:
         loss, names, _blocked = self._obstacle_effects(source, target)
@@ -1781,6 +1897,249 @@ class PropagationModel:
             list(dict.fromkeys(weakening)),
             maximum_range,
         )
+
+    def path_profile(self, source: Node, target: Node, samples: int = 240) -> PathProfile:
+        """Ground elevation and every obstacle footprint between two arbitrary
+        points, for a side-view cross-section -- independent of whether either
+        point is an actual configured node."""
+        environment = self.scenario.environment
+        distance = math.hypot(target.x - source.x, target.y - source.y)
+        steps = max(2, samples)
+        terrain_samples: list[tuple[float, float | None]] = []
+        for index in range(steps + 1):
+            t = index / steps
+            x = source.x + (target.x - source.x) * t
+            y = source.y + (target.y - source.y) * t
+            terrain_samples.append((distance * t, environment.terrain_elevation(x, y)))
+
+        obstacles: list[PathProfileObstacle] = []
+        for obstacle in self._candidate_obstacles(source, target):
+            if not obstacle.enabled:
+                continue
+            _inside_length, midpoint_t, exit_t = self._obstacle_intersection(obstacle, source, target)
+            if midpoint_t is None or exit_t is None:
+                continue
+            entry_t = max(0.0, min(1.0, 2.0 * midpoint_t - exit_t))
+            exit_t = max(0.0, min(1.0, exit_t))
+            if exit_t <= entry_t:
+                continue
+            obstacles.append(
+                PathProfileObstacle(
+                    obstacle.id,
+                    obstacle.name,
+                    obstacle.kind,
+                    obstacle.color,
+                    obstacle.behavior,
+                    distance * entry_t,
+                    distance * exit_t,
+                    obstacle.base_elevation_m,
+                    obstacle.base_elevation_m + obstacle.height_m,
+                )
+            )
+        obstacles.sort(key=lambda item: item.start_m)
+
+        # Reuse the same link budget the simulator itself would run, so
+        # "clear" here means the link actually works, not merely that no
+        # single obstacle hard-blocks it -- many attenuating obstacles (e.g.
+        # a dense row of buildings) can sum to a hopeless loss without any
+        # one of them qualifying as a hard BLOCK.
+        link_result = self.link(source, target)
+
+        return PathProfile(
+            distance,
+            terrain_samples,
+            obstacles,
+            source.elevation_m,
+            source.antenna_z,
+            target.elevation_m,
+            target.antenna_z,
+            link_result.obstacle_loss_db,
+            link_result.compatible,
+            link_result.margin_db,
+            link_result.reason,
+        )
+
+    # More, finer bands read as a continuous near-to-far terrain profile
+    # (real dips and rises before the skyline) instead of a few coarse steps.
+    HORIZON_LAYER_FRACTIONS = (0.06, 0.13, 0.22, 0.34, 0.48, 0.65, 0.82, 1.0)
+
+    def _node_geometrically_visible(self, source: Node, target: Node) -> bool:
+        """Pure line-of-sight: does terrain or any obstacle (regardless of
+        its RF behaviour -- BLOCK, ATTENUATE, whatever) rise above the
+        straight line from source's eye to target's antenna anywhere along
+        the way? This intentionally ignores radio compatibility/budget --
+        the horizon panorama is a geometric skyline, not a link check."""
+        eye_z = source.antenna_z
+        target_z = target.antenna_z
+        distance = math.hypot(target.x - source.x, target.y - source.y)
+        if distance < 1.0:
+            return True
+        environment = self.scenario.environment
+        steps = max(8, min(150, int(distance / 25.0)))
+        for step in range(1, steps):
+            t = step / steps
+            x = source.x + (target.x - source.x) * t
+            y = source.y + (target.y - source.y) * t
+            los_z = eye_z + (target_z - eye_z) * t
+            elevation = environment.terrain_elevation(x, y)
+            if elevation is not None and elevation >= los_z:
+                return False
+        for obstacle in self._candidate_obstacles(source, target):
+            if not obstacle.enabled:
+                continue
+            _inside_length, midpoint_t, exit_t = self._obstacle_intersection(obstacle, source, target)
+            if midpoint_t is None or exit_t is None:
+                continue
+            top_z = obstacle.base_elevation_m + obstacle.height_m
+            los_z_here = eye_z + (target_z - eye_z) * max(0.0, min(1.0, midpoint_t))
+            if top_z >= los_z_here:
+                return False
+        return True
+
+    def horizon_panorama(
+        self,
+        source: Node,
+        bearing_samples: int = 360,
+        max_range_m: float | None = None,
+        radial_steps: int = 120,
+    ) -> HorizonPanorama:
+        """A 360° skyline around ``source``: the highest elevation angle
+        (terrain or obstacle top) visible along every compass bearing, plus
+        a handful of fixed-distance depth layers so nearer terrain and
+        buildings still show through when something taller sits further
+        away in the same direction.
+
+        This is a pure geometric horizon, independent of any radio -- it
+        answers "what's the skyline look like from here", not "can a radio
+        reach past it", so it walks terrain/obstacle heights directly rather
+        than reusing the RF link budget machinery.
+        """
+        environment = self.scenario.environment
+        eye_z = source.antenna_z
+        probe = self._ray_probe(source, source)
+        maximum_range = self.unobstructed_range_m(source, probe)
+        if max_range_m is not None:
+            maximum_range = min(maximum_range, max(200.0, float(max_range_m)))
+        bearings = max(8, bearing_samples)
+        steps = max(8, radial_steps)
+        band_distances = [maximum_range * fraction for fraction in self.HORIZON_LAYER_FRACTIONS]
+
+        envelope_points: list[HorizonPoint] = []
+        layer_points: list[list[HorizonPoint]] = [[] for _ in band_distances]
+
+        for index in range(bearings):
+            bearing = 360.0 * index / bearings
+            angle_rad = math.radians(bearing)
+            dx, dy = math.sin(angle_rad), -math.cos(angle_rad)
+            far_probe = Node(x=source.x + dx * maximum_range, y=source.y + dy * maximum_range)
+
+            # A direction with no terrain data at all (past the loaded grid,
+            # or an unloaded map) is open sky, not a cliff -- default to a
+            # flat, unobstructed horizon rather than a misleading -90 drop.
+            # But real terrain that IS there always wins on its own merits,
+            # even when every sample looks down (a tall antenna standing
+            # well above nearby ground) -- seeding the "best" angle at 0.0
+            # would silently floor every legitimately negative angle back
+            # to flat, hiding the whole downward view from an elevated eye.
+            best_angle, best_distance, best_kind, best_color, best_source_id = (
+                -math.inf, maximum_range, "terrain", self.TERRAIN_HORIZON_COLOR, None,
+            )
+            terrain_hits: list[tuple[float, float]] = []
+            for step in range(1, steps + 1):
+                distance = maximum_range * step / steps
+                elevation = environment.terrain_elevation(
+                    source.x + dx * distance, source.y + dy * distance
+                )
+                if elevation is None:
+                    continue
+                angle = math.degrees(math.atan2(elevation - eye_z, max(1.0, distance)))
+                terrain_hits.append((distance, angle))
+                if angle > best_angle:
+                    best_angle, best_distance = angle, distance
+                    best_kind, best_color, best_source_id = "terrain", self.TERRAIN_HORIZON_COLOR, None
+            if not terrain_hits:
+                best_angle, best_distance = 0.0, maximum_range
+
+            ground_angle = best_angle
+
+            obstacle_hits: list[tuple[float, float, float, str, str, int]] = []
+            for obstacle in self._candidate_obstacles(source, far_probe):
+                if not obstacle.enabled:
+                    continue
+                _inside_length, midpoint_t, exit_t = self._obstacle_intersection(obstacle, source, far_probe)
+                if midpoint_t is None or exit_t is None:
+                    continue
+                entry_t = max(0.0, min(1.0, 2.0 * midpoint_t - exit_t))
+                exit_t = max(0.0, min(1.0, exit_t))
+                entry_distance, exit_distance = maximum_range * entry_t, maximum_range * exit_t
+                top_z = obstacle.base_elevation_m + obstacle.height_m
+                mid_distance = max(1.0, (entry_distance + exit_distance) / 2.0)
+                angle = math.degrees(math.atan2(top_z - eye_z, mid_distance))
+                obstacle_hits.append((entry_distance, exit_distance, angle, obstacle.kind, obstacle.color, id(obstacle)))
+                if angle > best_angle:
+                    best_angle, best_distance = angle, entry_distance
+                    best_kind, best_color, best_source_id = obstacle.kind, obstacle.color, id(obstacle)
+
+            envelope_points.append(
+                HorizonPoint(bearing, best_angle, best_distance, best_kind, best_color, ground_angle, best_source_id)
+            )
+
+            # Each layer covers a distance ZONE (not one exact ring) and shows
+            # the envelope within just that zone -- a narrow building's 20 m
+            # footprint would almost never land on one exact sample point, but
+            # it reliably falls inside a zone.
+            zone_low = 0.0
+            for layer_index, zone_high in enumerate(band_distances):
+                # The zone's own terrain (no obstacles) is its ground -- track
+                # it separately so an obstacle inside this zone can rise from
+                # that real ground instead of a bar dropping to the chart
+                # bottom, the same guarantee the overall envelope already has.
+                # Seeded below any real angle, same reasoning as the envelope
+                # above: a zone that's genuinely below eye level (near ground
+                # under a tall antenna) must be allowed to record a negative
+                # angle instead of being floored to flat.
+                zone_ground_angle = -math.inf
+                zone_ground_distance = zone_high
+                zone_has_terrain = False
+                for hit_distance, hit_angle in terrain_hits:
+                    if zone_low < hit_distance <= zone_high:
+                        zone_has_terrain = True
+                        if hit_angle > zone_ground_angle:
+                            zone_ground_angle, zone_ground_distance = hit_angle, hit_distance
+                if not zone_has_terrain:
+                    zone_ground_angle, zone_ground_distance = 0.0, zone_high
+                zone_angle, zone_distance = zone_ground_angle, zone_ground_distance
+                zone_kind, zone_color, zone_source_id = "terrain", self.TERRAIN_HORIZON_COLOR, None
+                for entry_distance, exit_distance, angle, kind, color, source_id in obstacle_hits:
+                    if entry_distance <= zone_high and exit_distance > zone_low and angle > zone_angle:
+                        zone_angle, zone_distance = angle, max(zone_low, entry_distance)
+                        zone_kind, zone_color, zone_source_id = kind, color, source_id
+                layer_points[layer_index].append(
+                    HorizonPoint(
+                        bearing, zone_angle, zone_distance, zone_kind, zone_color, zone_ground_angle, zone_source_id,
+                    )
+                )
+                zone_low = zone_high
+
+        layers = [
+            HorizonLayer(band_distances[index], layer_points[index]) for index in range(len(band_distances))
+        ]
+
+        visible_nodes: list[HorizonNodeMarker] = []
+        for other in self.scenario.nodes:
+            if other.id == source.id:
+                continue
+            distance = math.hypot(other.x - source.x, other.y - source.y)
+            if distance < 1.0 or distance > maximum_range:
+                continue
+            if not self._node_geometrically_visible(source, other):
+                continue
+            dx, dy = other.x - source.x, other.y - source.y
+            node_bearing = math.degrees(math.atan2(dx, -dy)) % 360.0
+            node_angle = math.degrees(math.atan2(other.antenna_z - eye_z, max(1.0, distance)))
+            visible_nodes.append(HorizonNodeMarker(other.id, other.name, node_bearing, node_angle, distance))
+
+        return HorizonPanorama(source.id, eye_z, maximum_range, envelope_points, layers, visible_nodes)
 
 
 def dm_route_key(source_id: str, destination_id: str) -> str:

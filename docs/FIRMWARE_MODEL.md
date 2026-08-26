@@ -51,7 +51,7 @@ Normal antenna elevation is terrain MSL plus installation AGL. A valid live MSL 
 Terrain is sampled along each path:
 
 - terrain at or above the antenna-to-antenna line blocks reception;
-- terrain inside 60% of the first Fresnel zone adds up to 24 dB loss.
+- terrain intruding into the first Fresnel zone without blocking outright adds single-knife-edge diffraction loss, using the standard ITU-R approximation: loss grows the deeper the intrusion and caps near 6 dB at the point of exactly grazing the line of sight. Terrain clearing roughly 60% of the first Fresnel zone is treated as unaffected.
 
 Obstructions add fixed and distance-through-material loss. Their modes are:
 
@@ -59,7 +59,7 @@ Obstructions add fixed and distance-through-material loss. Their modes are:
 - `BLOCK`: stop the path;
 - `LIMIT_AFTER`: stop reception past a set distance beyond the obstruction.
 
-An RF path that clears an obstruction and 60% of its first Fresnel zone is unaffected by it.
+An obstruction whose rooftop the path clears is unaffected by it, regardless of how close the path passes to it. Only a path that is geometrically below an obstruction's top counts as a real crossing and applies its full per-obstruction loss.
 
 The global Building default is 10.8 dB for each crossed footprint plus 0.3 dB per 100 m traveled inside footprints, always using `ATTENUATE` and no arbitrary post-building range cap. This value applies equally to drawn, imported, surveyed, and unsurveyed buildings. Survey calibration can replace the fixed per-building value across the whole current scenario while leaving the propagation baseline and inside-distance term unchanged.
 
