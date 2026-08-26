@@ -6,40 +6,36 @@ Use it to explore coverage, find likely dead spots, compare node locations and h
 
 ## See it in action
 
+<div align="center">
+
 <table>
 <tr>
-<td width="50%">
-
-**Packet hops, live**
-Send a packet and watch it flood hop by hop across real terrain and buildings, colored and badged `H0`–`H3` by hop count.
+<td width="50%" valign="top">
 <img src="docs/media/packet-hops.png" alt="Packet send with colored hop lines and H0-H3 badges across a dense real map">
-
+<br><b>Packet hops, live</b><br>
+<sub>Send a packet and watch it flood hop by hop across real terrain and buildings, colored and badged H0–H3 by hop count.</sub>
 </td>
-<td width="50%">
-
-**Coverage heatmap**
-Drop a beacon and see its live range as a green-to-red ray heatmap, blocked and weakened directions called out as it pulses.
+<td width="50%" valign="top">
 <img src="docs/media/beacon-coverage.png" alt="Beacon coverage heatmap radiating across dense imported buildings">
-
+<br><b>Coverage heatmap</b><br>
+<sub>Drop a beacon and see its live range as a green-to-red ray heatmap, with blocked and weakened directions called out as it pulses.</sub>
 </td>
 </tr>
 <tr>
-<td width="50%">
-
-**360° horizon panorama**
-Stand at any node's real installed height and see the full skyline around it — terrain, buildings, and forest, obstructions marked.
+<td width="50%" valign="top">
 <img src="docs/media/horizon-panorama.png" alt="360 degree horizon panorama toward a wooded ridge with obstruction markers">
-
+<br><b>360° horizon panorama</b><br>
+<sub>Stand at any node's real installed height and see the full skyline around it — terrain, buildings, and forest, with obstructions marked.</sub>
 </td>
-<td width="50%">
-
-**Link profile between nodes**
-Slice the terrain between two nodes to see exactly what's in the way and how much margin the link has left.
+<td width="50%" valign="top">
 <img src="docs/media/profile-tool.png" alt="Elevation and obstacle profile between Node 1 and Node 2 with link margin">
-
+<br><b>Link profile between nodes</b><br>
+<sub>Slice the terrain between two nodes to see exactly what's in the way and how much margin the link has left.</sub>
 </td>
 </tr>
 </table>
+
+</div>
 
 ## Field survey firmware
 
