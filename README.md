@@ -1,6 +1,6 @@
 # MeshLab RF
 
-MeshLab RF is an unreleased Windows desktop tool for planning Meshtastic networks. It lets you place radios on a real map, import buildings and forests, use terrain elevation, and watch packets travel from node to node.
+MeshLab RF is a Windows desktop tool for planning Meshtastic networks. It lets you place radios on a real map, import buildings and forests, use terrain elevation, and watch packets travel from node to node.
 
 Use it to explore coverage, find likely dead spots, compare node locations and heights, and understand how hop limits and node roles affect a mesh. It is a planning aid, not a replacement for an RF site survey.
 
@@ -8,11 +8,11 @@ Use it to explore coverage, find likely dead spots, compare node locations and h
 
 MeshLab RF's building-attenuation model is only as good as the real-world data it's calibrated against. The [`signal_tester/`](signal_tester/) firmware turns a pair of LoRa boards into a purpose-built RF survey tool: one radio walks a route with GPS, the other sits at a fixed base, and they exchange direct probes every few seconds, logging RSSI/SNR for both directions straight to onboard flash — no phone, server, or Meshtastic mesh involved. Walk a route that crosses buildings at different distances and angles, then export both radios' logs into MeshLab RF's **Survey logs** viewer and apply **Calibrate buildings** to fit the model's attenuation value to what you actually measured.
 
-It currently targets the Heltec Mesh Node T114 (GPS, display, and battery already on one board), with the project structured to add other boards later. See [Build and modify the signal tester firmware](BUILD_FIRMWARE.md).
+It currently targets the Heltec Mesh Node T114 (GPS, display, and battery already on one board), with the project structured to add other boards later. Ready-to-flash UF2 files are on the [Releases](https://github.com/HarukiToreda/MeshLab-RF/releases) page; see [Build and modify the signal tester firmware](BUILD_FIRMWARE.md) to change it and build your own.
 
 ## Run it
 
-Open [MeshLabRF.exe](dist/MeshLabRF.exe).
+Download the latest [MeshLabRF.exe](https://github.com/HarukiToreda/MeshLab-RF/releases/latest/download/MeshLabRF.exe) from [Releases](https://github.com/HarukiToreda/MeshLab-RF/releases), or build it yourself (see [Development](#development)).
 
 The app starts with a map but no nodes. Internet access is needed for new map tiles, search, terrain, and obstacle data. Saved scenarios and cached data can be used offline.
 
