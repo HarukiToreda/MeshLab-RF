@@ -4,6 +4,8 @@ MeshLab RF is a Windows desktop tool for planning Meshtastic networks. It lets y
 
 Use it to explore coverage, find likely dead spots, compare node locations and heights, and understand how hop limits and node roles affect a mesh. It is a planning aid, not a replacement for an RF site survey.
 
+Most propagation tools stop at topography — a clean line-of-sight check over hills and nothing else. MeshLab RF also charges every building actually standing in the path, using a per-building attenuation value pulled from real field data, not a textbook guess: months of walking real routes through cities, towns, and forests with a [paired GPS/RF survey rig](#field-survey-firmware), logging exactly how much a building knocks down a Meshtastic signal at different distances and angles. The values in this repo are the compilation of that survey work so far.
+
 ## See it in action
 
 <div align="center">
