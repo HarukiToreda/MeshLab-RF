@@ -1061,19 +1061,37 @@ class PropagationModel:
     def __init__(self, scenario: Scenario):
         self.scenario = scenario
         bounds = [obstacle.normalized() for obstacle in scenario.obstacles]
-        xs = [node.x for node in scenario.nodes]
-        ys = [node.y for node in scenario.nodes]
-        for left, top, right, bottom in bounds:
-            xs.extend((left, right))
-            ys.extend((top, bottom))
+        node_xs = [node.x for node in scenario.nodes]
+        node_ys = [node.y for node in scenario.nodes]
+        obstacle_xs = [x for left, _top, right, _bottom in bounds for x in (left, right)]
+        obstacle_ys = [y for _left, top, _right, bottom in bounds for y in (top, bottom)]
+        xs = node_xs + obstacle_xs
+        ys = node_ys + obstacle_ys
         span = max(
             (max(xs) - min(xs)) if xs else 0.0,
             (max(ys) - min(ys)) if ys else 0.0,
             6_400.0,
         )
+        # Sizing purely off the combined node+obstacle span makes every cell
+        # too coarse whenever obstacles cluster far tighter than the nodes
+        # are spread (an imported city block inside a region-wide mesh): a
+        # handful of nodes 20 km apart with 8,000+ buildings packed into one
+        # square kilometre would still get the same span/64 cell everywhere,
+        # so a single query along a ray near that cluster returns hundreds of
+        # candidates the exact intersection test then has to walk one by one.
+        # Estimating a second, density-based cell size from the obstacles'
+        # own bounding box (ignoring how far-flung the nodes are) and using
+        # whichever is smaller keeps a typical 3x3-cell neighbourhood query
+        # down to roughly this many obstacles regardless of that spread.
+        TARGET_OBSTACLES_PER_CELL = 6.0
+        obstacle_span_x = (max(obstacle_xs) - min(obstacle_xs)) if obstacle_xs else 0.0
+        obstacle_span_y = (max(obstacle_ys) - min(obstacle_ys)) if obstacle_ys else 0.0
+        obstacle_area = max(1.0, obstacle_span_x) * max(1.0, obstacle_span_y)
+        obstacle_count = max(1, len(scenario.obstacles))
+        density_cell_m = math.sqrt(obstacle_area * TARGET_OBSTACLES_PER_CELL / obstacle_count)
         self._obstacle_cell_m = max(
-            100.0,
-            min(5000.0, span / 64.0),
+            25.0,
+            min(5000.0, span / 64.0, density_cell_m),
         )
         self._obstacle_cells: dict[tuple[int, int], list[int]] = {}
         self._global_obstacle_indices: list[int] = []
@@ -1370,6 +1388,26 @@ class PropagationModel:
         t0, t1 = min(inside_parameters), max(inside_parameters)
         return planar * (t1 - t0), (t0 + t1) / 2.0, t1
 
+    @staticmethod
+    def _segment_bbox_overlaps(
+        ax: float, ay: float, bx: float, by: float, bounds: tuple[float, float, float, float]
+    ) -> bool:
+        """Cheap reject before the exact (and much pricier) polygon walk: if
+        the segment's own bounding box sits wholly to one side of the
+        obstacle's cached bounding box, it cannot possibly cross it. Same
+        fast-reject `_segment_rect_intersection` already does for rectangles,
+        just usable ahead of the polygon path too -- a spatial-hash query
+        along a long ray routinely returns hundreds of candidates nowhere
+        near it, and every one used to pay for two point-in-polygon tests
+        plus a full edge walk before this existed."""
+        x_min, y_min, x_max, y_max = bounds
+        return not (
+            (ax < x_min and bx < x_min)
+            or (ax > x_max and bx > x_max)
+            or (ay < y_min and by < y_min)
+            or (ay > y_max and by > y_max)
+        )
+
     def _obstacle_intersection(
         self, obstacle: Obstacle, source: Node, target: Node
     ) -> tuple[float, float | None, float | None]:
@@ -1377,23 +1415,32 @@ class PropagationModel:
             return self._segment_brush_intersection(
                 source.x, source.y, target.x, target.y, obstacle.points, obstacle.brush_radius_m
             )
+        obstacle_key = id(obstacle)
         if obstacle.shape == "polygon" and len(obstacle.points) >= 3:
-            polygon = self._obstacle_polygons[id(obstacle)]
+            if not self._segment_bbox_overlaps(
+                source.x, source.y, target.x, target.y, self._obstacle_bounds[obstacle_key]
+            ):
+                return 0.0, None, None
+            polygon = self._obstacle_polygons[obstacle_key]
             return self._segment_polygon_intersection(source.x, source.y, target.x, target.y, polygon)
         if obstacle.kind == "Mountain":
+            if not self._segment_bbox_overlaps(
+                source.x, source.y, target.x, target.y, self._obstacle_bounds[obstacle_key]
+            ):
+                return 0.0, None, None
             return self._segment_polygon_intersection(
                 source.x,
                 source.y,
                 target.x,
                 target.y,
-                self._obstacle_polygons[id(obstacle)],
+                self._obstacle_polygons[obstacle_key],
             )
         return self._segment_rect_intersection(
             source.x,
             source.y,
             target.x,
             target.y,
-            self._obstacle_bounds[id(obstacle)],
+            self._obstacle_bounds[obstacle_key],
         )
 
     def _obstacle_effects(
