@@ -4,6 +4,43 @@ MeshLab RF is a Windows desktop tool for planning Meshtastic networks. It lets y
 
 Use it to explore coverage, find likely dead spots, compare node locations and heights, and understand how hop limits and node roles affect a mesh. It is a planning aid, not a replacement for an RF site survey.
 
+## See it in action
+
+<table>
+<tr>
+<td width="50%">
+
+**Packet hops, live**
+Send a packet and watch it flood hop by hop across real terrain and buildings, colored and badged `H0`–`H3` by hop count.
+<img src="docs/media/packet-hops.png" alt="Packet send with colored hop lines and H0-H3 badges across a dense real map">
+
+</td>
+<td width="50%">
+
+**Coverage heatmap**
+Drop a beacon and see its live range as a green-to-red ray heatmap, blocked and weakened directions called out as it pulses.
+<img src="docs/media/beacon-coverage.png" alt="Beacon coverage heatmap radiating across dense imported buildings">
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+**360° horizon panorama**
+Stand at any node's real installed height and see the full skyline around it — terrain, buildings, and forest, obstructions marked.
+<img src="docs/media/horizon-panorama.png" alt="360 degree horizon panorama toward a wooded ridge with obstruction markers">
+
+</td>
+<td width="50%">
+
+**Link profile between nodes**
+Slice the terrain between two nodes to see exactly what's in the way and how much margin the link has left.
+<img src="docs/media/profile-tool.png" alt="Elevation and obstacle profile between Node 1 and Node 2 with link margin">
+
+</td>
+</tr>
+</table>
+
 ## Field survey firmware
 
 MeshLab RF's building-attenuation model is only as good as the real-world data it's calibrated against. The [`signal_tester/`](signal_tester/) firmware turns a pair of LoRa boards into a purpose-built RF survey tool: one radio walks a route with GPS, the other sits at a fixed base, and they exchange direct probes every few seconds, logging RSSI/SNR for both directions straight to onboard flash — no phone, server, or Meshtastic mesh involved. Walk a route that crosses buildings at different distances and angles, then export both radios' logs into MeshLab RF's **Survey logs** viewer and apply **Calibrate buildings** to fit the model's attenuation value to what you actually measured.
