@@ -1084,6 +1084,17 @@ class PropagationModel:
     # makes a large flood (many nodes, most of them out of each other's range)
     # tractable instead of paying full ray/terrain geometry for every pair.
     HOPELESS_MARGIN_DEFICIT_DB = 40.0
+    # A straight ray crossing many buildings in a row and charging each one
+    # its full flat penalty compounds into triple-digit dB totals implying an
+    # RSSI far below anything a receiver could ever decode -- a number with
+    # no physical meaning, since real signal that far behind a dense block
+    # reaches the receiver by a path the single-ray model never considers
+    # (over rooftops, around corners, down streets), not by punching through
+    # every building in a straight line. Field survey data across 1-16
+    # stacked crossings never showed more than about 40 dB of real building
+    # loss even in the most favorable case; this cap leaves headroom above
+    # that observed ceiling while eliminating physically-impossible totals.
+    MAX_OBSTACLE_STACK_LOSS_DB = 60.0
     TERRAIN_HORIZON_COLOR = "#3a6b64"
 
     def __init__(self, scenario: Scenario):
@@ -1479,6 +1490,7 @@ class PropagationModel:
         ray_intervals: dict[int, tuple[float, float]] | None = None,
     ) -> tuple[float, list[str], str]:
         total = 0.0
+        peak_single_loss = 0.0
         hit_names: list[str] = []
         segment_distance = math.hypot(target.x - source.x, target.y - source.y)
         planar_distance = max(1.0, segment_distance)
@@ -1525,18 +1537,25 @@ class PropagationModel:
             loss = obstacle.attenuation_db
             loss += obstacle.loss_per_100m_db * (inside_length / 100.0)
             total += loss
+            peak_single_loss = max(peak_single_loss, loss)
+            # A straight-line stack of many buildings shouldn't compound past
+            # a physically meaningless total, but a single obstacle's own
+            # configured loss (e.g. a deliberately lossy custom obstacle) is
+            # always honored in full -- only the summed contribution of
+            # multiple obstacles gets capped.
+            capped_total = min(total, max(self.MAX_OBSTACLE_STACK_LOSS_DB, peak_single_loss))
             hit_names.append(f"{obstacle.name} ({loss:.1f} dB)")
             if obstacle.behavior == "BLOCK":
-                return total, hit_names, f"{obstacle.name} blocks line of sight"
+                return capped_total, hit_names, f"{obstacle.name} blocks line of sight"
             if obstacle.behavior == "LIMIT_AFTER" and exit_t is not None and obstacle.max_range_beyond_m > 0:
                 distance_after = planar_distance * (1.0 - exit_t)
                 if distance_after > obstacle.max_range_beyond_m:
                     return (
-                        total,
+                        capped_total,
                         hit_names,
                         f"{obstacle.name} limits travel to {obstacle.max_range_beyond_m / 1609.344:.2f} mi beyond it",
                     )
-        return total, hit_names, ""
+        return min(total, max(self.MAX_OBSTACLE_STACK_LOSS_DB, peak_single_loss)), hit_names, ""
 
     def _terrain_effects(self, source: Node, target: Node) -> tuple[float, str]:
         environment = self.scenario.environment
