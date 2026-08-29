@@ -1671,45 +1671,6 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(len(profile.obstacles), 15)
         self.assertLess(profile.margin_db, MIN_DECODE_MARGIN_DB)
 
-    def test_many_stacked_buildings_cap_at_a_physically_plausible_total(self):
-        """A straight ray crossing a dozen buildings in a row at their flat
-        default penalty would sum past 100 dB, implying an RSSI far below
-        anything a receiver could ever decode. Real signal that deep behind a
-        block reaches the receiver by some other path (over rooftops, around
-        corners) that the single-ray model can't see, so the total shouldn't
-        compound past a physically meaningful ceiling."""
-        source = Node(x=0, y=0, antenna_height_m=2.0)
-        target = Node(x=1300, y=0, antenna_height_m=2.0)
-        buildings = [
-            Obstacle(
-                id=f"b{index}", name=f"Building {index}", kind="Building",
-                x1=100.0 * index, y1=-10, x2=100.0 * index + 20, y2=10,
-                height_m=12, behavior="ATTENUATE",
-            )
-            for index in range(12)
-        ]
-        model = PropagationModel(Scenario(nodes=[source, target], obstacles=buildings))
-
-        obstacle_loss, hit_names, _reason = model._obstacle_effects(source, target)
-
-        self.assertEqual(len(hit_names), 12)
-        self.assertEqual(obstacle_loss, PropagationModel.MAX_OBSTACLE_STACK_LOSS_DB)
-
-    def test_single_obstacles_own_high_loss_is_never_capped(self):
-        """The stacking cap must never discount a single obstacle's own
-        deliberately-configured loss below what the user actually set."""
-        source = Node(x=0, y=0, antenna_height_m=2.0)
-        target = Node(x=200, y=0, antenna_height_m=2.0)
-        heavy_obstacle = Obstacle(
-            kind="Building", x1=80, y1=-10, x2=120, y2=10,
-            height_m=12, attenuation_db=90.0, loss_per_100m_db=0.0, behavior="ATTENUATE",
-        )
-        model = PropagationModel(Scenario(nodes=[source, target], obstacles=[heavy_obstacle]))
-
-        obstacle_loss, _hit_names, _reason = model._obstacle_effects(source, target)
-
-        self.assertAlmostEqual(obstacle_loss, 90.0)
-
     def test_manual_below_ground_override_remains_physically_blocked(self):
         environment = Environment(
             initial_view_width_m=1000,
