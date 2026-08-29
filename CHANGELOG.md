@@ -4,6 +4,7 @@
 
 ### Added
 
+- **Incognito mode.** A new View menu toggle ("Incognito mode") hides every coordinate display in the tool — node and obstacle position fields (latitude/longitude or X/Y, whichever is shown), the canvas hover status bar, the scale bar's coordinate readout, the Survey logs GPS column, and Horizon/Profile point labels. Position fields show masked dots instead of blanking, so editing still works normally; only the displayed text is hidden. Useful for recording screen content without revealing your location.
 - **Survey playback.** The Survey logs viewer can now walk a loaded survey on the map over time instead of showing every point at once. Play/Pause, a speed selector (1x–600x), and a scrub bar sit above the measurement table; the current position is highlighted on the map with its live RSSI, and points reveal in GPS-timestamp order as playback advances.
 - **Animated ping during playback.** As each probe is revealed, a short animated pulse travels from the mobile position out to the base, then back again if the base replied — a lost probe visibly fades out partway instead of completing the trip.
 

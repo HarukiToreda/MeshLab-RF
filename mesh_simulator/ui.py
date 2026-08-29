@@ -826,6 +826,7 @@ class MeshSimulatorApp:
         self.show_drops = tk.BooleanVar(value=True)
         self.map_visible = tk.BooleanVar(value=True)
         self.terrain_only_view = tk.BooleanVar(value=False)
+        self.incognito_mode = tk.BooleanVar(value=False)
         self.unit_system = tk.StringVar(value="Imperial")
         self.hop_line_vars = {hop: tk.BooleanVar(value=True) for hop in range(1, 8)}
         self.results_stale = False
@@ -1100,6 +1101,17 @@ class MeshSimulatorApp:
             )
         self.render_canvas()
 
+    def _incognito_changed(self) -> None:
+        enabled = self.incognito_mode.get()
+        self.status_var.set(
+            "Incognito mode on · all coordinate displays hidden"
+            if enabled
+            else "Incognito mode off"
+        )
+        self._build_object_form()
+        self._refresh_survey_table()
+        self.render_canvas()
+
     def _units_changed(self, _event: tk.Event | None = None) -> None:
         self.refresh_all()
         if self.last_result is not None:
@@ -1140,6 +1152,11 @@ class MeshSimulatorApp:
             command=self._terrain_only_changed,
         )
         view_menu.add_command(label="Refresh terrain data", command=self.load_topography)
+        view_menu.add_checkbutton(
+            label="Incognito mode (hide all coordinates)",
+            variable=self.incognito_mode,
+            command=self._incognito_changed,
+        )
         units_menu = self._dark_menu(view_menu)
         for units in ("Imperial", "Metric"):
             units_menu.add_radiobutton(
@@ -2401,7 +2418,9 @@ class MeshSimulatorApp:
         node = Node(x=x, y=y)
         self._set_auto_node_elevation(node)
         env = self.scenario.environment
-        if env.map_configured:
+        if self.incognito_mode.get():
+            label = "Point"
+        elif env.map_configured:
             latitude, longitude = world_to_latlon(x, y, env.map_center_lat, env.map_center_lon)
             label = f"{latitude:.5f}, {longitude:.5f}"
         else:
@@ -4572,12 +4591,16 @@ class MeshSimulatorApp:
 
         section = self._section(body, "Position & installation height")
         length_unit = self._length_unit()
+        incognito = self.incognito_mode.get()
         if env.map_configured:
-            self._field(section, 0, "Latitude", self.object_vars["latitude"])
-            self._field(section, 1, "Longitude", self.object_vars["longitude"])
+            lat_field = self._field(section, 0, "Latitude", self.object_vars["latitude"])
+            lon_field = self._field(section, 1, "Longitude", self.object_vars["longitude"])
         else:
-            self._field(section, 0, f"X ({length_unit})", self.object_vars["x"])
-            self._field(section, 1, f"Y ({length_unit})", self.object_vars["y"])
+            lat_field = self._field(section, 0, f"X ({length_unit})", self.object_vars["x"])
+            lon_field = self._field(section, 1, f"Y ({length_unit})", self.object_vars["y"])
+        if incognito:
+            lat_field.configure(show="•")
+            lon_field.configure(show="•")
         self._field(section, 2, f"Terrain elevation MSL ({length_unit})", self.object_vars["elevation_m"])
         self._check(section, 3, "Manually override terrain elevation", self.object_vars["elevation_override"])
         self._field(
@@ -4818,10 +4841,13 @@ class MeshSimulatorApp:
                 justify="left",
             ).grid(row=3, column=0, columnspan=2, sticky="w", pady=6)
         else:
-            self._field(section, 0, f"Left X ({length_unit})", self.object_vars["x1"])
-            self._field(section, 1, f"Top Y ({length_unit})", self.object_vars["y1"])
-            self._field(section, 2, f"Right X ({length_unit})", self.object_vars["x2"])
-            self._field(section, 3, f"Bottom Y ({length_unit})", self.object_vars["y2"])
+            x1_field = self._field(section, 0, f"Left X ({length_unit})", self.object_vars["x1"])
+            y1_field = self._field(section, 1, f"Top Y ({length_unit})", self.object_vars["y1"])
+            x2_field = self._field(section, 2, f"Right X ({length_unit})", self.object_vars["x2"])
+            y2_field = self._field(section, 3, f"Bottom Y ({length_unit})", self.object_vars["y2"])
+            if self.incognito_mode.get():
+                for field in (x1_field, y1_field, x2_field, y2_field):
+                    field.configure(show="•")
             self._field(section, 4, f"Height AGL ({length_unit})", self.object_vars["height_m"])
             self._field(section, 5, f"Ground elevation ({length_unit})", self.object_vars["base_elevation_m"])
         section = self._section(body, "Signal loss")
@@ -8704,10 +8730,13 @@ class MeshSimulatorApp:
         cx, cy = c.winfo_width() / 2.0, c.winfo_height() / 2.0
         wx, wy = self.screen_to_world(cx, cy)
         env = self.scenario.environment
-        coordinates = f"X {self.format_distance(wx)} · Y {self.format_distance(wy)}"
-        if env.map_configured:
-            latitude, longitude = world_to_latlon(wx, wy, env.map_center_lat, env.map_center_lon)
-            coordinates += f" · {latitude:.5f}, {longitude:.5f}"
+        if self.incognito_mode.get():
+            coordinates = ""
+        else:
+            coordinates = f"X {self.format_distance(wx)} · Y {self.format_distance(wy)}"
+            if env.map_configured:
+                latitude, longitude = world_to_latlon(wx, wy, env.map_center_lat, env.map_center_lon)
+                coordinates += f" · {latitude:.5f}, {longitude:.5f}"
 
         self._halo_line(c, x, y, x + pixels, y)
         self._halo_line(c, x, y - 4, x, y + 4)
@@ -9128,6 +9157,9 @@ class MeshSimulatorApp:
         self.zoom_render_after = self.root.after(90, self._finish_zoom_render)
 
     def _canvas_motion(self, event: tk.Event) -> None:
+        if self.incognito_mode.get():
+            self.status_var.set(f"{self.tool.title()} · zoom {self.zoom:.2f}×")
+            return
         wx, wy = self.screen_to_world(event.x, event.y)
         env = self.scenario.environment
         geographic = ""
@@ -10404,7 +10436,10 @@ class MeshSimulatorApp:
             timestamp = datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S") if epoch > 0 else "GPS time unavailable"
             latitude = survey_float(measurement.get("mobile_latitude"))
             longitude = survey_float(measurement.get("mobile_longitude"))
-            location = f"{latitude:.6f}, {longitude:.6f}" if latitude is not None and longitude is not None else "No GPS"
+            if self.incognito_mode.get():
+                location = "hidden" if latitude is not None and longitude is not None else "No GPS"
+            else:
+                location = f"{latitude:.6f}, {longitude:.6f}" if latitude is not None and longitude is not None else "No GPS"
             forward = survey_bool(measurement.get("forward_received"))
             reply = survey_bool(measurement.get("reply_received"))
             reply_known = survey_value_known(measurement.get("reply_received"))
