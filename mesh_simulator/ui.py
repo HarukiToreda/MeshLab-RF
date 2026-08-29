@@ -871,10 +871,9 @@ class MeshSimulatorApp:
         self.live_connection_ready = False
         self.survey_window: tk.Toplevel | None = None
         self.survey_ports: dict[str, SerialPort] = {}
-        self.survey_mobile_port_var = tk.StringVar()
-        self.survey_base_port_var = tk.StringVar()
+        self.survey_port_var = tk.StringVar()
         self.survey_captures: dict[str, DeviceCapture] = {}
-        self.survey_capture_attempts: set[tuple[str, str]] = set()
+        self.survey_capture_attempts: set[str] = set()
         self.survey_devices: list[DeviceInfo] = []
         self.survey_measurements: list[dict[str, object]] = []
         self.survey_selected_index: int | None = None
@@ -2827,18 +2826,17 @@ class MeshSimulatorApp:
             textvariable=self.live_port_var,
             state="readonly",
         )
-        self.live_port_picker.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        self.live_refresh_button = ttk.Button(connection, text="Refresh", command=self.refresh_live_ports)
-        self.live_refresh_button.grid(row=1, column=0, sticky="ew", padx=(0, 3))
+        self.live_port_picker.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        self.live_port_picker.bind("<Button-1>", self.refresh_live_ports)
         self.live_connect_button = ttk.Button(
             connection, text="Connect", style="Accent.TButton", command=self.connect_live_radio
         )
-        self.live_connect_button.grid(row=1, column=1, sticky="ew", padx=3)
+        self.live_connect_button.grid(row=1, column=0, sticky="ew", padx=(0, 3))
         self.live_disconnect_button = ttk.Button(
             connection, text="Disconnect", command=self.disconnect_live_radio, state="disabled"
         )
-        self.live_disconnect_button.grid(row=1, column=2, sticky="ew", padx=(3, 0))
-        for column in range(3):
+        self.live_disconnect_button.grid(row=1, column=1, sticky="ew", padx=(3, 0))
+        for column in range(2):
             connection.columnconfigure(column, weight=1)
 
         options = ttk.Frame(self.live_panel)
@@ -2873,7 +2871,7 @@ class MeshSimulatorApp:
         ).pack(fill="x", padx=10, pady=8)
         self.refresh_live_ports()
 
-    def refresh_live_ports(self) -> None:
+    def refresh_live_ports(self, _event: tk.Event | None = None) -> None:
         previous_device = ""
         selected = self.live_ports.get(self.live_port_var.get())
         if selected is not None:
@@ -2905,13 +2903,12 @@ class MeshSimulatorApp:
         if port is None:
             messagebox.showinfo(
                 "Choose a COM port",
-                "Connect the radio by USB, press Refresh, then choose its COM port.",
+                "Connect the radio by USB, then choose its COM port from the dropdown.",
                 parent=self.root,
             )
             return
         self.live_connection_ready = False
         self.live_connect_button.configure(state="disabled")
-        self.live_refresh_button.configure(state="disabled")
         self.live_disconnect_button.configure(state="normal")
         self.live_port_picker.configure(state="disabled")
         self.live_status_var.set(f"Connecting {port.device}…")
@@ -2930,7 +2927,6 @@ class MeshSimulatorApp:
 
     def _set_live_disconnected_controls(self) -> None:
         self.live_connect_button.configure(state="normal")
-        self.live_refresh_button.configure(state="normal")
         self.live_disconnect_button.configure(state="disabled")
         self.live_port_picker.configure(state="readonly")
 
@@ -9651,8 +9647,6 @@ class MeshSimulatorApp:
         ).pack(anchor="w")
         actions = ttk.Frame(header, style="Toolbar.TFrame")
         actions.pack(side="right", padx=12, pady=10)
-        self.survey_scan_button = ttk.Button(actions, text="Refresh ports", command=self._start_survey_scan)
-        self.survey_scan_button.pack(side="left", padx=3)
         self.survey_export_button = ttk.Button(
             actions, text="Save captured logs…", style="Accent.TButton", command=self._start_survey_export,
             state="disabled",
@@ -9678,24 +9672,18 @@ class MeshSimulatorApp:
         devices_frame.pack(fill="x", padx=12, pady=5)
         port_picker = ttk.Frame(devices_frame)
         port_picker.pack(fill="x", padx=7, pady=(7, 2))
-        ttk.Label(port_picker, text="Mobile port", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
-        self.survey_mobile_port_combo = ttk.Combobox(
-            port_picker, textvariable=self.survey_mobile_port_var, state="readonly", width=42,
+        ttk.Label(port_picker, text="Survey node port", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        self.survey_port_combo = ttk.Combobox(
+            port_picker, textvariable=self.survey_port_var, state="readonly", width=42,
         )
-        self.survey_mobile_port_combo.grid(row=1, column=0, sticky="ew", padx=(0, 8))
-        ttk.Label(port_picker, text="Base port", style="Muted.TLabel").grid(row=0, column=1, sticky="w")
-        self.survey_base_port_combo = ttk.Combobox(
-            port_picker, textvariable=self.survey_base_port_var, state="readonly", width=42,
-        )
-        self.survey_base_port_combo.grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        self.survey_port_combo.grid(row=1, column=0, sticky="ew", padx=(0, 8))
         self.survey_identify_button = ttk.Button(
             port_picker, text="Reload selected", command=self._start_survey_identify, state="disabled",
         )
-        self.survey_identify_button.grid(row=1, column=2, sticky="ew")
+        self.survey_identify_button.grid(row=1, column=1, sticky="ew")
         port_picker.columnconfigure(0, weight=1)
-        port_picker.columnconfigure(1, weight=1)
-        self.survey_mobile_port_combo.bind("<<ComboboxSelected>>", self._survey_port_changed)
-        self.survey_base_port_combo.bind("<<ComboboxSelected>>", self._survey_port_changed)
+        self.survey_port_combo.bind("<<ComboboxSelected>>", self._survey_port_changed)
+        self.survey_port_combo.bind("<Button-1>", self._refresh_survey_ports)
         self.survey_devices_tree = ttk.Treeview(
             devices_frame,
             columns=("role", "port", "node", "records", "size", "format"),
@@ -9763,7 +9751,8 @@ class MeshSimulatorApp:
         )
         self.survey_tree.bind("<<TreeviewSelect>>", self._survey_tree_selected)
 
-        self._start_survey_scan()
+        self._refresh_survey_ports()
+        self._survey_port_changed()
         if self.survey_measurements:
             self._apply_survey_measurements(self.survey_measurements, self.survey_export_path, fit=False)
 
@@ -9775,13 +9764,10 @@ class MeshSimulatorApp:
     def _survey_set_busy(self, busy: bool, message: str = "") -> None:
         if self.survey_window is None or not self.survey_window.winfo_exists():
             return
-        state = "disabled" if busy else "normal"
-        self.survey_scan_button.configure(state=state)
-        self.survey_mobile_port_combo.configure(state="disabled" if busy else "readonly")
-        self.survey_base_port_combo.configure(state="disabled" if busy else "readonly")
-        selected_ports = self._selected_survey_ports()
+        self.survey_port_combo.configure(state="disabled" if busy else "readonly")
+        selected_port = self._selected_survey_port()
         self.survey_identify_button.configure(
-            state="normal" if not busy and selected_ports else "disabled"
+            state="normal" if not busy and selected_port else "disabled"
         )
         self.survey_export_button.configure(
             state="disabled" if busy or not self.survey_captures else "normal"
@@ -9795,86 +9781,67 @@ class MeshSimulatorApp:
             self.survey_progress.stop()
             self.survey_progress.configure(mode="determinate")
 
-    def _start_survey_scan(self) -> None:
+    def _refresh_survey_ports(self, _event: tk.Event | None = None) -> None:
         if self.survey_worker is not None and self.survey_worker.is_alive():
             return
-        previous_mobile = self.survey_mobile_port_var.get()
-        previous_base = self.survey_base_port_var.get()
+        previous = self.survey_port_var.get()
         ports = list_serial_ports()
         self.survey_ports = {port.label: port for port in ports}
         labels = [SURVEY_PORT_NONE, *self.survey_ports]
-        self.survey_mobile_port_combo.configure(values=labels)
-        self.survey_base_port_combo.configure(values=labels)
-        self.survey_mobile_port_var.set(previous_mobile if previous_mobile in self.survey_ports else SURVEY_PORT_NONE)
-        self.survey_base_port_var.set(previous_base if previous_base in self.survey_ports else SURVEY_PORT_NONE)
-        self._survey_port_changed()
+        self.survey_port_combo.configure(values=labels)
+        self.survey_port_var.set(previous if previous in self.survey_ports else SURVEY_PORT_NONE)
         if ports:
             self.survey_status_var.set(
                 f"Found {len(ports)} serial port{'s' if len(ports) != 1 else ''}. "
-                "Choose either survey node to load and plot it automatically."
+                "Choose the connected survey node to load and plot it automatically."
             )
         else:
-            self.survey_status_var.set("No serial ports found. Connect the survey nodes and refresh ports.")
+            self.survey_status_var.set("No serial ports found. Connect a survey node and open the dropdown again.")
 
-    def _selected_survey_ports(self) -> list[str]:
-        selected: list[str] = []
-        for variable in (self.survey_mobile_port_var, self.survey_base_port_var):
-            port = self.survey_ports.get(variable.get())
-            if port is not None and port.device not in selected:
-                selected.append(port.device)
-        return selected
+    def _selected_survey_port(self) -> str | None:
+        port = self.survey_ports.get(self.survey_port_var.get())
+        return port.device if port is not None else None
 
     def _survey_port_changed(self, _event: tk.Event | None = None) -> None:
         self.survey_devices = []
         self._populate_survey_devices()
-        selected = self._selected_survey_ports()
+        port = self._selected_survey_port()
         if hasattr(self, "survey_identify_button"):
-            self.survey_identify_button.configure(state="normal" if selected else "disabled")
+            self.survey_identify_button.configure(state="normal" if port else "disabled")
         if hasattr(self, "survey_export_button"):
             self.survey_export_button.configure(state="disabled")
-        if hasattr(self, "survey_status_var") and selected:
-            self.survey_status_var.set(
-                f"Loading {len(selected)} selected survey node{'s' if len(selected) != 1 else ''}…"
-            )
-        for assignment in self._selected_survey_assignments().items():
-            self.survey_capture_attempts.discard(assignment)
+        if port is not None:
+            self.survey_capture_attempts.discard(port)
+            if hasattr(self, "survey_status_var"):
+                self.survey_status_var.set("Loading the selected survey node…")
         self._capture_next_selected()
-
-    def _selected_survey_assignments(self) -> dict[str, str]:
-        assignments: dict[str, str] = {}
-        mobile = self.survey_ports.get(self.survey_mobile_port_var.get())
-        base = self.survey_ports.get(self.survey_base_port_var.get())
-        if mobile is not None:
-            assignments["mobile"] = mobile.device
-        if base is not None:
-            assignments["base"] = base.device
-        return assignments
 
     def _capture_next_selected(self) -> None:
         if self.survey_worker is not None and self.survey_worker.is_alive():
             return
-        for role, port in self._selected_survey_assignments().items():
-            existing = self.survey_captures.get(role)
-            if (existing is None or existing.info.port != port) and (role, port) not in self.survey_capture_attempts:
-                self._start_survey_capture(role, port)
-                return
+        port = self._selected_survey_port()
+        if port is None or port in self.survey_capture_attempts:
+            return
+        if any(capture.info.port == port for capture in self.survey_captures.values()):
+            return
+        self._start_survey_capture(port)
 
     def _start_survey_identify(self) -> None:
         if self.survey_worker is not None and self.survey_worker.is_alive():
             return
-        assignments = self._selected_survey_assignments()
-        if not assignments:
-            self.survey_status_var.set("Choose at least one survey-node port first.")
+        port = self._selected_survey_port()
+        if port is None:
+            self.survey_status_var.set("Choose a survey-node port first.")
             return
-        for role in assignments:
-            self.survey_captures.pop(role, None)
-        for assignment in assignments.items():
-            self.survey_capture_attempts.discard(assignment)
+        for role, capture in list(self.survey_captures.items()):
+            if capture.info.port == port:
+                self.survey_captures.pop(role, None)
+        self.survey_capture_attempts.discard(port)
         self._capture_next_selected()
 
-    def _start_survey_capture(self, expected_role: str, port: str) -> None:
-        self.survey_capture_attempts.add((expected_role, port))
-        self._survey_set_busy(True, f"Loading the {expected_role} survey log from {port}…")
+    def _start_survey_capture(self, port: str) -> None:
+        self.survey_capture_attempts.add(port)
+        self._survey_set_busy(True, f"Loading the survey log from {port}…")
 
         def progress(message: str, fraction: float | None) -> None:
             self.survey_updates.put(("progress", (message, fraction)))
@@ -9882,10 +9849,6 @@ class MeshSimulatorApp:
         def worker() -> None:
             try:
                 info = query_device(port)
-                if info.role != expected_role:
-                    raise RuntimeError(
-                        f"{port} is not the {expected_role} survey node; firmware reported {info.role}"
-                    )
                 self.survey_updates.put(("capture", capture_device(info, progress)))
             except Exception as error:
                 self.survey_updates.put(("error", error))
@@ -10249,8 +10212,6 @@ class MeshSimulatorApp:
         self.status_var.set(f"Exported results to {path}")
 
     def on_close(self) -> None:
-        if not self._confirm_discard():
-            return
         self.stop_animation()
         self.stop_live_mesh(clear_visuals=True)
         if self.live_radio.connected or self.live_radio.connecting:

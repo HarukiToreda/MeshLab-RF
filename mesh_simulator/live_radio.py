@@ -58,6 +58,11 @@ def _port_number(device: str) -> int:
     return int(match.group(1)) if match else 1_000_000
 
 
+def _is_bluetooth_port(port: SerialPort) -> bool:
+    text = f"{port.description} {port.hardware_id}".lower()
+    return "bluetooth" in text or "bthenum" in text
+
+
 def list_serial_ports() -> list[SerialPort]:
     ports = [
         SerialPort(
@@ -67,10 +72,11 @@ def list_serial_ports() -> list[SerialPort]:
         )
         for port in list_ports.comports()
     ]
+    ports = [port for port in ports if not _is_bluetooth_port(port)]
 
     def priority(port: SerialPort) -> tuple[int, int, str]:
         text = f"{port.description} {port.hardware_id}".lower()
-        likely_usb_radio = "usb" in text and "bluetooth" not in text
+        likely_usb_radio = "usb" in text
         return (0 if likely_usb_radio else 1, _port_number(port.device), port.device)
 
     return sorted(ports, key=priority)
