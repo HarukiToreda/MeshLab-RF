@@ -74,16 +74,29 @@ def _map_center_mercator(latitude: float, longitude: float) -> tuple[float, floa
     return latlon_to_mercator(latitude, longitude)
 
 
+def world_scale_factor(center_latitude: float) -> float:
+    """Ratio of true ground meters to raw Web Mercator meters at a latitude.
+
+    Web Mercator inflates ground distance by 1/cos(latitude) away from the
+    equator. Every "world" x/y used for placing nodes and obstacles is scaled
+    by this factor so that one world unit equals one true ground meter near
+    the map center, instead of a latitude-dependent, inflated Mercator meter.
+    """
+    clamped = max(-MAX_LATITUDE, min(MAX_LATITUDE, center_latitude))
+    return math.cos(math.radians(clamped))
+
+
 def latlon_to_world(
     latitude: float,
     longitude: float,
     center_latitude: float,
     center_longitude: float,
 ) -> tuple[float, float]:
-    """Return unrestricted, center-relative Web Mercator coordinates."""
+    """Return unrestricted, center-relative coordinates in true ground meters."""
     x, y = latlon_to_mercator(latitude, longitude)
     center_x, center_y = _map_center_mercator(center_latitude, center_longitude)
-    return x - center_x, center_y - y
+    scale = world_scale_factor(center_latitude)
+    return (x - center_x) * scale, (center_y - y) * scale
 
 
 def world_to_latlon(
@@ -92,9 +105,10 @@ def world_to_latlon(
     center_latitude: float,
     center_longitude: float,
 ) -> tuple[float, float]:
-    """Convert unrestricted center-relative coordinates to latitude/longitude."""
+    """Convert unrestricted center-relative true-meter coordinates to latitude/longitude."""
     center_x, center_y = _map_center_mercator(center_latitude, center_longitude)
-    return mercator_to_latlon(center_x + x, center_y - y)
+    scale = world_scale_factor(center_latitude)
+    return mercator_to_latlon(center_x + x / scale, center_y - y / scale)
 
 
 def world_viewport_to_mercator_bounds(
@@ -105,15 +119,16 @@ def world_viewport_to_mercator_bounds(
     center_latitude: float,
     center_longitude: float,
 ) -> tuple[float, float, float, float]:
-    """Convert an unrestricted canvas viewport into ordered Web Mercator bounds."""
+    """Convert an unrestricted true-meter canvas viewport into ordered Web Mercator bounds."""
     left, right = min(world_left, world_right), max(world_left, world_right)
     top, bottom = min(world_top, world_bottom), max(world_top, world_bottom)
     center_x, center_y = _map_center_mercator(center_latitude, center_longitude)
+    scale = world_scale_factor(center_latitude)
     return (
-        center_x + left,
-        center_y - top,
-        center_x + right,
-        center_y - bottom,
+        center_x + left / scale,
+        center_y - top / scale,
+        center_x + right / scale,
+        center_y - bottom / scale,
     )
 
 
@@ -552,10 +567,16 @@ class MapDataService:
         columns = columns or max(49, min(129, round(width_m / 175.0) + 1))
         rows = max(25, min(97, round(columns * height_m / max(1.0, width_m))))
         center_x, center_y = latlon_to_mercator(center_latitude, center_longitude)
-        left = center_x - width_m / 2.0
-        right = center_x + width_m / 2.0
-        bottom = center_y - height_m / 2.0
-        top = center_y + height_m / 2.0
+        # width_m/height_m are true ground meters; Web Mercator itself inflates
+        # distance by 1/cos(latitude), so the raw mercator span to query is
+        # larger than the true-meter span by that same factor.
+        scale = world_scale_factor(center_latitude)
+        mercator_width = width_m / scale
+        mercator_height = height_m / scale
+        left = center_x - mercator_width / 2.0
+        right = center_x + mercator_width / 2.0
+        bottom = center_y - mercator_height / 2.0
+        top = center_y + mercator_height / 2.0
         zoom = 14
         while zoom > 1:
             tx1, ty1 = mercator_to_tile(left, top, zoom)
@@ -566,7 +587,7 @@ class MapDataService:
             zoom -= 1
         column_samples: list[tuple[int, int]] = []
         for column in range(columns):
-            mercator_x = left + width_m * column / max(1, columns - 1)
+            mercator_x = left + mercator_width * column / max(1, columns - 1)
             tile_x_float, _unused_y = mercator_to_tile(mercator_x, center_y, zoom)
             tile_x = math.floor(tile_x_float)
             pixel_x = max(0, min(255, int((tile_x_float - tile_x) * 256)))
@@ -574,7 +595,7 @@ class MapDataService:
 
         row_samples: list[tuple[int, int]] = []
         for row in range(rows):
-            mercator_y = top - height_m * row / max(1, rows - 1)
+            mercator_y = top - mercator_height * row / max(1, rows - 1)
             _unused_x, tile_y_float = mercator_to_tile(center_x, mercator_y, zoom)
             tile_y = math.floor(tile_y_float)
             pixel_y = max(0, min(255, int((tile_y_float - tile_y) * 256)))

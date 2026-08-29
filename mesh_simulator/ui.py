@@ -35,6 +35,7 @@ from .geography import (
     obstacle_import_plan,
     tile_bounds_mercator,
     tile_size_m,
+    world_scale_factor,
     world_viewport_to_mercator_bounds,
     world_to_latlon,
 )
@@ -3153,12 +3154,13 @@ class MeshSimulatorApp:
         max_y = max(point[1] for point in mercator_points)
         span_x = max_x - min_x
         span_y = max_y - min_y
-        env.initial_view_width_m = max(6_000.0, span_x * 1.35)
-        env.initial_view_height_m = max(4_200.0, span_y * 1.35)
         env.map_center_lat, env.map_center_lon = mercator_to_latlon(
             (min_x + max_x) / 2.0,
             (min_y + max_y) / 2.0,
         )
+        mercator_scale = world_scale_factor(env.map_center_lat)
+        env.initial_view_width_m = max(6_000.0, span_x * mercator_scale * 1.35)
+        env.initial_view_height_m = max(4_200.0, span_y * mercator_scale * 1.35)
         env.map_configured = True
         env.map_layer = self.map_layer_var.get() if self.map_layer_var.get() in TILE_LAYERS else "Topographic"
         self._clear_terrain_grid()
@@ -3450,8 +3452,9 @@ class MeshSimulatorApp:
             south, north, west, east = bounds
             west_x, south_y = latlon_to_mercator(south, west)
             east_x, north_y = latlon_to_mercator(north, east)
-            requested_width = abs(east_x - west_x) * 1.25
-            requested_height = abs(north_y - south_y) * 1.25
+            mercator_scale = world_scale_factor(latitude)
+            requested_width = abs(east_x - west_x) * mercator_scale * 1.25
+            requested_height = abs(north_y - south_y) * mercator_scale * 1.25
         else:
             requested_width, requested_height = 10_000.0, 7_000.0
         env.initial_view_width_m = max(6_000.0, requested_width)
@@ -3569,8 +3572,9 @@ class MeshSimulatorApp:
         if not env.map_configured:
             return None
         center_x, center_y = latlon_to_mercator(env.map_center_lat, env.map_center_lon)
-        mercator_x = center_x + x
-        mercator_y = center_y - y
+        mercator_scale = world_scale_factor(env.map_center_lat)
+        mercator_x = center_x + x / mercator_scale
+        mercator_y = center_y - y / mercator_scale
         zooms = sorted(
             {key[1] for key in self.map_tile_bytes if key[0] == "TerrainDEM"},
             reverse=True,
@@ -7345,6 +7349,7 @@ class MeshSimulatorApp:
         scale = self._base_scale() * self.zoom
         zoom = choose_tile_zoom(scale, int(TILE_LAYERS[layer]["max_zoom"]))
         center_x, center_y = latlon_to_mercator(env.map_center_lat, env.map_center_lon)
+        mercator_scale = world_scale_factor(env.map_center_lat)
         world_left, world_top = self.screen_to_world(0, 0)
         world_right, world_bottom = self.screen_to_world(c.winfo_width(), c.winfo_height())
         mercator_left, mercator_top, mercator_right, mercator_bottom = world_viewport_to_mercator_bounds(
@@ -7358,7 +7363,7 @@ class MeshSimulatorApp:
         tile_left, tile_top = mercator_to_tile(mercator_left, mercator_top, zoom)
         tile_right, tile_bottom = mercator_to_tile(mercator_right, mercator_bottom, zoom)
         maximum = 2**zoom
-        pixel_size = max(32, round(tile_size_m(zoom) * scale))
+        pixel_size = max(32, round(tile_size_m(zoom) * mercator_scale * scale))
         for tile_y in range(math.floor(tile_top), math.floor(tile_bottom) + 1):
             if tile_y < 0 or tile_y >= maximum:
                 continue
@@ -7373,8 +7378,8 @@ class MeshSimulatorApp:
                 tile_mercator_left, _bottom, _right, tile_mercator_top = tile_bounds_mercator(
                     zoom, raw_tile_x, tile_y
                 )
-                world_x = tile_mercator_left - center_x
-                world_y = center_y - tile_mercator_top
+                world_x = (tile_mercator_left - center_x) * mercator_scale
+                world_y = (center_y - tile_mercator_top) * mercator_scale
                 screen_x, screen_y = self.world_to_screen(world_x, world_y)
                 try:
                     if pixel_size <= MAX_CACHED_TILE_PIXELS:

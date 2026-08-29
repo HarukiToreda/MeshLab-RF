@@ -625,7 +625,7 @@ class Obstacle:
 class Environment:
     initial_view_width_m: float = 10000.0
     initial_view_height_m: float = 7000.0
-    coordinate_space: str = "CENTERED_MERCATOR"
+    coordinate_space: str = "CENTERED_MERCATOR_TRUE_SCALE"
     path_loss_exponent: float = 2.45
     shadowing_sigma_db: float = 2.0
     weather_loss_db: float = 0.0
@@ -914,7 +914,9 @@ class Scenario:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Scenario":
         environment_data = dict(data.get("environment", {}))
-        legacy_coordinates = environment_data.get("coordinate_space") != "CENTERED_MERCATOR"
+        coordinate_space = environment_data.get("coordinate_space")
+        legacy_coordinates = coordinate_space not in ("CENTERED_MERCATOR", "CENTERED_MERCATOR_TRUE_SCALE")
+        needs_true_scale_migration = coordinate_space == "CENTERED_MERCATOR"
         legacy_width = float(environment_data.pop("width_m", 10_000.0))
         legacy_height = float(environment_data.pop("height_m", 7_000.0))
         environment_data.setdefault("initial_view_width_m", legacy_width)
@@ -998,6 +1000,32 @@ class Scenario:
                 env.terrain_width_m = legacy_width
                 env.terrain_height_m = legacy_height
             env.coordinate_space = "CENTERED_MERCATOR"
+            needs_true_scale_migration = True
+        if needs_true_scale_migration:
+            # Pre-fix files stored x/y in raw, latitude-inflated Web Mercator
+            # meters (Web Mercator overstates ground distance by 1/cos(lat)
+            # away from the equator). Rescale everything once so stored
+            # coordinates become true ground meters, matching what
+            # geography.latlon_to_world now produces on every fresh load.
+            true_scale = math.cos(math.radians(max(-85.05112878, min(85.05112878, env.map_center_lat))))
+            for node in nodes:
+                node.x *= true_scale
+                node.y *= true_scale
+            for obstacle in obstacles:
+                obstacle.x1 *= true_scale
+                obstacle.x2 *= true_scale
+                obstacle.y1 *= true_scale
+                obstacle.y2 *= true_scale
+                obstacle.points = [
+                    [point[0] * true_scale, point[1] * true_scale]
+                    for point in obstacle.points
+                ]
+            if env.terrain_values:
+                env.terrain_left_m *= true_scale
+                env.terrain_top_m *= true_scale
+                env.terrain_width_m *= true_scale
+                env.terrain_height_m *= true_scale
+            env.coordinate_space = "CENTERED_MERCATOR_TRUE_SCALE"
         packet = PacketConfig(**data.get("packet", {}))
         live_mesh = LiveMeshConfig(**data.get("live_mesh", {}))
         learned_routes = {

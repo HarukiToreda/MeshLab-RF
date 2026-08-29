@@ -15,6 +15,10 @@ MeshLab RF uses public geographic services for its map, elevation, search, and i
 
 Map and elevation tiles load for the visible area. Terrain also refreshes after startup, searches, live-node reframing, and moving nodes outside current coverage. Obstacle data loads only when **Import obstacles** is selected.
 
+## Coordinate system
+
+Node and obstacle positions are stored as `x`/`y` in true ground meters, center-relative to the scenario's map location. Latitude/longitude is projected with Web Mercator and then rescaled by `cos(map center latitude)`, since raw Web Mercator inflates ground distance by `1 / cos(latitude)` away from the equator; without that correction, one coordinate unit would represent more real distance at higher latitudes, quietly adding excess path loss to every simulated link. Scenario files saved before this correction (`coordinate_space: "CENTERED_MERCATOR"`) are rescaled automatically the first time they're opened.
+
 ## Display and terrain
 
 Map tiles are converted to high-contrast grayscale. **Terrain only** replaces the map with hillshade, contours, and elevation labels generated from elevation data.

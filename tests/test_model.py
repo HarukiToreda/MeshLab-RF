@@ -39,6 +39,7 @@ from mesh_simulator.geography import (
     overture_rows_to_elements,
     obstacle_import_plan,
     split_geographic_bounds,
+    world_scale_factor,
     world_to_latlon,
     world_viewport_to_mercator_bounds,
 )
@@ -1302,6 +1303,36 @@ class ModelTests(unittest.TestCase):
             (0.0, 0.0),
         )
 
+    def test_world_coordinates_are_true_ground_meters_not_inflated_mercator(self):
+        # Web Mercator inflates ground distance by 1/cos(latitude); world
+        # coordinates must be scaled back down so 1 world unit == 1 true
+        # meter, or every distance-based RF calculation is systematically
+        # too pessimistic away from the equator.
+        import math
+
+        center_lat, center_lon = 40.9171, -74.1962
+        near_lat, near_lon = 40.9141, -74.1979  # roughly 358 true meters away
+        x1, y1 = latlon_to_world(center_lat, center_lon, center_lat, center_lon)
+        x2, y2 = latlon_to_world(near_lat, near_lon, center_lat, center_lon)
+        world_distance = math.hypot(x2 - x1, y2 - y1)
+
+        # Independent ground-truth distance via the haversine formula.
+        r = 6_371_000.0
+        p1, p2 = math.radians(center_lat), math.radians(near_lat)
+        dphi = math.radians(near_lat - center_lat)
+        dlambda = math.radians(near_lon - center_lon)
+        a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+        true_distance = 2 * r * math.asin(math.sqrt(a))
+
+        self.assertAlmostEqual(world_distance, true_distance, delta=1.0)
+
+    def test_world_to_latlon_round_trips_through_the_true_scale(self):
+        center_lat, center_lon = 51.5, -0.12
+        x, y = latlon_to_world(51.51, -0.10, center_lat, center_lon)
+        latitude, longitude = world_to_latlon(x, y, center_lat, center_lon)
+        self.assertAlmostEqual(latitude, 51.51, places=6)
+        self.assertAlmostEqual(longitude, -0.10, places=6)
+
     def test_legacy_rectangular_coordinates_migrate_without_moving_geography(self):
         restored = Scenario.from_dict(
             {
@@ -1326,13 +1357,18 @@ class ModelTests(unittest.TestCase):
                 ],
             }
         )
-        self.assertEqual(restored.environment.coordinate_space, "CENTERED_MERCATOR")
-        self.assertEqual((restored.nodes[0].x, restored.nodes[0].y), (200.0, -50.0))
-        self.assertEqual(restored.obstacles[0].points[0], [100.0, -150.0])
-        self.assertEqual(
-            restored.environment.terrain_bounds(),
-            (-500.0, -250.0, 500.0, 250.0),
-        )
+        self.assertEqual(restored.environment.coordinate_space, "CENTERED_MERCATOR_TRUE_SCALE")
+        scale = world_scale_factor(40.7128)
+        node_x, node_y = restored.nodes[0].x, restored.nodes[0].y
+        self.assertAlmostEqual(node_x, 200.0 * scale)
+        self.assertAlmostEqual(node_y, -50.0 * scale)
+        point_x, point_y = restored.obstacles[0].points[0]
+        self.assertAlmostEqual(point_x, 100.0 * scale)
+        self.assertAlmostEqual(point_y, -150.0 * scale)
+        bounds = restored.environment.terrain_bounds()
+        expected_bounds = (-500.0 * scale, -250.0 * scale, 500.0 * scale, 250.0 * scale)
+        for actual, expected in zip(bounds, expected_bounds, strict=True):
+            self.assertAlmostEqual(actual, expected)
 
     def test_terrain_cache_can_cover_negative_unbounded_coordinates(self):
         environment = Environment(
@@ -1402,8 +1438,9 @@ class ModelTests(unittest.TestCase):
             40.9,
             -74.1,
         )
-        self.assertAlmostEqual(right - left, 40_000)
-        self.assertAlmostEqual(top - bottom, 26_000)
+        scale = world_scale_factor(40.9)
+        self.assertAlmostEqual(right - left, 40_000 / scale)
+        self.assertAlmostEqual(top - bottom, 26_000 / scale)
 
     def test_polygon_obstacle_intersects_real_outline(self):
         a = Node(x=0, y=500, antenna_height_m=2)
