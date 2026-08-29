@@ -137,6 +137,8 @@ HUD_LAYER_TAG = "hud-layer"
 GEOGRAPHIC_LAYER_TAG = "geographic-layer"
 SELECTED_OBSTACLE_TAG = "selected-obstacle"
 SURVEY_LAYER_TAG = "survey-layer"
+SURVEY_PING_TAG = "survey-ping"
+SURVEY_PING_DURATION_S = 0.4
 SURVEY_PORT_NONE = "— Not selected —"
 LIVE_TRAFFIC_PRESETS: dict[str, dict[str, Any]] = {
     "Default / slow": {
@@ -877,6 +879,20 @@ class MeshSimulatorApp:
         self.survey_devices: list[DeviceInfo] = []
         self.survey_measurements: list[dict[str, object]] = []
         self.survey_selected_index: int | None = None
+        self.survey_playback_active: bool = False
+        self.survey_playback_index: int = 0
+        self.survey_playback_current_index: int | None = None
+        self.survey_playback_speed: float = 20.0
+        self.survey_playback_wall_reference: float | None = None
+        self.survey_playback_epoch_reference: float = 0.0
+        self.survey_playback_epochs: list[float | None] = []
+        self.survey_playback_bounds: tuple[float, float] | None = None
+        self.survey_playback_after: str | None = None
+        self.survey_playback_updating_scale: bool = False
+        self.survey_ping_queue: list[tuple[tuple[float, float], tuple[float, float], bool]] = []
+        self.survey_ping_active_leg: tuple[tuple[float, float], tuple[float, float], bool] | None = None
+        self.survey_ping_leg_start_wall: float = 0.0
+        self.survey_ping_after: str | None = None
         self.survey_export_path: Path | None = None
         self.survey_export_roles: set[str] = set()
         self.survey_worker: threading.Thread | None = None
@@ -7165,6 +7181,8 @@ class MeshSimulatorApp:
             return
         width, height = c.winfo_width(), c.winfo_height()
         selected = self.survey_selected_index
+        current = self.survey_playback_current_index
+        reveal_count = (current + 1) if current is not None else len(self.survey_measurements)
         base_position = self._survey_base_world_position()
         if selected is not None and 0 <= selected < len(self.survey_measurements):
             mobile_position = self._survey_world_position(self.survey_measurements[selected])
@@ -7177,6 +7195,8 @@ class MeshSimulatorApp:
                 )
 
         for index, measurement in enumerate(self.survey_measurements):
+            if index >= reveal_count:
+                break
             position = self._survey_world_position(measurement)
             if position is None:
                 continue
@@ -7184,16 +7204,26 @@ class MeshSimulatorApp:
             if x < -12 or y < -12 or x > width + 12 or y > height + 12:
                 continue
             color = survey_signal_color(measurement)
-            radius = 8 if index == selected else 4
+            is_current = index == current
+            radius = 9 if is_current else (8 if index == selected else 4)
             tags = (SURVEY_LAYER_TAG, f"survey-point:{index}")
             if not survey_bool(measurement.get("forward_received")):
                 c.create_line(x - radius, y - radius, x + radius, y + radius, fill=color, width=3, tags=tags)
                 c.create_line(x - radius, y + radius, x + radius, y - radius, fill=color, width=3, tags=tags)
             else:
-                outline = "#ffffff" if index == selected else "#06101c"
+                outline = "#00e5ff" if is_current else ("#06101c")
                 c.create_oval(
                     x - radius, y - radius, x + radius, y + radius,
-                    fill=color, outline=outline, width=3 if index == selected else 1, tags=tags,
+                    fill=color, outline=outline, width=3 if (is_current or index == selected) else 1, tags=tags,
+                )
+            if is_current:
+                c.create_oval(
+                    x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6,
+                    outline="#0a0a0a", width=4, tags=tags,
+                )
+                c.create_oval(
+                    x - radius - 5, y - radius - 5, x + radius + 5, y + radius + 5,
+                    outline="#00e5ff", width=2, tags=tags,
                 )
 
         if base_position:
@@ -7203,8 +7233,8 @@ class MeshSimulatorApp:
                     x, y - 10, x + 10, y, x, y + 10, x - 10, y,
                     fill=ACCENT, outline="#ffffff", width=2, tags=(SURVEY_LAYER_TAG,),
                 )
-                c.create_text(
-                    x, y - 17, text="SURVEY BASE", fill="#ffffff",
+                self._halo_text(
+                    c, x, y - 17, text="SURVEY BASE",
                     font=("Segoe UI Semibold", 8), tags=(SURVEY_LAYER_TAG,),
                 )
 
@@ -7223,8 +7253,25 @@ class MeshSimulatorApp:
                 )
                 if reverse is not None:
                     label += f"  back {reverse:.0f} dBm"
-                c.create_text(
-                    x + 12, y - 15, text=label, anchor="sw", fill="#ffffff",
+                self._halo_text(
+                    c, x + 12, y - 15, text=label, anchor="sw",
+                    font=("Segoe UI Semibold", 9), tags=(SURVEY_LAYER_TAG,),
+                )
+
+        if current is not None and current != selected and 0 <= current < len(self.survey_measurements):
+            measurement = self.survey_measurements[current]
+            position = self._survey_world_position(measurement)
+            if position:
+                x, y = self.world_to_screen(*position)
+                forward = survey_float(measurement.get("forward_rssi_dbm"))
+                sequence = measurement.get("sequence", current + 1)
+                label = (
+                    f"#{sequence}  out {forward:.0f} dBm"
+                    if forward is not None
+                    else f"#{sequence}  forward lost"
+                )
+                self._halo_text(
+                    c, x + 14, y - 15, text=label, anchor="sw",
                     font=("Segoe UI Semibold", 9), tags=(SURVEY_LAYER_TAG,),
                 )
 
@@ -7233,8 +7280,13 @@ class MeshSimulatorApp:
             legend_x, 12, width - 12, 72, fill="#081321", outline=BORDER,
             tags=(SURVEY_LAYER_TAG, HUD_LAYER_TAG),
         )
+        legend_title = (
+            f"FIELD SURVEY · {reveal_count:,}/{len(self.survey_measurements):,} points"
+            if current is not None
+            else f"FIELD SURVEY · {len(self.survey_measurements):,} points"
+        )
         c.create_text(
-            legend_x + 9, 21, text=f"FIELD SURVEY · {len(self.survey_measurements):,} points",
+            legend_x + 9, 21, text=legend_title,
             anchor="w", fill="#ffffff", font=("Segoe UI Semibold", 8),
             tags=(SURVEY_LAYER_TAG, HUD_LAYER_TAG),
         )
@@ -9716,6 +9768,37 @@ class MeshSimulatorApp:
                 font=("Segoe UI Semibold", 15), anchor="w",
             ).pack(fill="x", padx=9, pady=(0, 5))
 
+        playback = ttk.LabelFrame(window, text="Playback")
+        playback.pack(fill="x", padx=12, pady=(2, 5))
+        playback_row = ttk.Frame(playback)
+        playback_row.pack(fill="x", padx=7, pady=6)
+        self.survey_play_button = ttk.Button(
+            playback_row, text="▶ Play", command=self._toggle_survey_playback, state="disabled", width=9,
+        )
+        self.survey_play_button.pack(side="left")
+        ttk.Label(playback_row, text="Speed", style="Muted.TLabel").pack(side="left", padx=(12, 4))
+        self.survey_playback_speed_var = tk.StringVar(value="20x")
+        speed_box = ttk.Combobox(
+            playback_row,
+            textvariable=self.survey_playback_speed_var,
+            values=("1x", "2x", "5x", "10x", "20x", "60x", "120x", "300x", "600x"),
+            state="readonly",
+            width=6,
+        )
+        speed_box.pack(side="left")
+        speed_box.bind("<<ComboboxSelected>>", self._survey_playback_speed_changed)
+        self.survey_playback_time_var = tk.StringVar(value="Load a survey to play it back on the map.")
+        ttk.Label(playback_row, textvariable=self.survey_playback_time_var, style="Muted.TLabel", width=34).pack(
+            side="left", padx=(12, 8)
+        )
+        self.survey_playback_scale_var = tk.DoubleVar(value=0.0)
+        self.survey_playback_scale = ttk.Scale(
+            playback_row, from_=0.0, to=1.0, orient="horizontal",
+            variable=self.survey_playback_scale_var, command=self._survey_playback_scrub,
+        )
+        self.survey_playback_scale.pack(side="left", fill="x", expand=True)
+        self.survey_playback_scale.state(["disabled"])
+
         controls = ttk.Frame(window)
         controls.pack(fill="x", padx=12, pady=(4, 3))
         ttk.Label(controls, text="Show", style="Muted.TLabel").pack(side="left")
@@ -9757,9 +9840,252 @@ class MeshSimulatorApp:
             self._apply_survey_measurements(self.survey_measurements, self.survey_export_path, fit=False)
 
     def _close_survey_viewer(self) -> None:
+        self._pause_survey_playback()
         if self.survey_window is not None:
             self.survey_window.destroy()
         self.survey_window = None
+
+    @staticmethod
+    def _format_survey_elapsed(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+    def _compute_survey_playback_epochs(self) -> None:
+        self.survey_playback_epochs = [survey_float(row.get("epoch_s")) for row in self.survey_measurements]
+        valid = [value for value in self.survey_playback_epochs if value is not None]
+        self.survey_playback_bounds = (min(valid), max(valid)) if len(valid) >= 2 and max(valid) > min(valid) else None
+        self._pause_survey_playback()
+        self.survey_playback_index = 0
+        self.survey_playback_current_index = None
+        if hasattr(self, "survey_play_button"):
+            self.survey_play_button.configure(
+                state="normal" if self.survey_playback_bounds else "disabled", text="▶ Play",
+            )
+        if hasattr(self, "survey_playback_scale"):
+            self.survey_playback_scale.state(
+                ["!disabled"] if self.survey_playback_bounds else ["disabled"]
+            )
+            self.survey_playback_updating_scale = True
+            self.survey_playback_scale_var.set(0.0)
+            self.survey_playback_updating_scale = False
+        if hasattr(self, "survey_playback_time_var"):
+            self.survey_playback_time_var.set(
+                "Press Play to walk the survey on the map."
+                if self.survey_playback_bounds
+                else "This survey has no GPS timestamps to play back."
+            )
+
+    def _toggle_survey_playback(self) -> None:
+        if self.survey_playback_active:
+            self._pause_survey_playback()
+        else:
+            self._start_survey_playback()
+
+    def _start_survey_playback(self) -> None:
+        bounds = self.survey_playback_bounds
+        if bounds is None or not self.survey_measurements:
+            return
+        if self.survey_playback_current_index is None or self.survey_playback_current_index >= len(self.survey_measurements) - 1:
+            start, _end = bounds
+            self.survey_playback_epoch_reference = start
+            self.survey_playback_index = 0
+            self.survey_playback_current_index = 0
+            self._start_survey_ping(self.survey_measurements[0])
+        self.survey_playback_active = True
+        self.survey_playback_wall_reference = time.monotonic()
+        if hasattr(self, "survey_play_button"):
+            self.survey_play_button.configure(text="⏸ Pause")
+        self._survey_playback_tick()
+
+    def _pause_survey_playback(self, reached_end: bool = False) -> None:
+        self.survey_playback_active = False
+        if self.survey_playback_after is not None:
+            try:
+                self.root.after_cancel(self.survey_playback_after)
+            except Exception:
+                pass
+            self.survey_playback_after = None
+        self._cancel_survey_ping()
+        if hasattr(self, "survey_play_button"):
+            self.survey_play_button.configure(text="▶ Play")
+        if reached_end and hasattr(self, "survey_status_var"):
+            self.survey_status_var.set("Playback reached the end of the survey.")
+
+    def _survey_playback_tick(self) -> None:
+        self.survey_playback_after = None
+        if not self.survey_playback_active or not self.survey_measurements or self.survey_playback_bounds is None:
+            return
+        now = time.monotonic()
+        elapsed_wall = now - (self.survey_playback_wall_reference or now)
+        self.survey_playback_wall_reference = now
+        self.survey_playback_epoch_reference += elapsed_wall * self.survey_playback_speed
+        epochs = self.survey_playback_epochs
+        last = len(self.survey_measurements) - 1
+        previous_index = self.survey_playback_index
+        while (
+            self.survey_playback_index < last
+            and epochs[self.survey_playback_index + 1] is not None
+            and epochs[self.survey_playback_index + 1] <= self.survey_playback_epoch_reference
+        ):
+            self.survey_playback_index += 1
+        self.survey_playback_current_index = self.survey_playback_index
+        if self.survey_playback_index != previous_index:
+            self._start_survey_ping(self.survey_measurements[self.survey_playback_index])
+        self._update_survey_playback_display()
+        if self.survey_playback_index >= last:
+            self._pause_survey_playback(reached_end=True)
+            return
+        self.survey_playback_after = self.root.after(50, self._survey_playback_tick)
+
+    def _cancel_survey_ping(self) -> None:
+        if self.survey_ping_after is not None:
+            try:
+                self.root.after_cancel(self.survey_ping_after)
+            except Exception:
+                pass
+            self.survey_ping_after = None
+        self.survey_ping_active_leg = None
+        self.survey_ping_queue = []
+        if hasattr(self, "canvas"):
+            self.canvas.delete(SURVEY_PING_TAG)
+
+    def _start_survey_ping(self, measurement: dict[str, object]) -> None:
+        mobile_position = self._survey_world_position(measurement)
+        base_position = self._survey_base_world_position()
+        if mobile_position is None or base_position is None:
+            return
+        forward_ok = survey_bool(measurement.get("forward_received"))
+        legs: list[tuple[tuple[float, float], tuple[float, float], bool]] = [
+            (mobile_position, base_position, forward_ok)
+        ]
+        if forward_ok:
+            reply_ok = survey_bool(measurement.get("reply_received"))
+            legs.append((base_position, mobile_position, reply_ok))
+        self.survey_ping_queue = legs
+        self._advance_survey_ping()
+
+    def _advance_survey_ping(self) -> None:
+        if self.survey_ping_after is not None:
+            try:
+                self.root.after_cancel(self.survey_ping_after)
+            except Exception:
+                pass
+            self.survey_ping_after = None
+        if not self.survey_ping_queue:
+            self.survey_ping_active_leg = None
+            if hasattr(self, "canvas"):
+                self.canvas.delete(SURVEY_PING_TAG)
+            return
+        self.survey_ping_active_leg = self.survey_ping_queue.pop(0)
+        self.survey_ping_leg_start_wall = time.monotonic()
+        self._survey_ping_tick()
+
+    def _survey_ping_tick(self) -> None:
+        self.survey_ping_after = None
+        if self.survey_ping_active_leg is None or not hasattr(self, "canvas"):
+            return
+        (fx, fy), (tx, ty), completes = self.survey_ping_active_leg
+        elapsed = time.monotonic() - self.survey_ping_leg_start_wall
+        progress = elapsed / SURVEY_PING_DURATION_S
+        # A lost probe only travels partway before fading out instead of
+        # arriving, so a dropped packet visibly doesn't make it to the base.
+        travel_limit = 1.0 if completes else 0.55
+        travel = min(travel_limit, progress)
+        x = fx + (tx - fx) * travel
+        y = fy + (ty - fy) * travel
+        c = self.canvas
+        c.delete(SURVEY_PING_TAG)
+        fsx, fsy = self.world_to_screen(fx, fy)
+        sx, sy = self.world_to_screen(x, y)
+        color = "#1fae56" if completes else "#d62828"
+        # The base map is a light background, so every ping element gets a
+        # dark halo underneath it -- a plain white or pale outline (like the
+        # default light theme elsewhere) disappears against light streets.
+        c.create_line(fsx, fsy, sx, sy, fill="#0a0a0a", width=6, tags=(SURVEY_PING_TAG,))
+        c.create_line(fsx, fsy, sx, sy, fill=color, width=3, tags=(SURVEY_PING_TAG,))
+        radius = 7
+        c.create_oval(
+            sx - radius - 2, sy - radius - 2, sx + radius + 2, sy + radius + 2,
+            fill="#0a0a0a", outline="", tags=(SURVEY_PING_TAG,),
+        )
+        c.create_oval(
+            sx - radius, sy - radius, sx + radius, sy + radius,
+            fill=color, outline="#ffffff", width=1, tags=(SURVEY_PING_TAG,),
+        )
+        if progress >= travel_limit:
+            self._advance_survey_ping()
+            return
+        self.survey_ping_after = self.root.after(20, self._survey_ping_tick)
+
+    def _update_survey_playback_display(self) -> None:
+        bounds = self.survey_playback_bounds
+        if bounds is None or not self.survey_measurements:
+            return
+        start, end = bounds
+        span = max(1.0, end - start)
+        position = min(end, max(start, self.survey_playback_epoch_reference))
+        fraction = (position - start) / span
+        if hasattr(self, "survey_playback_scale_var"):
+            self.survey_playback_updating_scale = True
+            self.survey_playback_scale_var.set(fraction)
+            self.survey_playback_updating_scale = False
+        if hasattr(self, "survey_playback_time_var"):
+            index = self.survey_playback_current_index or 0
+            self.survey_playback_time_var.set(
+                f"{self._format_survey_elapsed(position - start)} / {self._format_survey_elapsed(span)}"
+                f"  ·  probe {index + 1}/{len(self.survey_measurements)}"
+            )
+        self._render_survey_playback_frame()
+
+    def _render_survey_playback_frame(self) -> None:
+        if not hasattr(self, "canvas"):
+            return
+        c = self.canvas
+        c.delete(SURVEY_LAYER_TAG)
+        self._draw_survey_overlay(c)
+
+    def _survey_playback_scrub(self, value: str) -> None:
+        if self.survey_playback_updating_scale:
+            return
+        bounds = self.survey_playback_bounds
+        if bounds is None or not self.survey_measurements:
+            return
+        was_playing = self.survey_playback_active
+        self._pause_survey_playback()
+        start, end = bounds
+        try:
+            fraction = max(0.0, min(1.0, float(value)))
+        except ValueError:
+            return
+        target_epoch = start + fraction * (end - start)
+        epochs = self.survey_playback_epochs
+        index = 0
+        for candidate_index, epoch in enumerate(epochs):
+            if epoch is not None and epoch <= target_epoch:
+                index = candidate_index
+            else:
+                break
+        self.survey_playback_epoch_reference = target_epoch
+        self.survey_playback_index = index
+        self.survey_playback_current_index = index
+        self._update_survey_playback_display()
+        if was_playing:
+            self.survey_playback_active = True
+            self.survey_playback_wall_reference = time.monotonic()
+            if hasattr(self, "survey_play_button"):
+                self.survey_play_button.configure(text="⏸ Pause")
+            self.survey_playback_after = self.root.after(50, self._survey_playback_tick)
+
+    def _survey_playback_speed_changed(self, _event: tk.Event | None = None) -> None:
+        text = self.survey_playback_speed_var.get().strip().lower().rstrip("x")
+        try:
+            self.survey_playback_speed = max(0.1, float(text))
+        except ValueError:
+            self.survey_playback_speed = 20.0
+        if self.survey_playback_active:
+            self.survey_playback_wall_reference = time.monotonic()
 
     def _survey_set_busy(self, busy: bool, message: str = "") -> None:
         if self.survey_window is None or not self.survey_window.winfo_exists():
@@ -10030,6 +10356,7 @@ class MeshSimulatorApp:
         self.survey_measurements = list(measurements)
         self.survey_export_path = source
         self.survey_selected_index = None
+        self._compute_survey_playback_epochs()
         total = len(self.survey_measurements)
         forward = sum(survey_bool(row.get("forward_received")) for row in self.survey_measurements)
         reply = sum(survey_bool(row.get("reply_received")) for row in self.survey_measurements)
@@ -10121,6 +10448,7 @@ class MeshSimulatorApp:
     def _clear_survey_map(self) -> None:
         self.survey_measurements = []
         self.survey_selected_index = None
+        self._compute_survey_playback_epochs()
         if hasattr(self, "survey_tree"):
             self.survey_tree.delete(*self.survey_tree.get_children())
         if hasattr(self, "survey_metric_vars"):
@@ -10213,6 +10541,7 @@ class MeshSimulatorApp:
 
     def on_close(self) -> None:
         self.stop_animation()
+        self._pause_survey_playback()
         self.stop_live_mesh(clear_visuals=True)
         if self.live_radio.connected or self.live_radio.connecting:
             self.live_radio.disconnect()
