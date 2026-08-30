@@ -1281,8 +1281,6 @@ class MeshSimulatorApp:
             side="left", padx=(6, 2), pady=6
         )
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8, pady=8)
-        ttk.Button(bar, text="⌫  Delete", style="Tool.TButton", command=self.delete_selected).pack(side="left", padx=2)
-        ttk.Button(bar, text="⊙  Fit", style="Tool.TButton", command=self.fit_view).pack(side="left", padx=2)
         ttk.Button(bar, text="◌  Mesh graph", style="Tool.TButton", command=self.show_mesh_graph).pack(
             side="left", padx=2
         )
@@ -1295,12 +1293,6 @@ class MeshSimulatorApp:
             bar, text="Clear hops", style="Tool.TButton", command=self.clear_results, state="disabled"
         )
         self.clear_hops_button.pack(side="right", padx=2)
-        ttk.Button(
-            bar,
-            text="COM Radio",
-            style="Tool.TButton",
-            command=lambda: self.show_sidebar_tab("Live Radio"),
-        ).pack(side="right", padx=2)
         hop_button = ttk.Menubutton(bar, text="Hop lines ▾", style="Tool.TMenubutton")
         self.toolbar_hop_menu = self._create_hop_lines_menu(hop_button)
         hop_button.configure(menu=self.toolbar_hop_menu)

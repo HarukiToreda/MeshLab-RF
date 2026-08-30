@@ -19,7 +19,7 @@
 
 ### Changed
 
-- Serial port pickers (Survey logs, COM Radio) now rescan automatically when opened — no manual refresh.
+- Serial port pickers (Survey logs, Live Radio) now rescan automatically when opened — no manual refresh.
 - Survey logs uses one combined port picker instead of separate mobile/base pickers.
 - Bluetooth virtual COM ports no longer clutter the port pickers.
 - Closing MeshLab RF no longer prompts to save — save explicitly with File → Save.

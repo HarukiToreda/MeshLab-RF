@@ -102,7 +102,7 @@ The **Terrain only** option shows elevation contours without roads and labels. *
 
 ## Live radio
 
-Open **COM Radio**, choose the Meshtastic radio’s Windows COM port, and connect. MeshLab RF reads the radio’s known NodeDB and plots nodes with valid positions.
+Open the **Live Radio** sidebar tab, choose the Meshtastic radio’s Windows COM port, and connect. MeshLab RF reads the radio’s known NodeDB and plots nodes with valid positions.
 
 Updates are merged by node number, so reconnecting does not duplicate nodes. Nodes without coordinates remain listed but are not placed. Valid MSL altitude is used when available; impossible altitude is ignored while the position is kept and placed above local terrain.
 
