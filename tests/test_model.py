@@ -4,6 +4,7 @@ import queue
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image, ImageColor
@@ -2134,7 +2135,73 @@ class ModelTests(unittest.TestCase):
         small = obstacle_import_plan(4_000, 3_000)
         self.assertEqual(OBSTACLE_IMPORT_MAX_AREA_M2, 12_000_000.0)
         self.assertEqual(small[:2], (2, 2))
+        self.assertGreaterEqual(small[2], 12_000)
         self.assertFalse(small[3])
+
+    def test_overture_batch_detects_source_cap_before_polygon_conversion(self):
+        class Batch:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def slice(self, offset: int, length: int):
+                return Batch(self.rows[offset : offset + length])
+
+            def to_pylist(self):
+                return self.rows
+
+        with tempfile.TemporaryDirectory() as temporary:
+            service = MapDataService.__new__(MapDataService)
+            service.cache_root = Path(temporary)
+            source_rows = [{"id": index} for index in range(6)]
+            converted = [{"type": "overture", "id": "valid"}]
+            with (
+                patch(
+                    "mesh_simulator.geography.record_batch_reader",
+                    return_value=[Batch(source_rows)],
+                ),
+                patch(
+                    "mesh_simulator.geography.overture_rows_to_elements",
+                    return_value=converted,
+                ),
+            ):
+                elements, saturated = service.fetch_overture_building_batch(
+                    40.0, -75.0, 41.0, -74.0, limit=5
+                )
+
+            self.assertEqual(elements, converted)
+            self.assertTrue(saturated)
+
+    def test_adaptive_import_keeps_downloaded_leaf_coverage_past_soft_budget(self):
+        service = MapDataService.__new__(MapDataService)
+
+        def fake_fetch(
+            south: float,
+            west: float,
+            north: float,
+            east: float,
+            *,
+            limit: int,
+        ) -> tuple[list[dict[str, object]], bool]:
+            if (north - south) * (east - west) > 0.25:
+                return [], True
+            return (
+                [
+                    {
+                        "type": "overture",
+                        "id": f"{south:.2f}-{west:.2f}-{index}",
+                        "geometry": [],
+                    }
+                    for index in range(3)
+                ],
+                False,
+            )
+
+        service.fetch_overture_building_batch = fake_fetch  # type: ignore[method-assign]
+        elements = service.fetch_overture_buildings_for_viewport(
+            0.0, 0.0, 1.0, 1.0, limit=5, columns=1, rows=1
+        )
+
+        self.assertEqual(len(elements), 12)
 
     def test_saturated_obstacle_cells_are_subdivided(self):
         service = MapDataService.__new__(MapDataService)
@@ -2147,22 +2214,28 @@ class ModelTests(unittest.TestCase):
             east: float,
             *,
             limit: int,
-        ) -> list[dict[str, object]]:
+        ) -> tuple[list[dict[str, object]], bool]:
             queried.append((south, west, north, east))
             if (north - south) * (east - west) > 0.1:
-                return [
-                    {"type": "overture", "id": f"saturated-{index}", "geometry": []}
-                    for index in range(limit)
-                ]
-            return [
-                {
-                    "type": "overture",
-                    "id": f"{south:.3f}-{west:.3f}",
-                    "geometry": [],
-                }
-            ]
+                return (
+                    [
+                        {"type": "overture", "id": f"saturated-{index}", "geometry": []}
+                        for index in range(limit)
+                    ],
+                    True,
+                )
+            return (
+                [
+                    {
+                        "type": "overture",
+                        "id": f"{south:.3f}-{west:.3f}",
+                        "geometry": [],
+                    }
+                ],
+                False,
+            )
 
-        service.fetch_overture_buildings = fake_fetch  # type: ignore[method-assign]
+        service.fetch_overture_building_batch = fake_fetch  # type: ignore[method-assign]
         progress: list[tuple[int, int, str]] = []
         elements = service.fetch_overture_buildings_for_viewport(
             0.0,

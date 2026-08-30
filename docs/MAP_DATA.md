@@ -29,11 +29,18 @@ Nodes use the most detailed cached elevation available, with the saved grid as f
 
 ## Obstacle import
 
-Each import covers the complete visible viewport but is limited to 12 km² (4.63 mi²). Import adjacent views to cover a larger area.
+Obstacle imports use these limits:
 
-The viewport is divided into 4–16 geographic cells. Overture cells that reach their 750-building query limit are divided into four and retried for two more levels. Results are distributed across cells, with a total building limit between 6,000 and 20,000 depending on the initial grid.
+- Each tile covers at most 12 km² (4.63 mi²).
+- The viewport uses up to a 3×3 tile grid. Extremely wide views import their central region.
+- Each tile starts with a 12,000-building budget.
+- Capped Overture cells subdivide for up to two more levels.
+- Downloaded results are kept up to 20,000 buildings per tile.
+- Results at the hard cap are distributed across completed cells.
 
-OSM forest ways use `landuse=forest` or `natural=wood`; up to 500 are added per import. OSM buildings are used if Overture fails. Duplicate provider IDs are skipped.
+Saturation is checked before polygon conversion. Invalid geometry cannot hide a capped query.
+
+OSM provides the building fallback and up to 500 forest ways. Duplicate provider IDs are skipped. Re-importing adds missing footprints without duplicating existing buildings.
 
 Building height uses the supplied height, then floors × 3 m, then a 6 m default (an unverified footprint with no source height/floor data reads as roughly 2 storeys rather than 4, since a single overestimated import building was enough to falsely mark an otherwise-clear long link as blocked). Forests default to 18 m. RF loss values never come from the map provider. MeshLab's global field-survey Building default is 10.8 dB per crossed footprint plus 0.3 dB/100 m inside it, with attenuation rather than a distance cutoff; imported buildings receive the same default as manually drawn buildings.
 
@@ -45,7 +52,11 @@ Data is cached under:
 
 `%LOCALAPPDATA%\MeshLabRF\map-cache`
 
-Map and elevation tiles currently have no automatic expiry. Overture extracts expire after seven days. Terrain saved in a scenario is separate from this cache.
+- Map and elevation tiles have no automatic expiry.
+- Overture extracts expire after seven days.
+- Obstacle cache entries retain query-saturation status.
+- The first re-import after this update refreshes legacy obstacle cache entries.
+- Terrain saved in a scenario is separate from this cache.
 
 Search text and visible/requested geographic bounds are sent to the relevant public services. Providers may be incomplete, rate-limited, unavailable, or changed independently of MeshLab RF.
 

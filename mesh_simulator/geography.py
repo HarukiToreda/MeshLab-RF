@@ -701,7 +701,11 @@ def obstacle_import_plan(width_m: float, height_m: float) -> tuple[int, int, int
     cell_count = columns * rows
     building_limit = min(
         OVERTURE_MAX_VIEWPORT_BUILDING_LIMIT,
-        max(6000, cell_count * 1500),
+        # Six thousand footprints was too small for an ordinary dense-city
+        # tile. The adaptive loader had already downloaded the rest of the
+        # subdivided cells, then discarded them to honor this soft budget,
+        # producing visibly patchy imports that only filled after zooming in.
+        max(12_000, cell_count * 3_000),
     )
     spatially_sampled = desired_cells > OBSTACLE_IMPORT_MAX_CELLS
     return columns, rows, building_limit, spatially_sampled
@@ -900,11 +904,16 @@ class MapDataService:
     def _overture_cache_path(
         self, south: float, west: float, north: float, east: float, limit: int
     ) -> Path:
-        bounds = ",".join(f"{value:.5f}" for value in (south, west, north, east, limit))
+        # v2 stores whether the upstream row reader hit its cap. Older cache
+        # files only stored converted polygons, which could look incomplete
+        # without revealing that the source query itself was saturated.
+        bounds = "v2," + ",".join(
+            f"{value:.5f}" for value in (south, west, north, east, limit)
+        )
         digest = hashlib.sha256(bounds.encode("ascii")).hexdigest()[:24]
         return self.cache_root / "obstacles" / "overture" / f"{digest}.json"
 
-    def fetch_overture_buildings(
+    def fetch_overture_building_batch(
         self,
         south: float,
         west: float,
@@ -912,13 +921,23 @@ class MapDataService:
         east: float,
         *,
         limit: int = OVERTURE_BUILDING_LIMIT,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return converted footprints and authoritative source saturation.
+
+        One extra source row is requested so a conversion failure cannot make
+        a capped query appear complete. That distinction drives adaptive cell
+        subdivision and prevents geographic holes in dense areas.
+        """
         cache_path = self._overture_cache_path(south, west, north, east, limit)
-        if cache_path.exists() and time.time() - cache_path.stat().st_mtime <= OVERTURE_BUILDING_CACHE_SECONDS:
+        if (
+            cache_path.exists()
+            and time.time() - cache_path.stat().st_mtime <= OVERTURE_BUILDING_CACHE_SECONDS
+        ):
             try:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(cached, list):
-                    return cached[:limit]
+                if isinstance(cached, dict) and isinstance(cached.get("elements"), list):
+                    elements = cached["elements"][:limit]
+                    return elements, bool(cached.get("saturated", False))
             except (OSError, ValueError, TypeError):
                 pass
 
@@ -930,21 +949,44 @@ class MapDataService:
             stac=True,
         )
         if reader is None:
-            return []
+            return [], False
         rows: list[dict[str, Any]] = []
+        source_row_limit = max(1, limit) + 1
         for batch in reader:
-            remaining = limit - len(rows)
+            remaining = source_row_limit - len(rows)
             if remaining <= 0:
                 break
             rows.extend(batch.slice(0, remaining).to_pylist())
+        source_saturated = len(rows) > limit
         elements = overture_rows_to_elements(rows, limit=limit)
+        saturated = source_saturated or len(elements) >= limit
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             temporary_path = cache_path.with_suffix(".tmp")
-            temporary_path.write_text(json.dumps(elements, separators=(",", ":")), encoding="utf-8")
+            temporary_path.write_text(
+                json.dumps(
+                    {"version": 2, "saturated": saturated, "elements": elements},
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
             temporary_path.replace(cache_path)
         except OSError:
             pass
+        return elements, saturated
+
+    def fetch_overture_buildings(
+        self,
+        south: float,
+        west: float,
+        north: float,
+        east: float,
+        *,
+        limit: int = OVERTURE_BUILDING_LIMIT,
+    ) -> list[dict[str, Any]]:
+        elements, _saturated = self.fetch_overture_building_batch(
+            south, west, north, east, limit=limit
+        )
         return elements
 
     def fetch_overture_buildings_for_viewport(
@@ -980,9 +1022,11 @@ class MapDataService:
         if progress_callback:
             progress_callback(completed_units, total_units, "Querying building cells")
 
-        def fetch_cell(item: tuple[tuple[float, float, float, float], int]) -> list[dict[str, Any]]:
+        def fetch_cell(
+            item: tuple[tuple[float, float, float, float], int]
+        ) -> tuple[list[dict[str, Any]], bool]:
             cell, _depth = item
-            return self.fetch_overture_buildings(*cell, limit=cell_query_limit)
+            return self.fetch_overture_building_batch(*cell, limit=cell_query_limit)
 
         while frontier:
             next_frontier: list[tuple[tuple[float, float, float, float], int]] = []
@@ -992,8 +1036,8 @@ class MapDataService:
                 future_items = {executor.submit(fetch_cell, item): item for item in frontier}
                 for future in concurrent.futures.as_completed(future_items):
                     cell, depth = future_items[future]
-                    cell_elements = future.result()
-                    if len(cell_elements) >= cell_query_limit and depth < OVERTURE_ADAPTIVE_MAX_DEPTH:
+                    cell_elements, saturated = future.result()
+                    if saturated and depth < OVERTURE_ADAPTIVE_MAX_DEPTH:
                         children = [
                             (subcell, depth + 1)
                             for subcell in split_geographic_bounds(*cell, columns=2, rows=2)
@@ -1018,7 +1062,14 @@ class MapDataService:
         elements: list[dict[str, Any]] = []
         seen: set[str] = set()
         remaining = [deque(cell_elements) for cell_elements in leaf_results]
-        while len(elements) < limit and any(remaining):
+        # The query work is already complete at this point. Retain downloaded
+        # footprints up to the hard safety cap instead of throwing away useful
+        # leaf results merely because the initial soft budget was exceeded.
+        retention_limit = min(
+            OVERTURE_MAX_VIEWPORT_BUILDING_LIMIT,
+            max(limit, sum(len(cell_elements) for cell_elements in leaf_results)),
+        )
+        while len(elements) < retention_limit and any(remaining):
             for cell_elements in remaining:
                 while cell_elements:
                     element = cell_elements.popleft()
@@ -1028,7 +1079,7 @@ class MapDataService:
                     seen.add(identifier)
                     elements.append(element)
                     break
-                if len(elements) >= limit:
+                if len(elements) >= retention_limit:
                     break
         return elements
 
