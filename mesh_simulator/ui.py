@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 import csv
 import io
 import json
@@ -20,6 +19,7 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont, ImageTk
 
+from .background import DaemonTask, daemon_map_as_completed
 from .geography import (
     MapDataService,
     OBSTACLE_IMPORT_MAX_AREA_M2,
@@ -688,6 +688,7 @@ class ScrollFrame(ttk.Frame):
 class MeshSimulatorApp:
     def __init__(self, root: tk.Tk):
         self.root = root
+        self._closing = False
         self.root.title("MeshLab RF — Meshtastic Propagation Studio")
         self.root.geometry("1540x940")
         self.root.minsize(1100, 720)
@@ -956,6 +957,7 @@ class MeshSimulatorApp:
         self.survey_worker: threading.Thread | None = None
         self.survey_updates: queue.Queue[tuple[str, object]] = queue.Queue()
         self.terrain_request_id = 0
+        self.terrain_request_marks_dirty = True
         self.pending_terrain_rf_refresh: tuple[int, str | None, bool, bool] | None = None
         # Place/road name labels extracted from each generated tile's vector
         # data, keyed by (zoom, x, y) -- populated as a side effect of
@@ -3611,13 +3613,14 @@ class MeshSimulatorApp:
         left, top, right, bottom = env.terrain_bounds()
         return left <= x <= right and top <= y <= bottom
 
-    def load_topography(self) -> None:
+    def load_topography(self, *, mark_dirty: bool = True) -> None:
         env = self.scenario.environment
         if not env.map_configured:
             messagebox.showinfo("Search first", "Search for a real-world location before loading terrain.", parent=self.root)
             return
         self.terrain_request_id += 1
         request_id = self.terrain_request_id
+        self.terrain_request_marks_dirty = mark_dirty
         self.status_var.set("Loading and sampling global terrain elevation…")
         left, top, right, bottom = self._terrain_request_bounds()
         center_lat, center_lon = world_to_latlon(
@@ -3656,7 +3659,8 @@ class MeshSimulatorApp:
         if env.map_configured and not env.terrain_values and not (
             self.simulation_thread and self.simulation_thread.is_alive()
         ):
-            self.load_topography()
+            # Startup terrain is derived background data, not a user edit.
+            self.load_topography(mark_dirty=False)
 
     def _cached_dem_elevation(self, x: float, y: float) -> float | None:
         """Return the most detailed cached DEM value for a world position."""
@@ -3771,7 +3775,6 @@ class MeshSimulatorApp:
             changed = self._set_auto_node_elevation(node) or changed
         if not changed:
             return
-        self.mark_dirty()
         self._mark_results_stale()
         if isinstance(self.get_selected(), Node):
             self._build_object_form()
@@ -3821,7 +3824,8 @@ class MeshSimulatorApp:
             elevation = env.ground_elevation((x1 + x2) / 2.0, (y1 + y2) / 2.0)
             if elevation is not None:
                 obstacle.base_elevation_m = elevation
-        self.mark_dirty()
+        if self.terrain_request_marks_dirty:
+            self.mark_dirty()
         self._mark_results_stale()
         self.refresh_all()
         self.status_var.set(
@@ -3962,22 +3966,27 @@ class MeshSimulatorApp:
                 # Forests use a separate provider and used to begin only after every
                 # building query completed. Start that request beside the bounded
                 # building pool so its latency is normally hidden.
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as forest_executor:
-                    forest_future = forest_executor.submit(fetch_forests)
-                    # Each tile fans its cells across a small pool; the outer limit
-                    # keeps aggregate remote work bounded.
-                    if total <= 1:
-                        tile_results = [fetch_tile(job) for job in tile_jobs]
-                    else:
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=min(TILE_IMPORT_CONCURRENCY, total)
-                        ) as executor:
-                            tile_results = list(executor.map(fetch_tile, tile_jobs))
-                    try:
-                        forests = forest_future.result()
-                    except Exception as forest_error:
-                        forests = []
-                        warnings.append(f"OSM forests unavailable: {forest_error}")
+                forest_task = DaemonTask(fetch_forests, name="ForestImport")
+                # Each tile fans its cells across a small pool; the outer limit
+                # keeps aggregate remote work bounded.
+                if total <= 1:
+                    tile_results = [fetch_tile(job) for job in tile_jobs]
+                else:
+                    results_by_job = {
+                        job: result
+                        for job, result in daemon_map_as_completed(
+                            fetch_tile,
+                            tile_jobs,
+                            max_workers=min(TILE_IMPORT_CONCURRENCY, total),
+                            name="ObstacleTile",
+                        )
+                    }
+                    tile_results = [results_by_job[job] for job in tile_jobs]
+                try:
+                    forests = forest_task.result()
+                except Exception as forest_error:
+                    forests = []
+                    warnings.append(f"OSM forests unavailable: {forest_error}")
                 for elements, source in tile_results:
                     if source == "OSM fallback":
                         building_source = "OSM fallback"
@@ -10902,12 +10911,30 @@ class MeshSimulatorApp:
         self.status_var.set(f"Exported results to {path}")
 
     def on_close(self) -> None:
-        self.stop_animation()
-        self._pause_survey_playback()
-        self.stop_live_mesh(clear_visuals=True)
+        if self._closing:
+            return
+        self._closing = True
+        # Shutdown must not call the normal stop helpers: several of them redraw
+        # loaded map/RF layers before returning, which can make the title-bar X
+        # appear unresponsive on a dense scene. Invalidate background results and
+        # signal long-running workers directly; all application-owned workers are
+        # daemon threads and may finish harmlessly after Tk has gone away.
+        self.live_mesh_cancel_event.set()
+        self.beacon_cancel.set()
+        self.static_coverage_cancel.set()
+        self.live_mesh_request_id += 1
+        self.beacon_request_id += 1
+        self.static_coverage_request_id += 1
+        self.simulation_request_id += 1
+        self.terrain_request_id += 1
+        self.survey_playback_active = False
         if self.live_radio.connected or self.live_radio.connecting:
             self.live_radio.disconnect()
-        self.root.destroy()
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def show_model_info(self) -> None:
         messagebox.showinfo(

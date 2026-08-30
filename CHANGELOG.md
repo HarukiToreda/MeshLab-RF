@@ -11,6 +11,8 @@
 
 ### Fixed
 
+- **False save prompt.** Opening a file from an untouched blank session no longer asks to save it.
+- **Window close.** Closing now skips expensive final redraws and cannot be held open by active map-import worker pools.
 - **Beacon speed.** Dense maps now use the intended adaptive ray count, making coverage appear much sooner.
 - **Packet and live-mesh speed.** Dense packet contours use adaptive sampling, and impossible obstacle intersections are filtered earlier.
 - **Dense obstacle imports.** Fixed patchwork gaps and missing buildings. Capped cells now subdivide reliably, with downloaded results kept up to 20,000 buildings per tile.

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 from collections import deque
 from functools import lru_cache
 import io
@@ -20,6 +19,8 @@ from PIL import Image, ImageDraw, ImageEnhance
 from overturemaps.core import record_batch_reader
 from shapely import wkb
 from shapely.geometry import MultiPolygon, Polygon
+
+from .background import daemon_map_as_completed
 
 
 EARTH_RADIUS_M = 6_378_137.0
@@ -1030,31 +1031,32 @@ class MapDataService:
 
         while frontier:
             next_frontier: list[tuple[tuple[float, float, float, float], int]] = []
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(max(1, query_workers), len(frontier))
-            ) as executor:
-                future_items = {executor.submit(fetch_cell, item): item for item in frontier}
-                for future in concurrent.futures.as_completed(future_items):
-                    cell, depth = future_items[future]
-                    cell_elements, saturated = future.result()
-                    if saturated and depth < OVERTURE_ADAPTIVE_MAX_DEPTH:
-                        children = [
-                            (subcell, depth + 1)
-                            for subcell in split_geographic_bounds(*cell, columns=2, rows=2)
-                        ]
-                        next_frontier.extend(children)
-                        phase = f"Subdividing saturated cell to level {depth + 1}"
-                    else:
-                        leaf_results.append(cell_elements)
-                        completed_units += 4 ** (OVERTURE_ADAPTIVE_MAX_DEPTH - depth)
-                        phase = f"Loaded building cell level {depth}"
-                    processed_queries += 1
-                    if progress_callback:
-                        progress_callback(
-                            completed_units,
-                            total_units,
-                            f"{phase} · {processed_queries} queries checked",
-                        )
+            for item, result in daemon_map_as_completed(
+                fetch_cell,
+                frontier,
+                max_workers=min(max(1, query_workers), len(frontier)),
+                name="OvertureCell",
+            ):
+                cell, depth = item
+                cell_elements, saturated = result
+                if saturated and depth < OVERTURE_ADAPTIVE_MAX_DEPTH:
+                    children = [
+                        (subcell, depth + 1)
+                        for subcell in split_geographic_bounds(*cell, columns=2, rows=2)
+                    ]
+                    next_frontier.extend(children)
+                    phase = f"Subdividing saturated cell to level {depth + 1}"
+                else:
+                    leaf_results.append(cell_elements)
+                    completed_units += 4 ** (OVERTURE_ADAPTIVE_MAX_DEPTH - depth)
+                    phase = f"Loaded building cell level {depth}"
+                processed_queries += 1
+                if progress_callback:
+                    progress_callback(
+                        completed_units,
+                        total_units,
+                        f"{phase} · {processed_queries} queries checked",
+                    )
             frontier = next_frontier
 
         # If a very dense view exceeds the final global bound, retain data from every
@@ -1143,11 +1145,15 @@ class MapDataService:
         if len(tile_keys) == 1:
             images = {tile_keys[0]: load_tile(tile_keys[0])}
         else:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(MAP_TILE_WORKERS, len(tile_keys))
-            ) as executor:
-                futures = {key: executor.submit(load_tile, key) for key in tile_keys}
-                images = {key: futures[key].result() for key in tile_keys}
+            images = {
+                key: image
+                for key, image in daemon_map_as_completed(
+                    load_tile,
+                    tile_keys,
+                    max_workers=min(MAP_TILE_WORKERS, len(tile_keys)),
+                    name="TerrainTile",
+                )
+            }
 
         pixels = {key: image.load() for key, image in images.items()}
         values: list[float] = []
