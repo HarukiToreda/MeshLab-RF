@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageDraw, ImageEnhance
 from overturemaps.core import record_batch_reader
 from shapely import wkb
 from shapely.geometry import MultiPolygon, Polygon
@@ -35,7 +35,7 @@ OVERTURE_ADAPTIVE_MAX_DEPTH = 2
 OBSTACLE_DETAIL_CELL_AREA_M2 = 3_000_000.0
 OBSTACLE_IMPORT_MAX_CELLS = 16
 OBSTACLE_IMPORT_MAX_AREA_M2 = 12_000_000.0
-MAP_TILE_WORKERS = 4
+MAP_TILE_WORKERS = 10
 _GEOCODE_LOCK = threading.Lock()
 _LAST_GEOCODE_REQUEST = 0.0
 
@@ -51,6 +51,10 @@ TILE_LAYERS = {
     "TerrainDEM": {
         "url": "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
         "max_zoom": 15,
+    },
+    "Generated": {
+        "url": "",
+        "max_zoom": 19,
     },
 }
 
@@ -149,6 +153,403 @@ def tile_bounds_mercator(zoom: int, x: int, y: int) -> tuple[float, float, float
     return left, top - size, left + size, top
 
 
+GENERATED_TILE_SIZE = 256
+
+# --- Locally-rendered base map from OpenFreeMap vector tiles -------------
+#
+# Raster Street/Topographic tiles bake roads, land, water, and every label
+# into one flat image with no separation, so there is no way to hide street
+# names (Incognito mode) without degrading everything else. OpenFreeMap
+# publishes the same OSM-derived cartographic data (land use, parks, water,
+# roads, place/road names) as small per-tile vector (.pbf/MVT) files, so a
+# real-looking basemap can be rendered locally, tile by tile, with the name
+# labels kept out of the baked image entirely (drawn as a separate live
+# overlay by the UI instead, so Incognito can hide them with zero effect on
+# the roads/land/water pixels). Buildings are deliberately never drawn here
+# -- they stay on the existing separate Overture/OSM obstacle-import path.
+OPENFREEMAP_VECTOR_URL = "https://tiles.openfreemap.org/planet/latest/{z}/{x}/{y}.pbf"
+OPENFREEMAP_MAX_DETAIL_ZOOM = 14
+VECTOR_EXTENT = 4096
+GENERATED_BACKGROUND_COLOR = "#f7f8f4"
+
+# Internal supersampling factor: vector shapes are drawn at
+# GENERATED_TILE_SIZE * SUPERSAMPLE and downsampled with LANCZOS at the end.
+# PIL's ImageDraw has no anti-aliasing, so a line/polygon edge drawn straight
+# at 256x256 looks visibly jagged/pixelated, especially once the tile is
+# upscaled on screen for a continuous zoom between discrete tile levels --
+# drawing bigger and shrinking down is the standard cheap way to soften that.
+SUPERSAMPLE = 3
+
+# (fill, outline) per land polygon layer, drawn in this order (later layers
+# on top of earlier ones) -- soft pastel tones now that "Generated" tiles
+# keep their color instead of being flattened to grayscale like the old
+# raster layers.
+VECTOR_LAND_LAYERS: list[tuple[str, str, str | None]] = [
+    ("landcover", "#dce6d8", "#c3d2bd"),
+    ("landuse", "#f1ece0", "#ddd4bf"),
+    ("park", "#c9e4bd", "#aad198"),
+]
+VECTOR_WATER_FILL = "#bfe0f2"
+VECTOR_WATER_OUTLINE = "#9bc9e3"
+
+VECTOR_PATH_CLASSES = {"track", "path", "footway", "cycleway", "bridleway", "steps"}
+VECTOR_ROAD_DEFAULT_STYLE: tuple[str, str | None, int, int] = ("#aeb6b0", None, 1, 0)
+VECTOR_WATERWAY_WIDTH_M = {"river": 10, "canal": 8, "stream": 5, "drain": 2, "ditch": 1}
+
+
+def _vector_road_style(road_class: str, zoom: int) -> tuple[str, str | None, int, int]:
+    """(casing color, fill color or None, casing width px, fill width px).
+
+    Below each class's own detail threshold, even a motorway draws as a
+    single thin line with no casing/fill split -- a wide dual-tone road at a
+    regional/state zoom reads as a fat blob rather than a road, which is
+    exactly what a real basemap avoids by only widening roads once there's
+    enough screen space per pixel for the detail to read as a road.
+    """
+    if road_class == "motorway":
+        return ("#9ea296", None, 1, 0) if zoom < 12 else ("#8c8570", "#f6cf87", 9, 6)
+    if road_class == "trunk":
+        return ("#a4a89c", None, 1, 0) if zoom < 12 else ("#8c8570", "#f8da9c", 8, 5)
+    if road_class == "primary":
+        return ("#a4a89c", None, 1, 0) if zoom < 12 else ("#8a8a80", "#fbe6b0", 7, 4)
+    if road_class == "secondary":
+        return ("#aeb2a4", None, 1, 0) if zoom < 13 else ("#95968c", "#ffffff", 6, 3)
+    if road_class == "tertiary":
+        return ("#b6b9ae", None, 1, 0) if zoom < 13 else ("#a3a49a", "#ffffff", 5, 2)
+    if road_class == "minor":
+        return ("#b7bab0", None, 1, 0) if zoom < 14 else ("#aeb1a7", "#ffffff", 4, 2)
+    if road_class == "service":
+        return ("#c1c4ba", None, 1, 0) if zoom < 15 else ("#b7bab0", "#ffffff", 3, 1)
+    if road_class in VECTOR_PATH_CLASSES:
+        return ("#a9ac9f", None, 1, 0)
+    if road_class == "rail":
+        return ("#7c8078", "#f0f1ec", 3, 1) if zoom >= 10 else ("#9a9c96", None, 1, 0)
+    return VECTOR_ROAD_DEFAULT_STYLE
+
+# A named road only gets a live-overlay label once the view is zoomed to at
+# least this level, mirroring typical basemap label density.
+MIN_LABEL_ZOOM_BY_CLASS: dict[str, int] = {
+    "motorway": 9, "trunk": 10, "primary": 11, "secondary": 12,
+    "tertiary": 13, "minor": 14, "service": 16,
+}
+
+
+def scale_point(
+    point: list[float] | tuple[float, float], render_scale: float = 1.0
+) -> tuple[float, float]:
+    """Vector-tile local coordinates (0..VECTOR_EXTENT) to tile pixel
+    coordinates. `render_scale` (default 1x, the logical 256px tile space
+    label extraction relies on) lets the image-drawing helpers below target
+    a larger supersampled canvas instead -- see SUPERSAMPLE."""
+    return (
+        float(point[0]) / VECTOR_EXTENT * GENERATED_TILE_SIZE * render_scale,
+        float(point[1]) / VECTOR_EXTENT * GENERATED_TILE_SIZE * render_scale,
+    )
+
+
+def _overzoom_coordinates(value: Any, offset_x: float, offset_y: float, scale: int) -> Any:
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) >= 2
+        and isinstance(value[0], (int, float))
+        and isinstance(value[1], (int, float))
+    ):
+        return [(value[0] - offset_x) * scale, (value[1] - offset_y) * scale]
+    if isinstance(value, list):
+        return [_overzoom_coordinates(item, offset_x, offset_y, scale) for item in value]
+    return value
+
+
+def _overzoom_vector_data(data: dict, x: int, y: int, scale: int) -> dict:
+    """Re-express a coarser parent tile's features in a finer child tile's
+    local coordinate space, so a zoom level beyond OpenFreeMap's own detail
+    level still shows (enlarged, blockier) geometry instead of nothing."""
+    offset_x = (x % scale) * VECTOR_EXTENT / scale
+    offset_y = (y % scale) * VECTOR_EXTENT / scale
+    transformed: dict[str, dict] = {}
+    for layer_name, layer in data.items():
+        features = []
+        for feature in layer.get("features", []):
+            geometry = feature.get("geometry", {})
+            features.append(
+                {
+                    **feature,
+                    "geometry": {
+                        **geometry,
+                        "coordinates": _overzoom_coordinates(
+                            geometry.get("coordinates", []), offset_x, offset_y, scale
+                        ),
+                    },
+                }
+            )
+        transformed[layer_name] = {**layer, "features": features}
+    return transformed
+
+
+_VECTOR_TILE_CACHE: dict[tuple[int, int, int], dict] = {}
+_VECTOR_TILE_CACHE_ORDER: list[tuple[int, int, int]] = []
+_VECTOR_TILE_CACHE_MAX = 300
+_VECTOR_TILE_CACHE_LOCK = threading.Lock()
+
+
+def get_vector_tile_data(map_service: "MapDataService", zoom: int, x: int, y: int) -> dict:
+    """Decoded OpenFreeMap vector-tile data for (zoom, x, y), with a small
+    in-memory LRU cache -- the same tile is read once by the tile-image
+    generator and again by the label overlay, and re-decoding the same .pbf
+    on every render frame would be far too slow."""
+    key = (zoom, x, y)
+    with _VECTOR_TILE_CACHE_LOCK:
+        cached = _VECTOR_TILE_CACHE.get(key)
+        if cached is not None:
+            return cached
+    from mapbox_vector_tile import decode as decode_mvt
+
+    if zoom <= OPENFREEMAP_MAX_DETAIL_ZOOM:
+        raw = map_service.fetch_vector_tile_bytes(zoom, x, y)
+        data = decode_mvt(raw, default_options={"y_coord_down": True}) if raw else {}
+    else:
+        scale = 2 ** (zoom - OPENFREEMAP_MAX_DETAIL_ZOOM)
+        parent_x, parent_y = x // scale, y // scale
+        raw = map_service.fetch_vector_tile_bytes(OPENFREEMAP_MAX_DETAIL_ZOOM, parent_x, parent_y)
+        parent_data = decode_mvt(raw, default_options={"y_coord_down": True}) if raw else {}
+        data = _overzoom_vector_data(parent_data, x, y, scale)
+    with _VECTOR_TILE_CACHE_LOCK:
+        _VECTOR_TILE_CACHE[key] = data
+        _VECTOR_TILE_CACHE_ORDER.append(key)
+        while len(_VECTOR_TILE_CACHE_ORDER) > _VECTOR_TILE_CACHE_MAX:
+            oldest = _VECTOR_TILE_CACHE_ORDER.pop(0)
+            _VECTOR_TILE_CACHE.pop(oldest, None)
+    return data
+
+
+def _draw_vector_polygon(
+    drawing: ImageDraw.ImageDraw, rings: list, fill: str, outline: str | None, render_scale: float
+) -> None:
+    if not rings:
+        return
+    outer = [scale_point(point, render_scale) for point in rings[0]]
+    if len(outer) >= 3:
+        drawing.polygon(outer, fill=fill, outline=outline)
+
+
+def _draw_vector_polygon_layer(
+    drawing: ImageDraw.ImageDraw,
+    data: dict,
+    layer_name: str,
+    fill: str,
+    outline: str | None,
+    render_scale: float,
+) -> None:
+    for feature in data.get(layer_name, {}).get("features", []):
+        geometry = feature.get("geometry", {})
+        geometry_type = geometry.get("type")
+        coordinates = geometry.get("coordinates", [])
+        if geometry_type == "Polygon":
+            _draw_vector_polygon(drawing, coordinates, fill, outline, render_scale)
+        elif geometry_type == "MultiPolygon":
+            for polygon in coordinates:
+                _draw_vector_polygon(drawing, polygon, fill, outline, render_scale)
+
+
+def _draw_vector_line(
+    drawing: ImageDraw.ImageDraw, points: list, color: str, width: int, render_scale: float
+) -> None:
+    scaled = [scale_point(point, render_scale) for point in points]
+    if len(scaled) >= 2:
+        drawing.line(scaled, fill=color, width=max(1, round(width * render_scale)), joint="curve")
+
+
+def _draw_vector_geometry_lines(
+    drawing: ImageDraw.ImageDraw, geometry: dict, color: str, width: int, render_scale: float
+) -> None:
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates", [])
+    if geometry_type == "LineString":
+        _draw_vector_line(drawing, coordinates, color, width, render_scale)
+    elif geometry_type == "MultiLineString":
+        for line in coordinates:
+            _draw_vector_line(drawing, line, color, width, render_scale)
+
+
+def _draw_vector_waterways(drawing: ImageDraw.ImageDraw, data: dict, zoom: int, render_scale: float) -> None:
+    meters_per_pixel = tile_size_m(zoom) / GENERATED_TILE_SIZE
+    for feature in data.get("waterway", {}).get("features", []):
+        properties = feature.get("properties", {})
+        water_class = properties.get("class", properties.get("brunnel", "stream"))
+        real_m = VECTOR_WATERWAY_WIDTH_M.get(water_class)
+        if real_m is None:
+            continue
+        width = max(1, round(real_m / meters_per_pixel))
+        _draw_vector_geometry_lines(
+            drawing, feature.get("geometry", {}), VECTOR_WATER_OUTLINE, width, render_scale
+        )
+
+
+def _draw_vector_transportation(drawing: ImageDraw.ImageDraw, data: dict, zoom: int, render_scale: float) -> None:
+    if zoom <= 5:
+        return
+    features = data.get("transportation", {}).get("features", [])
+    jobs = []
+    for feature in features:
+        road_class = feature.get("properties", {}).get("class", "")
+        if zoom < 12 and road_class not in {"motorway", "trunk", "primary"}:
+            continue
+        casing, fill, casing_width, fill_width = _vector_road_style(road_class, zoom)
+        jobs.append((feature.get("geometry", {}), casing, fill, casing_width, fill_width))
+    # Casing pass first, then fill on top -- gives through roads a bordered
+    # look instead of a flat single-color line.
+    for geometry, casing, _fill, casing_width, _fill_width in jobs:
+        _draw_vector_geometry_lines(drawing, geometry, casing, casing_width, render_scale)
+    for geometry, _casing, fill, _casing_width, fill_width in jobs:
+        if fill and fill_width > 0:
+            _draw_vector_geometry_lines(drawing, geometry, fill, fill_width, render_scale)
+
+
+def _draw_vector_boundaries(drawing: ImageDraw.ImageDraw, data: dict, zoom: int, render_scale: float) -> None:
+    """Country/state/county administrative boundary lines -- the only
+    features shown at world/regional zoom besides place labels, so a
+    zoomed-out view isn't just bare roads with nothing else."""
+    for feature in data.get("boundary", {}).get("features", []):
+        properties = feature.get("properties", {})
+        try:
+            admin_level = int(properties.get("admin_level", 8))
+        except (TypeError, ValueError):
+            admin_level = 8
+        if admin_level <= 2:
+            color, width = "#8f7f8f", 2
+        elif admin_level <= 4:
+            color, width = "#9f8f9f", 1
+        elif admin_level <= 6 and zoom >= 8:
+            color, width = "#aea0ae", 1
+        else:
+            continue
+        _draw_vector_geometry_lines(drawing, feature.get("geometry", {}), color, width, render_scale)
+
+
+# Below this zoom, landcover/landuse/park shading is skipped entirely --
+# at a wide/regional view those polygons fragment into visual noise, and
+# roads/water/boundaries/labels are the detail that actually matters there.
+LAND_SHADING_MIN_ZOOM = 9
+
+
+def render_vector_tile_image(data: dict, zoom: int) -> Image.Image:
+    """Render one 256x256 basemap tile (land, water, boundaries, roads --
+    no buildings, no text) from decoded OpenFreeMap vector data. Drawn at
+    SUPERSAMPLE x the final size and downsampled with LANCZOS at the end,
+    since PIL's ImageDraw has no anti-aliasing of its own and a straight
+    line/polygon edge drawn at 1x looks visibly jagged, especially once the
+    tile is upscaled on screen for a continuous zoom."""
+    render_size = GENERATED_TILE_SIZE * SUPERSAMPLE
+    image = Image.new("RGB", (render_size, render_size), GENERATED_BACKGROUND_COLOR)
+    drawing = ImageDraw.Draw(image)
+    if zoom >= LAND_SHADING_MIN_ZOOM:
+        for layer_name, fill, outline in VECTOR_LAND_LAYERS:
+            _draw_vector_polygon_layer(drawing, data, layer_name, fill, outline, SUPERSAMPLE)
+    _draw_vector_polygon_layer(drawing, data, "water", VECTOR_WATER_FILL, VECTOR_WATER_OUTLINE, SUPERSAMPLE)
+    _draw_vector_waterways(drawing, data, zoom, SUPERSAMPLE)
+    _draw_vector_boundaries(drawing, data, zoom, SUPERSAMPLE)
+    _draw_vector_transportation(drawing, data, zoom, SUPERSAMPLE)
+    return image.resize((GENERATED_TILE_SIZE, GENERATED_TILE_SIZE), Image.Resampling.LANCZOS)
+
+
+def _tile_pixel_to_world(
+    pixel_x: float, pixel_y: float, zoom: int, x: int, y: int, center_lat: float, center_lon: float
+) -> tuple[float, float]:
+    left, bottom, right, top = tile_bounds_mercator(zoom, x, y)
+    mercator_x = left + pixel_x / GENERATED_TILE_SIZE * (right - left)
+    mercator_y = top - pixel_y / GENERATED_TILE_SIZE * (top - bottom)
+    latitude, longitude = mercator_to_latlon(mercator_x, mercator_y)
+    return latlon_to_world(latitude, longitude, center_lat, center_lon)
+
+
+def _vector_label_text(properties: dict) -> str:
+    text = properties.get("name:en") or properties.get("name")
+    return str(text).strip() if text else ""
+
+
+_PLACE_RANK_BY_CLASS = {"city": 4, "town": 3, "borough": 3, "suburb": 2, "village": 2, "hamlet": 1, "neighbourhood": 1}
+
+
+def extract_vector_labels(
+    data: dict, zoom: int, x: int, y: int, center_lat: float, center_lon: float
+) -> list[dict[str, Any]]:
+    """Place names + named-road labels from one decoded vector tile, as plain
+    dicts (kind/text/x/y/rank/bearing_deg) in world coordinates -- kept
+    entirely separate from the baked tile image so the UI can draw (or, under
+    Incognito, not draw) them as a live overlay."""
+    labels: list[dict[str, Any]] = []
+    for feature in data.get("place", {}).get("features", []):
+        properties = feature.get("properties", {})
+        name = _vector_label_text(properties)
+        geometry = feature.get("geometry", {})
+        if not name or geometry.get("type") != "Point":
+            continue
+        point = geometry.get("coordinates")
+        if not point:
+            continue
+        pixel_x, pixel_y = scale_point(point)
+        if not (0.0 <= pixel_x <= GENERATED_TILE_SIZE and 0.0 <= pixel_y <= GENERATED_TILE_SIZE):
+            continue
+        world_x, world_y = _tile_pixel_to_world(pixel_x, pixel_y, zoom, x, y, center_lat, center_lon)
+        labels.append(
+            {
+                "kind": "place",
+                "text": name,
+                "x": world_x,
+                "y": world_y,
+                "rank": _PLACE_RANK_BY_CLASS.get(properties.get("class", ""), 0),
+                "bearing_deg": 0.0,
+            }
+        )
+
+    if zoom >= 13:
+        seen_names: set[str] = set()
+        for feature in data.get("transportation_name", {}).get("features", []):
+            properties = feature.get("properties", {})
+            name = _vector_label_text(properties)
+            if not name or name in seen_names:
+                continue
+            geometry = feature.get("geometry", {})
+            geometry_type = geometry.get("type")
+            coordinates = geometry.get("coordinates", [])
+            if geometry_type == "MultiLineString" and coordinates:
+                coordinates = coordinates[0]
+            elif geometry_type != "LineString":
+                continue
+            if len(coordinates) < 2:
+                continue
+            mid = len(coordinates) // 2
+            point_before = coordinates[max(0, mid - 1)]
+            point_after = coordinates[min(len(coordinates) - 1, mid + 1)]
+            px1, py1 = scale_point(point_before)
+            px2, py2 = scale_point(point_after)
+            bearing = math.degrees(math.atan2(py2 - py1, px2 - px1))
+            if bearing > 90.0:
+                bearing -= 180.0
+            elif bearing < -90.0:
+                bearing += 180.0
+            pixel_x, pixel_y = scale_point(coordinates[mid])
+            if not (0.0 <= pixel_x <= GENERATED_TILE_SIZE and 0.0 <= pixel_y <= GENERATED_TILE_SIZE):
+                continue
+            world_x, world_y = _tile_pixel_to_world(pixel_x, pixel_y, zoom, x, y, center_lat, center_lon)
+            road_class = properties.get("class", "")
+            if MIN_LABEL_ZOOM_BY_CLASS.get(road_class, 15) > zoom:
+                continue
+            labels.append(
+                {
+                    "kind": "road",
+                    "text": name,
+                    "x": world_x,
+                    "y": world_y,
+                    "rank": 0,
+                    "bearing_deg": bearing,
+                    "highway_class": road_class,
+                }
+            )
+            seen_names.add(name)
+    return labels
+
+
 def choose_tile_zoom(screen_pixels_per_meter: float, max_zoom: int) -> int:
     ideal = math.log2(max(1e-9, screen_pixels_per_meter) * WEB_MERCATOR_WORLD_M / 256.0)
     # Prefer the next coarser level so an interactive viewport needs fewer community-hosted tiles.
@@ -168,6 +569,16 @@ def decode_grayscale_tile(data: bytes) -> Image.Image:
     white = Image.new("RGBA", source_rgba.size, (255, 255, 255, 255))
     source = Image.alpha_composite(white, source_rgba).convert("RGB")
     return ImageEnhance.Contrast(source).enhance(1.15).convert("L")
+
+
+def decode_color_tile(data: bytes) -> Image.Image:
+    """Decode a tile keeping its full color, for the locally-rendered
+    "Generated" layer -- its land/water colors should actually show instead
+    of being flattened to grayscale the way the (now-unused) raster
+    Street/Topographic layers were."""
+    source_rgba = Image.open(io.BytesIO(data)).convert("RGBA")
+    white = Image.new("RGBA", source_rgba.size, (255, 255, 255, 255))
+    return Image.alpha_composite(white, source_rgba).convert("RGB")
 
 
 def grayscale_map_tile(data: bytes, pixel_size: int) -> Image.Image:
@@ -305,8 +716,26 @@ class MapDataService:
         self.tile_results: queue.Queue[tuple[tuple[str, int, int, int], bytes | Exception]] = queue.Queue()
         self.pending: set[tuple[str, int, int, int]] = set()
         self.pending_lock = threading.Lock()
+        self._tile_generators: dict[str, Callable[[int, int, int], bytes]] = {}
+        self._tile_generator_versions: dict[str, int] = {}
         for index in range(MAP_TILE_WORKERS):
             threading.Thread(target=self._tile_worker, name=f"MapTileWorker{index + 1}", daemon=True).start()
+
+    def set_tile_generator(
+        self, layer: str, generator: Callable[[int, int, int], bytes], *, version: int = 1
+    ) -> None:
+        """Register a purely-local (layer, zoom, x, y) -> PNG bytes generator
+        as a drop-in data source for get_tile_bytes, so the existing
+        fetch/cache/stitch pipeline works unchanged for locally-rendered tiles.
+
+        `version` is baked into the on-disk cache path (see _cache_path) so a
+        future change to the rendering logic -- a new style, a fixed bug --
+        can bump it to invalidate every previously-cached tile automatically,
+        rather than silently keeping serving stale renders from disk forever
+        the way a raster tile's cache correctly can (its source URL's content
+        doesn't change out from under it)."""
+        self._tile_generators[layer] = generator
+        self._tile_generator_versions[layer] = version
 
     def request_tile(self, layer: str, zoom: int, x: int, y: int) -> None:
         maximum = 2**zoom
@@ -331,7 +760,15 @@ class MapDataService:
             self.tile_results.put((key, result))
 
     def _cache_path(self, layer: str, zoom: int, x: int, y: int) -> Path:
-        return self.cache_root / layer / str(zoom) / str(x) / f"{y}.png"
+        version = self._tile_generator_versions.get(layer)
+        cache_layer = f"{layer}-v{version}" if version is not None else layer
+        return self.cache_root / cache_layer / str(zoom) / str(x) / f"{y}.png"
+
+    def cache_path_for(self, layer: str, zoom: int, x: int, y: int) -> Path:
+        """Public accessor so a registered tile generator can check/write its
+        own on-disk cache -- see get_tile_bytes for why a generated layer
+        needs this instead of the generic cache-then-generate flow below."""
+        return self._cache_path(layer, zoom, x, y)
 
     def get_tile_bytes(self, layer: str, zoom: int, x: int, y: int) -> bytes:
         definition = TILE_LAYERS[layer]
@@ -339,6 +776,15 @@ class MapDataService:
         x %= maximum
         if y < 0 or y >= maximum:
             raise ValueError("Tile is outside the Web Mercator world")
+        generator = self._tile_generators.get(layer)
+        if generator is not None:
+            # Always invoke the generator, even when its rendered image is
+            # already disk-cached -- it may have per-tile side effects (e.g.
+            # extracting text labels for a live overlay cache) that need to
+            # run regardless, so a fresh app launch reusing a previously
+            # disk-cached tile doesn't silently end up with no labels for
+            # it. The generator owns its own cache-path read/write.
+            return generator(zoom, x, y)
         cache_path = self._cache_path(layer, zoom, x, y)
         if cache_path.exists():
             return cache_path.read_bytes()
@@ -372,21 +818,23 @@ class MapDataService:
         return results[0]
 
     @staticmethod
-    def _fetch_overpass(
+    def _fetch_overpass_elements(
         south: float,
         west: float,
         north: float,
         east: float,
+        element_type: str,
         selectors: list[str],
+        out_clause: str,
     ) -> list[dict[str, Any]]:
         bbox = f"{south:.7f},{west:.7f},{north:.7f},{east:.7f}"
         query = (
             "[out:json][timeout:30][maxsize:134217728];"
             "("
-            + "".join(f"way[{selector}]({bbox});" for selector in selectors)
+            + "".join(f"{element_type}[{selector}]({bbox});" for selector in selectors)
             +
             ");"
-            "out tags geom 1000;"
+            f"{out_clause}"
         )
         body = urllib.parse.urlencode({"data": query}).encode("utf-8")
         request = urllib.request.Request(
@@ -400,6 +848,18 @@ class MapDataService:
         with urllib.request.urlopen(request, timeout=45) as response:
             payload = json.loads(response.read().decode("utf-8"))
         return list(payload.get("elements", []))
+
+    @staticmethod
+    def _fetch_overpass(
+        south: float,
+        west: float,
+        north: float,
+        east: float,
+        selectors: list[str],
+    ) -> list[dict[str, Any]]:
+        return MapDataService._fetch_overpass_elements(
+            south, west, north, east, "way", selectors, "out tags geom 1000;"
+        )
 
     @staticmethod
     def fetch_osm_obstacles(south: float, west: float, north: float, east: float) -> list[dict[str, Any]]:
@@ -420,6 +880,22 @@ class MapDataService:
             east,
             ['"landuse"="forest"', '"natural"="wood"'],
         )
+
+    def fetch_vector_tile_bytes(self, zoom: int, x: int, y: int) -> bytes:
+        """Raw OpenFreeMap vector tile (.pbf) bytes for the generated base
+        map, disk-cached exactly like a fetched raster tile."""
+        cache_path = self.cache_root / "vector" / str(zoom) / str(x) / f"{y}.pbf"
+        if cache_path.exists():
+            return cache_path.read_bytes()
+        url = OPENFREEMAP_VECTOR_URL.format(z=zoom, x=x, y=y)
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = response.read()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = cache_path.with_suffix(".tmp")
+        temporary_path.write_bytes(data)
+        temporary_path.replace(cache_path)
+        return data
 
     def _overture_cache_path(
         self, south: float, west: float, north: float, east: float, limit: int

@@ -27,12 +27,16 @@ from .geography import (
     TILE_LAYERS,
     WEB_MERCATOR_WORLD_M,
     choose_tile_zoom,
+    decode_color_tile,
     decode_grayscale_tile,
+    extract_vector_labels,
+    get_vector_tile_data,
     latlon_to_mercator,
     latlon_to_world,
     mercator_to_latlon,
     mercator_to_tile,
     obstacle_import_plan,
+    render_vector_tile_image,
     tile_bounds_mercator,
     tile_size_m,
     world_scale_factor,
@@ -138,6 +142,11 @@ GEOGRAPHIC_LAYER_TAG = "geographic-layer"
 SELECTED_OBSTACLE_TAG = "selected-obstacle"
 SURVEY_LAYER_TAG = "survey-layer"
 SURVEY_PING_TAG = "survey-ping"
+MAP_LABEL_TAG = "map-label"
+# Bump this whenever render_vector_tile_image's visual output changes --
+# it's baked into the on-disk tile cache path (MapDataService._cache_path)
+# so old renders never get served silently forever after a style change.
+GENERATED_TILE_STYLE_VERSION = 3
 SURVEY_PING_DURATION_S = 0.4
 SURVEY_PORT_NONE = "— Not selected —"
 LIVE_TRAFFIC_PRESETS: dict[str, dict[str, Any]] = {
@@ -836,6 +845,14 @@ class MeshSimulatorApp:
         self.env_vars: dict[str, tk.Variable] = {}
         self.packet_vars: dict[str, tk.Variable] = {}
         self.map_service = MapDataService()
+        # Bump GENERATED_TILE_STYLE_VERSION whenever render_vector_tile_image's
+        # visual output changes -- otherwise a tile fetched under an older
+        # version keeps being served from disk forever, since (unlike a
+        # fetched raster tile) nothing about the network request itself
+        # would ever signal that the rendering changed.
+        self.map_service.set_tile_generator(
+            "Generated", self._generate_road_tile_bytes, version=GENERATED_TILE_STYLE_VERSION
+        )
         self.map_tile_bytes: dict[tuple[str, int, int, int], bytes] = {}
         self.map_tile_images: dict[tuple[str, int, int, int, int], Image.Image] = {}
         # Decoded once per tile, independent of the requested pixel size, so a
@@ -845,6 +862,17 @@ class MeshSimulatorApp:
         # background between the old raster and the new one.
         self.map_tile_decoded: dict[tuple[str, int, int, int], Image.Image] = {}
         self.map_tile_failures: set[tuple[str, int, int, int]] = set()
+        # Last successfully composited map image, kept as an instant
+        # placeholder for the next one: zooming (especially out) or panning
+        # into an area needs a new set of tiles that haven't been
+        # fetched/rendered yet, and without this the newly-revealed area
+        # would just be blank for however long that takes. Scaling/shifting
+        # the previous frame into the new view (see _compose_map_layer)
+        # fills that gap immediately with slightly-stale-but-correctly-
+        # positioned content, which sharp new tiles then paint over as they
+        # arrive.
+        self.last_map_composite: Image.Image | None = None
+        self.last_map_composite_view: tuple[float, float, float] | None = None
         self.obstacle_layer_image: ImageTk.PhotoImage | None = None
         self.obstacle_layer_source: Image.Image | None = None
         self.obstacle_layer_source_key: tuple[object, ...] | None = None
@@ -900,6 +928,11 @@ class MeshSimulatorApp:
         self.survey_updates: queue.Queue[tuple[str, object]] = queue.Queue()
         self.terrain_request_id = 0
         self.pending_terrain_rf_refresh: tuple[int, str | None, bool, bool] | None = None
+        # Place/road name labels extracted from each generated tile's vector
+        # data, keyed by (zoom, x, y) -- populated as a side effect of
+        # rendering that tile (see _generate_road_tile_bytes) so the live
+        # label overlay never has to re-fetch or re-decode anything itself.
+        self.generated_tile_labels: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
 
         self._build_menu()
         self._build_toolbar()
@@ -1104,7 +1137,7 @@ class MeshSimulatorApp:
     def _incognito_changed(self) -> None:
         enabled = self.incognito_mode.get()
         self.status_var.set(
-            "Incognito mode on · all coordinate displays hidden"
+            "Incognito mode on · coordinates and street/place labels hidden"
             if enabled
             else "Incognito mode off"
         )
@@ -1153,7 +1186,7 @@ class MeshSimulatorApp:
         )
         view_menu.add_command(label="Refresh terrain data", command=self.load_topography)
         view_menu.add_checkbutton(
-            label="Incognito mode (hide all coordinates)",
+            label="Incognito mode (hide coordinates and street/place labels)",
             variable=self.incognito_mode,
             command=self._incognito_changed,
         )
@@ -3193,7 +3226,7 @@ class MeshSimulatorApp:
         env.initial_view_width_m = max(6_000.0, span_x * mercator_scale * 1.35)
         env.initial_view_height_m = max(4_200.0, span_y * mercator_scale * 1.35)
         env.map_configured = True
-        env.map_layer = self.map_layer_var.get() if self.map_layer_var.get() in TILE_LAYERS else "Topographic"
+        env.map_layer = self.map_layer_var.get() if self.map_layer_var.get() in TILE_LAYERS else "Generated"
         self._clear_terrain_grid()
         self.map_visible.set(True)
         self.map_tile_images.clear()
@@ -3494,7 +3527,7 @@ class MeshSimulatorApp:
         env.map_center_lon = longitude
         env.map_configured = True
         self.map_visible.set(True)
-        env.map_layer = self.map_layer_var.get() if self.map_layer_var.get() in TILE_LAYERS else "Topographic"
+        env.map_layer = self.map_layer_var.get() if self.map_layer_var.get() in TILE_LAYERS else "Generated"
         self._clear_terrain_grid()
         self.map_tile_failures.clear()
         self.map_tile_images.clear()
@@ -4110,6 +4143,54 @@ class MeshSimulatorApp:
                     restart_live_mesh=restart_live_mesh,
                     restart_packet=restart_packet,
                 )
+
+    def _generate_road_tile_bytes(self, zoom: int, x: int, y: int) -> bytes:
+        """Registered as the "Generated" layer's tile source (see __init__).
+        get_tile_bytes calls this on EVERY request for this layer, even when
+        the rendered PNG is already disk-cached from an earlier session --
+        label extraction has to run every time regardless (it populates the
+        in-memory generated_tile_labels, which starts empty on every fresh
+        launch). A small JSON sidecar caches the extracted labels next to the
+        PNG so a repeat/fresh-launch hit is two plain disk reads with no
+        network fetch, MVT decode, or re-render -- the vector-tile fetch and
+        decode only ever happens once per tile, ever. Runs on a background
+        tile-worker thread via the existing fetch/cache pipeline
+        (request_tile/_tile_worker/get_tile_bytes), so neither path blocks
+        the UI."""
+        cache_path = self.map_service.cache_path_for("Generated", zoom, x, y)
+        labels_path = cache_path.with_suffix(".labels.json")
+        if cache_path.exists() and labels_path.exists():
+            try:
+                self.generated_tile_labels[(zoom, x, y)] = json.loads(
+                    labels_path.read_text(encoding="utf-8")
+                )
+                return cache_path.read_bytes()
+            except (OSError, ValueError):
+                pass  # Corrupt/partial sidecar -- fall through and regenerate both.
+
+        env = self.scenario.environment
+        data = get_vector_tile_data(self.map_service, zoom, x, y)
+        labels = extract_vector_labels(data, zoom, x, y, env.map_center_lat, env.map_center_lon)
+        self.generated_tile_labels[(zoom, x, y)] = labels
+        try:
+            labels_path.parent.mkdir(parents=True, exist_ok=True)
+            labels_temp = labels_path.with_suffix(".tmp")
+            labels_temp.write_text(json.dumps(labels), encoding="utf-8")
+            labels_temp.replace(labels_path)
+        except OSError:
+            pass
+
+        if cache_path.exists():
+            return cache_path.read_bytes()
+        image = render_vector_tile_image(data, zoom)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        tile_bytes = buffer.getvalue()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = cache_path.with_suffix(".tmp")
+        temporary_path.write_bytes(tile_bytes)
+        temporary_path.replace(cache_path)
+        return tile_bytes
 
     def _build_results(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent)
@@ -7088,6 +7169,14 @@ class MeshSimulatorApp:
                 or self.obstacle_layer_source_key == geographic_key
             )
         )
+        visible_left, visible_top = self.screen_to_world(0, 0)
+        visible_right, visible_bottom = self.screen_to_world(c.winfo_width(), c.winfo_height())
+        visible_bounds = (
+            min(visible_left, visible_right),
+            min(visible_top, visible_bottom),
+            max(visible_left, visible_right),
+            max(visible_top, visible_bottom),
+        )
         if can_reuse_geographic:
             c.create_image(
                 0,
@@ -7098,14 +7187,6 @@ class MeshSimulatorApp:
             )
             self._draw_vector_obstacles(c, self.obstacle_layer_vectors)
         else:
-            visible_left, visible_top = self.screen_to_world(0, 0)
-            visible_right, visible_bottom = self.screen_to_world(c.winfo_width(), c.winfo_height())
-            visible_bounds = (
-                min(visible_left, visible_right),
-                min(visible_top, visible_bottom),
-                max(visible_left, visible_right),
-                max(visible_top, visible_bottom),
-            )
             self._visible_obstacle_bounds = []
             for obstacle in self.scenario.obstacles:
                 bounds = self._obstacle_bounds(obstacle)
@@ -7113,6 +7194,7 @@ class MeshSimulatorApp:
                     self._visible_obstacle_bounds.append((obstacle, bounds))
             visible_obstacles = [obstacle for obstacle, _bounds in self._visible_obstacle_bounds]
             self._draw_obstacle_layer(c, visible_obstacles)
+        self._draw_map_labels(c, visible_bounds)
         packet_start = len(c.find_all())
         self._draw_packet_links(c)
         self._draw_retained_coverage(c)
@@ -7404,9 +7486,82 @@ class MeshSimulatorApp:
         a continuous zoom asks for."""
         decoded = self.map_tile_decoded.get(key)
         if decoded is None:
-            decoded = decode_grayscale_tile(data)
+            decoded = decode_color_tile(data) if key[0] == "Generated" else decode_grayscale_tile(data)
             self.map_tile_decoded[key] = decoded
         return decoded.resize((pixel_size, pixel_size), Image.Resampling.BILINEAR)
+
+    MAX_MAP_LABELS_PER_FRAME = 220
+
+    def _draw_map_labels(self, c: tk.Canvas, visible_bounds: tuple[float, float, float, float]) -> None:
+        """Street/place name text extracted from the same OpenFreeMap vector
+        tiles the generated basemap is rendered from (see
+        _generate_road_tile_bytes/generated_tile_labels), drawn as a
+        genuinely separate pass so Incognito mode can hide it with zero
+        effect on the road/land/water pixels -- no blur, no image
+        processing, no regeneration. Declutters by dropping a candidate
+        whose anchor lands too close to an already-placed label instead of
+        letting every visible tile's labels pile up on screen."""
+        env = self.scenario.environment
+        if self.incognito_mode.get() or self.terrain_only_view.get() or not self.map_visible.get():
+            return
+        if not env.map_configured or not self.generated_tile_labels:
+            return
+        scale = self._base_scale() * self.zoom
+        zoom = choose_tile_zoom(scale, int(TILE_LAYERS["Generated"]["max_zoom"]))
+        world_left, world_top = self.screen_to_world(0, 0)
+        world_right, world_bottom = self.screen_to_world(c.winfo_width(), c.winfo_height())
+        mercator_left, mercator_top, mercator_right, mercator_bottom = world_viewport_to_mercator_bounds(
+            world_left, world_top, world_right, world_bottom, env.map_center_lat, env.map_center_lon,
+        )
+        tile_left, tile_top = mercator_to_tile(mercator_left, mercator_top, zoom)
+        tile_right, tile_bottom = mercator_to_tile(mercator_right, mercator_bottom, zoom)
+        maximum = 2**zoom
+        candidates: list[dict[str, Any]] = []
+        for tile_y in range(math.floor(tile_top), math.floor(tile_bottom) + 1):
+            if tile_y < 0 or tile_y >= maximum:
+                continue
+            for raw_tile_x in range(math.floor(tile_left), math.floor(tile_right) + 1):
+                candidates.extend(self.generated_tile_labels.get((zoom, raw_tile_x % maximum, tile_y), []))
+        if not candidates:
+            return
+        # Places (rarer, more important) before roads; within roads, bigger
+        # classes (lower MIN_LABEL_ZOOM_BY_CLASS, captured at extraction time
+        # via ordering roads before minor streets is not tracked here, so
+        # just prioritize by rank/kind) win any collision.
+        candidates.sort(key=lambda label: (0 if label["kind"] == "place" else 1, -label.get("rank", 0)))
+        left, top, right, bottom = visible_bounds
+        placed: list[tuple[float, float, float]] = []
+        seen_names: set[tuple[str, str]] = set()
+        for label in candidates:
+            if len(placed) >= self.MAX_MAP_LABELS_PER_FRAME:
+                break
+            name_key = (label["kind"], label["text"])
+            if name_key in seen_names:
+                continue
+            world_x, world_y = label["x"], label["y"]
+            if not (left <= world_x <= right and top <= world_y <= bottom):
+                continue
+            screen_x, screen_y = self.world_to_screen(world_x, world_y)
+            char_width = 7.0 if label["kind"] == "place" else 5.0
+            radius = max(20.0, len(label["text"]) * char_width * 0.5)
+            if any(
+                (screen_x - px) ** 2 + (screen_y - py) ** 2 < (radius + pr) ** 2 for px, py, pr in placed
+            ):
+                continue
+            placed.append((screen_x, screen_y, radius))
+            seen_names.add(name_key)
+            if label["kind"] == "place":
+                font = ("Segoe UI Semibold", 12 if label.get("rank", 0) >= 3 else 10)
+                self._halo_text(c, screen_x, screen_y, text=label["text"], font=font, tags=(MAP_LABEL_TAG,))
+            else:
+                font = ("Segoe UI", 8)
+                # world/canvas space is y-down, but Tk's create_text `angle`
+                # rotates counterclockwise in on-screen visual terms -- negate
+                # the stored atan2(dy, dx) bearing to align the two.
+                self._halo_text(
+                    c, screen_x, screen_y, text=label["text"], font=font, tags=(MAP_LABEL_TAG,),
+                    angle=-label["bearing_deg"],
+                )
 
     def _compose_map_layer(self, c: tk.Canvas) -> Image.Image:
         canvas_width = max(1, c.winfo_width())
@@ -7419,8 +7574,32 @@ class MeshSimulatorApp:
             return self._compose_terrain_only_layer(c, composed)
         if not env.map_configured:
             return composed
-        layer = env.map_layer if env.map_layer in TILE_LAYERS else "Topographic"
         scale = self._base_scale() * self.zoom
+        # Paint the last composited frame into the new view first, scaled and
+        # shifted to match -- an instant (if slightly stale) placeholder so a
+        # zoom/pan into not-yet-fetched tiles shows a filled map right away
+        # instead of blank space while the real tiles load in the background.
+        if self.last_map_composite is not None and self.last_map_composite_view is not None:
+            old_view_x, old_view_y, old_scale = self.last_map_composite_view
+            ratio = scale / old_scale if old_scale > 1e-9 else 0.0
+            # Shrinking the placeholder is always cheap, however far out the
+            # zoom jumped in one step (a big search-triggered jump, not just
+            # a scroll-wheel notch, is exactly when this matters most) --
+            # only growing it needs an upper bound, to avoid resizing up to
+            # an enormous image on a large zoom-in.
+            if 0.0 < ratio <= 50.0:
+                try:
+                    new_width = max(1, round(self.last_map_composite.width * ratio))
+                    new_height = max(1, round(self.last_map_composite.height * ratio))
+                    placeholder = self.last_map_composite.resize(
+                        (new_width, new_height), Image.Resampling.BILINEAR
+                    )
+                    offset_x = round((old_view_x - self.view_x) * scale)
+                    offset_y = round((old_view_y - self.view_y) * scale)
+                    composed.paste(placeholder, (offset_x, offset_y))
+                except Exception:
+                    pass
+        layer = env.map_layer if env.map_layer in TILE_LAYERS else "Generated"
         zoom = choose_tile_zoom(scale, int(TILE_LAYERS[layer]["max_zoom"]))
         center_x, center_y = latlon_to_mercator(env.map_center_lat, env.map_center_lon)
         mercator_scale = world_scale_factor(env.map_center_lat)
@@ -7494,6 +7673,8 @@ class MeshSimulatorApp:
             self.map_tile_decoded = {
                 key: image for key, image in self.map_tile_decoded.items() if key in current_decoded_keys
             }
+        self.last_map_composite = composed
+        self.last_map_composite_view = (self.view_x, self.view_y, scale)
         return composed
 
     @staticmethod

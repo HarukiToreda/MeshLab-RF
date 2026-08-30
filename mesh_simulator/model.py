@@ -636,7 +636,7 @@ class Environment:
     map_configured: bool = True
     map_center_lat: float = DEFAULT_MAP_CENTER_LAT
     map_center_lon: float = DEFAULT_MAP_CENTER_LON
-    map_layer: str = "Topographic"
+    map_layer: str = "Generated"
     terrain_enabled: bool = True
     terrain_columns: int = 0
     terrain_rows: int = 0
@@ -926,6 +926,11 @@ class Scenario:
             key: value for key, value in environment_data.items() if key in known_environment_fields
         }
         env = Environment(**environment_data)
+        if env.map_layer in ("Street", "Topographic"):
+            # Raster tiles are retired as the default base layer in favor of
+            # the locally-generated one (so Incognito can hide street/place
+            # labels); scenarios saved before this change move over on load.
+            env.map_layer = "Generated"
         if not env.map_configured:
             env.map_configured = True
             if env.map_center_lat == 0.0 and env.map_center_lon == 0.0:
