@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.0.1 - 2026-08-30
 
 ### Added
 
+- **macOS builds.** Separate Apple Silicon and Intel downloads are now published with Windows releases.
 - **Incognito mode.** View menu toggle that hides all coordinates (status bar, scale bar, node/obstacle fields, Survey GPS column, Horizon/Profile labels) and every street/place name on the map — for recording without revealing your location.
 - **Locally-generated base map.** Map tiles (land use, water, boundaries, roads) now render from vector data instead of fetched raster images, so street/place labels are a separate layer Incognito can hide independently. Faster repeat loading, more parallel tile workers, and an instant zoom/pan placeholder so the map never looks blank while new tiles load.
 - **Survey playback.** Walk a loaded survey over time with Play/Pause, a speed selector, and a scrub bar; the current position and RSSI highlight live on the map.
@@ -11,6 +12,7 @@
 
 ### Fixed
 
+- **Windows packaging.** Build failures now stop the release instead of reporting success.
 - **False save prompt.** Opening a file from an untouched blank session no longer asks to save it.
 - **Window close.** Closing now skips expensive final redraws and cannot be held open by active map-import worker pools.
 - **Beacon speed.** Dense maps now use the intended adaptive ray count, making coverage appear much sooner.

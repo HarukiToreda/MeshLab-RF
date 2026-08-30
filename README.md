@@ -1,6 +1,6 @@
 # MeshLab RF
 
-MeshLab RF is a Windows desktop tool for planning Meshtastic networks. It lets you place radios on a real map, import buildings and forests, use terrain elevation, and watch packets travel from node to node.
+MeshLab RF is a Windows and macOS desktop tool for planning Meshtastic networks. It lets you place radios on a real map, import buildings and forests, use terrain elevation, and watch packets travel from node to node.
 
 Use it to explore coverage, find likely dead spots, compare node locations and heights, and understand how hop limits and node roles affect a mesh. It is a planning aid, not a replacement for an RF site survey.
 
@@ -47,7 +47,13 @@ It currently targets the Heltec Mesh Node T114 (GPS, display, and battery alread
 
 ## Run it
 
-Download the latest [MeshLabRF.exe](https://github.com/HarukiToreda/MeshLab-RF/releases/latest/download/MeshLabRF.exe) from [Releases](https://github.com/HarukiToreda/MeshLab-RF/releases), or build it yourself (see [Development](#development)).
+Download the latest build from [Releases](https://github.com/HarukiToreda/MeshLab-RF/releases):
+
+- [Windows x64](https://github.com/HarukiToreda/MeshLab-RF/releases/latest/download/MeshLabRF.exe)
+- [macOS Apple Silicon](https://github.com/HarukiToreda/MeshLab-RF/releases/latest/download/MeshLabRF-macOS-arm64.dmg)
+- [macOS Intel](https://github.com/HarukiToreda/MeshLab-RF/releases/latest/download/MeshLabRF-macOS-x86_64.dmg)
+
+The macOS builds are currently unsigned. On first launch, Control-click **MeshLabRF**, choose **Open**, then confirm.
 
 The app starts with a map but no nodes. Internet access is needed for new map tiles, search, terrain, and obstacle data. Saved scenarios and cached data can be used offline.
 
@@ -102,7 +108,7 @@ The **Terrain only** option shows elevation contours without roads and labels. *
 
 ## Live radio
 
-Open the **Live Radio** sidebar tab, choose the Meshtastic radio’s Windows COM port, and connect. MeshLab RF reads the radio’s known NodeDB and plots nodes with valid positions.
+Open the **Live Radio** sidebar tab, choose the Meshtastic radio’s USB serial port, and connect. MeshLab RF reads the radio’s known NodeDB and plots nodes with valid positions.
 
 Updates are merged by node number, so reconnecting does not duplicate nodes. Nodes without coordinates remain listed but are not placed. Valid MSL altitude is used when available; impossible altitude is ignored while the position is kept and placed above local terrain.
 
@@ -123,6 +129,14 @@ Technical details:
 
 ## Development
 
+Install the build dependencies first:
+
+```text
+python -m pip install -r requirements-build.txt
+```
+
+Windows:
+
 ```powershell
 python main.py
 python -m unittest discover -s tests -v
@@ -130,3 +144,13 @@ python -m unittest discover -s tests -v
 ```
 
 The build output is `dist\MeshLabRF.exe`.
+
+macOS:
+
+```bash
+python3 main.py
+python3 -m unittest discover -s tests -v
+./build_macos.sh
+```
+
+The build output is an architecture-specific DMG in `dist/`.

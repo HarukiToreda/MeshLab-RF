@@ -226,7 +226,7 @@ class LiveRadioClient:
 
         def worker() -> None:
             # Meshtastic imports its protobuf stack, which is relatively heavy.
-            # Defer it until the COM-radio feature is actually used so map and
+            # Defer it until the serial-radio feature is actually used so map and
             # survey-only sessions do not pay that startup cost.
             from meshtastic.serial_interface import SerialInterface
 

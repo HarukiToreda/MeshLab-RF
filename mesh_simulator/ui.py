@@ -19,6 +19,7 @@ from typing import Any, Callable
 import numpy as np
 from PIL import Image, ImageChops, ImageColor, ImageDraw, ImageFont, ImageTk
 
+from . import __version__
 from .background import DaemonTask, daemon_map_as_completed
 from .geography import (
     MapDataService,
@@ -2971,7 +2972,7 @@ class MeshSimulatorApp:
             ports = list_serial_ports()
         except Exception as error:
             self.live_status_var.set("Port scan failed")
-            self.status_var.set(f"Could not enumerate COM ports: {error}")
+            self.status_var.set(f"Could not enumerate serial ports: {error}")
             return
         self.live_ports = {port.label: port for port in ports}
         labels = list(self.live_ports)
@@ -2987,14 +2988,14 @@ class MeshSimulatorApp:
         else:
             self.live_port_var.set("")
         if not self.live_radio.connected and not self.live_radio.connecting:
-            self.live_status_var.set(f"{len(ports)} COM port{'s' if len(ports) != 1 else ''}")
+            self.live_status_var.set(f"{len(ports)} serial port{'s' if len(ports) != 1 else ''}")
 
     def connect_live_radio(self) -> None:
         port = self.live_ports.get(self.live_port_var.get())
         if port is None:
             messagebox.showinfo(
-                "Choose a COM port",
-                "Connect the radio by USB, then choose its COM port from the dropdown.",
+                "Choose a serial port",
+                "Connect the radio by USB, then choose its serial port from the dropdown.",
                 parent=self.root,
             )
             return
@@ -3052,7 +3053,7 @@ class MeshSimulatorApp:
                 messagebox.showerror(
                     "Meshtastic connection failed",
                     f"Could not open {payload['port']}.\n\n{error}\n\n"
-                    "Close any other Meshtastic application using that COM port and try again.",
+                    "Close any other Meshtastic application using that serial port and try again.",
                     parent=self.root,
                 )
             elif event in {"disconnected", "lost"}:
@@ -10959,8 +10960,8 @@ class MeshSimulatorApp:
     def show_about(self) -> None:
         messagebox.showinfo(
             "About MeshLab RF",
-            "MeshLab RF\n\n"
-            "Unreleased Windows planning tool for Meshtastic packet propagation, terrain-aware RF coverage, "
+            f"MeshLab RF {__version__}\n\n"
+            "Desktop planning tool for Meshtastic packet propagation, terrain-aware RF coverage, "
             "obstruction import, and live read-only NodeDB plotting.\n\n"
             "Its routing and radio assumptions are based on the local Meshtastic firmware checkout. "
             "See Help → Model assumptions and the bundled project documentation for scope and limitations.",

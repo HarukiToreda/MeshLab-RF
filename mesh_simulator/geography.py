@@ -26,7 +26,7 @@ from .background import daemon_map_as_completed
 EARTH_RADIUS_M = 6_378_137.0
 WEB_MERCATOR_WORLD_M = 2.0 * math.pi * EARTH_RADIUS_M
 MAX_LATITUDE = 85.05112878
-USER_AGENT = "MeshLabRF (native Windows RF planning application)"
+USER_AGENT = "MeshLabRF (desktop RF planning application)"
 OVERTURE_BUILDING_CACHE_SECONDS = 7 * 24 * 60 * 60
 OVERTURE_BUILDING_LIMIT = 1000
 OVERTURE_VIEWPORT_BUILDING_LIMIT = 2400
