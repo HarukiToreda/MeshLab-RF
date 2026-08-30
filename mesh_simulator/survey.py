@@ -157,20 +157,6 @@ def decode_survey_records(
     return rows, invalid
 
 
-def read_survey_log(path: str | Path) -> list[dict[str, str]]:
-    with open(path, newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        fields = set(reader.fieldnames or ())
-        missing = sorted(SURVEY_REQUIRED_FIELDS - fields)
-        if missing:
-            raise SurveyLogError(f"{path} is not a MeshLab survey log; missing: {', '.join(missing)}")
-        rows = list(reader)
-    invalid = sorted({row.get("schema", "") for row in rows if row.get("schema") not in {"1", "2"}})
-    if invalid:
-        raise SurveyLogError(f"{path} uses unsupported survey schema values: {', '.join(invalid)}")
-    return rows
-
-
 def _integer(row: dict[str, str] | None, field: str, default: int = 0) -> int:
     if not row:
         return default

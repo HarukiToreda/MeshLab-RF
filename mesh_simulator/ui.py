@@ -6157,9 +6157,6 @@ class MeshSimulatorApp:
             # packet sent manually after obstacle loading.
             self.root.after_idle(self.run_simulation)
 
-    def _beacon_running(self) -> bool:
-        return self.beacon_after is not None
-
     @staticmethod
     def _beacon_ray_count(obstacle_count: int) -> int:
         """Fewer rays on obstacle-dense maps keeps the one-off sweep responsive."""
@@ -6184,14 +6181,6 @@ class MeshSimulatorApp:
             self.status_var.set(f"{node.name} is offline · bring it online to pulse a beacon")
             return
         self._queue_beacon_profile(node, keep_existing=False)
-
-    def _recompute_active_beacon(self, node_id: str) -> None:
-        """Reprofile a running beacon without hiding its current coverage."""
-        node = next((candidate for candidate in self.scenario.nodes if candidate.id == node_id), None)
-        if node is None or not node.online:
-            self.stop_beacon()
-            return
-        self._queue_beacon_profile(node, keep_existing=True)
 
     def _queue_beacon_profile(
         self,
@@ -8504,38 +8493,6 @@ class MeshSimulatorApp:
             fill="#b8c7d9",
             font=("Segoe UI Semibold", 9),
         )
-
-    def _draw_live_test_paths(self, c: tk.Canvas, nodes: dict[str, Node]) -> None:
-        """Retain the selected live test's first-arrival mesh links and hop badges."""
-        if self.live_path_test_id is None:
-            return
-        test = self.live_mesh_tests.get(self.live_path_test_id)
-        if test is None:
-            return
-        for receiver_id, arrival in test.reached.items():
-            via_id = str(arrival.get("via", ""))
-            hop = int(arrival.get("hop", 0))
-            if not via_id or hop <= 0 or not self.hop_line_vars.get(hop, tk.BooleanVar(value=True)).get():
-                continue
-            source = nodes.get(via_id)
-            receiver = nodes.get(receiver_id)
-            if source is None or receiver is None:
-                continue
-            x1, y1 = self.world_to_screen(source.x, source.y)
-            x2, y2 = self.world_to_screen(receiver.x, receiver.y)
-            color = HOP_COLORS.get(hop, ACCENT)
-            c.create_line(
-                x1, y1, x2, y2, fill="#02060d", width=7, dash=(6, 3),
-                arrow="last", arrowshape=(9, 11, 4),
-            )
-            c.create_line(
-                x1, y1, x2, y2, fill=color, width=3, dash=(6, 3),
-                arrow="last", arrowshape=(7, 9, 3),
-            )
-            self._draw_outlined_text(
-                c, (x1 + x2) / 2, (y1 + y2) / 2 - 9, f"H{hop}",
-                fill=color, font=("Segoe UI Bold", 9),
-            )
 
     HORIZON_SILHOUETTE_COLOR = "#3d3d3d"  # one uniform tone for the whole skyline shape
     HORIZON_DEFAULT_FOV_DEG = 90.0  # a normal-lens field of view, not the full 360° sweep

@@ -1231,15 +1231,6 @@ class PropagationModel:
                     intervals[obstacle_key] = (ray_length * entry_t, ray_length * exit_t)
         return intersecting, intervals
 
-    def _intersecting_ray_obstacles(
-        self,
-        source: Node,
-        target: Node,
-        candidates: list[Obstacle],
-    ) -> list[Obstacle]:
-        """Compatibility wrapper returning only full-ray intersecting obstacles."""
-        return self._prepare_ray_obstacles(source, target, candidates)[0]
-
     def _ray_obstacle_intersection(
         self,
         obstacle: Obstacle,

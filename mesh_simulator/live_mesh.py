@@ -3,7 +3,6 @@ from __future__ import annotations
 import heapq
 import math
 import random
-import itertools
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -436,9 +435,6 @@ class LiveMeshEngine:
             route.append(current)
             current = str(arrivals.get(current, {}).get("via", ""))
         return list(reversed(route))
-
-    def _test_path(self, test: LiveMeshTestResult) -> list[str]:
-        return self._path_from_arrivals(test.reached, test.packet.destination_id)
 
     @staticmethod
     def _response_for_port(port: str) -> tuple[str, int] | None:
