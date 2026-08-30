@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Signal testers now wake directly instead of entering OTA mode.
+- Battery gauges now refresh every five seconds.
+- Paused metrics now refresh without repainting the full screen.
+
+### Changed
+
+- Survey collection now uses a scrolling nine-ping status log.
+- Paused testers now show a metrics dashboard and require a hold to open the menu.
+- A tap while collecting now switches between the live log and control center.
+- Storage metrics now live only in the control center, not the menu.
+
 ## 1.0.1 - 2026-08-30
 
 ### Added

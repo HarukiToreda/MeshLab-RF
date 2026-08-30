@@ -17,11 +17,19 @@ python -m platformio run -e t114-survey-base
 
 The generated UF2 files are named `heltec-t114-signal-mobile.uf2` and `heltec-t114-signal-base.uf2` inside their corresponding `.pio/build` directories. Checked-in ready-to-flash copies are in [`artifacts/signal-tester`](../artifacts/signal-tester); those binaries are outputs, while this directory contains the editable source.
 
-Logging is paused at boot. Tap the T114 user button to open the popup menu, tap to move its highlight between items, and hold for 500 ms to select, matching Meshtastic's screened-device button timing. A short click registers on release; a long selection activates at the threshold while the button is still held. The menu can start/stop logging, show storage use, mute/unmute the mobile buzzer, wipe logs with confirmation, restart, or enter system-off. Power-off is accepted at the threshold and then waits for button release so the same press cannot wake the board. Press the user button again to wake from system-off. Logs are retained unless `WIPE ALL LOGS` is confirmed.
+Logging is paused at boot. Hold the T114 button for 500 ms to open the menu; a tap does nothing while paused. Tap to move and hold to select inside the menu. Power-off waits for release, and the next press wakes directly into the tester. Logs remain until `WIPE ALL LOGS` is confirmed.
+
+The battery gauge refreshes every five seconds, including while logging is paused.
+
+The paused control center shows GPS quality, coordinates, speed, storage, sound, radio settings, device ID, and battery.
+
+While collecting, both testers show a nine-row live log. New pings scroll in at the bottom with quality, RSSI/SNR, and reply status; the mobile updates `WAIT` to `YES` or `NO` when each result arrives.
+
+While collecting, tap to switch between the live log and control center. Hold from either view to open the menu.
 
 The mobile sends its first probe only after consecutive fresh fixes have at least six satellites and HDOP no worse than 2.00. Walking mode requires five good fixes. At 20 km/h or faster, vehicle mode requires seven good fixes and judges position changes against the GPS-reported speed instead of rejecting normal driving motion; speeds above 180 km/h remain rejected as implausible for this survey. After the first sample, another probe requires at least five meters of movement when walking or 15 meters while driving, as well as the five-second rate limit, so a stationary tester does not fill the log with duplicate positions. These thresholds are configurable in `include/survey_config.h`.
 
-The compact version 2 format stores 8,140 total records in a 640 KB internal-flash partition. A session uses one boot record and then one record per completed exchange, so one uninterrupted session holds up to 8,139 exchanges (roughly 11.3 hours at the default five-second interval). The normal footer shows used/total records, and the popup menu's `LOG STORAGE` page shows used and free records and KB. The updated USB extractor also understands legacy version 1 dump files.
+The compact version 2 format stores 8,140 total records in a 640 KB internal-flash partition. A session uses one boot record and then one record per completed exchange, so one uninterrupted session holds up to 8,139 exchanges (roughly 11.3 hours at the default five-second interval). The control center shows used and free records and KB. The updated USB extractor also understands legacy version 1 dump files.
 
 USB serial at 115200 baud exposes `MESHLAB_INFO`, `MESHLAB_DUMP`, and the deliberately explicit `MESHLAB_CLEAR YES` command for model-neutral desktop or command-line extraction. A dump includes role, node ID, record format, stored count, radio profile, raw records, and an end-to-end CRC. The desktop viewer lets the user select any serial port; it does not require both radios to be connected at once.
 

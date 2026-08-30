@@ -22,6 +22,8 @@ constexpr uint32_t BUTTON_DEBOUNCE_MS = 1;
 // Matches Meshtastic's screened-device user-button long-press threshold.
 constexpr uint32_t BUTTON_LONG_PRESS_MS = 500;
 constexpr uint32_t MENU_TIMEOUT_MS = 30000;
+// Adafruit nRF52 bootloader magic: skip DFU once after a system-off wake.
+constexpr uint8_t BOOTLOADER_SKIP_DFU_MAGIC = 0x6D;
 
 // A position is trusted only after several consecutive fresh fixes meet these
 // quality limits. Vehicle mode allows legitimate driving motion while requiring

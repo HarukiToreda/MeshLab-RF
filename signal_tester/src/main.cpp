@@ -39,6 +39,7 @@ constexpr char ROLE_NAME[] = "BASE";
 constexpr uint32_t FLASH_SECTOR_BYTES = 4096;
 constexpr uint8_t MAX_RADIO_PACKET_BYTES = 96;
 constexpr uint8_t PENDING_COUNT = 4;
+constexpr uint8_t DASHBOARD_ROW_COUNT = 9;
 constexpr uint8_t BUZZER_QUEUE_CAPACITY = 4;
 constexpr uint8_t BUTTON_EDGE_QUEUE_CAPACITY = 16;
 
@@ -75,7 +76,7 @@ uint32_t lastBasePacketMs = 0;
 uint32_t lastBaseStatusMs = 0;
 #endif
 
-enum class MenuMode : uint8_t { Closed, Select, StorageInfo, ConfirmErase, ConfirmPowerOff };
+enum class MenuMode : uint8_t { Closed, Select, ConfirmErase, ConfirmPowerOff };
 MenuMode menuMode = MenuMode::Closed;
 uint8_t menuSelection = 0;
 bool buttonRawDown = false;
@@ -101,6 +102,30 @@ struct PendingProbe {
 
 PendingProbe pending[PENDING_COUNT] = {};
 
+enum class DashboardResponse : uint8_t { Waiting, Received, Missed, ReplySent, ReplyFailed, SendFailed };
+
+struct DashboardRow {
+    bool active;
+    bool signalValid;
+    uint32_t sequence;
+    int16_t rssi;
+    int16_t snrCenti;
+    DashboardResponse response;
+};
+
+DashboardRow dashboardRows[DASHBOARD_ROW_COUNT] = {};
+uint8_t dashboardRowCount = 0;
+char dashboardStatus[22] = "READY";
+uint16_t dashboardStatusColor = ST77XX_YELLOW;
+char pausedGpsRendered[4][24] = {};
+uint16_t pausedGpsRenderedColor[4] = {};
+bool pausedGpsCacheValid = false;
+bool collectionControlVisible = false;
+bool controlStorageCacheValid = false;
+bool controlStorageReadyRendered = false;
+bool controlSoundRendered = false;
+uint32_t controlStorageSlotsRendered = UINT32_MAX;
+
 constexpr uint16_t BATTERY_OCV_MV[] = {4190, 4050, 3990, 3890, 3800, 3720, 3630, 3530, 3420, 3300, 3100};
 
 uint8_t batteryPercent(uint16_t millivolts)
@@ -122,11 +147,11 @@ uint8_t batteryPercent(uint16_t millivolts)
     return 0;
 }
 
-void updateBatteryReading(bool force = false)
+bool updateBatteryReading(bool force = false)
 {
     const uint32_t now = millis();
     if (!force && batteryReadOnce && static_cast<uint32_t>(now - lastBatteryReadMs) < BATTERY_READ_INTERVAL_MS)
-        return;
+        return false;
     lastBatteryReadMs = now;
     batteryReadOnce = true;
 
@@ -145,9 +170,10 @@ void updateBatteryReading(bool force = false)
     batteryReadingValid = measured >= 2500 && measured <= 5000;
     if (!batteryReadingValid) {
         batteryMillivolts = measured;
-        return;
+        return true;
     }
     batteryMillivolts = batteryMillivolts ? static_cast<uint16_t>((batteryMillivolts + measured) / 2) : measured;
+    return true;
 }
 
 #if defined(SURVEY_ROLE_MOBILE)
@@ -499,6 +525,8 @@ class SurveyStorage
 SurveyStorage storage;
 
 void redrawMenuOverlay();
+bool gpsSpeedIsFresh();
+uint8_t requiredGpsGoodFixes();
 
 void onRadioInterrupt()
 {
@@ -620,6 +648,415 @@ uint16_t statusTitleColor(const char *title)
     return ST77XX_YELLOW;
 }
 
+void drawBatteryStatus()
+{
+    constexpr int16_t batteryX = 174;
+    constexpr int16_t batteryY = 121;
+    constexpr int16_t batteryWidth = 19;
+    constexpr int16_t batteryHeight = 10;
+    display.fillRect(172, 120, 68, 15, ST77XX_BLACK);
+    display.drawRect(batteryX, batteryY, batteryWidth, batteryHeight, ST77XX_WHITE);
+    display.fillRect(batteryX + batteryWidth, batteryY + 3, 2, 4, ST77XX_WHITE);
+    display.setTextSize(1);
+    display.setCursor(200, 122);
+    if (batteryReadingValid) {
+        const uint8_t percent = batteryPercent(batteryMillivolts);
+        const uint16_t color = percent > 50 ? ST77XX_GREEN : (percent > 20 ? ST77XX_YELLOW : ST77XX_RED);
+        const int16_t fillWidth = static_cast<int16_t>((batteryWidth - 4) * percent / 100);
+        if (fillWidth > 0)
+            display.fillRect(batteryX + 2, batteryY + 2, fillWidth, batteryHeight - 4, color);
+        display.setTextColor(color);
+        display.print(percent);
+        display.print('%');
+    } else {
+        display.setTextColor(ST77XX_WHITE);
+        display.print("--");
+    }
+}
+
+const char *dashboardQuality(const DashboardRow &row)
+{
+    if (!row.signalValid)
+        return "--";
+    if (row.rssi >= -100 && row.snrCenti >= 0)
+        return "GOOD";
+    if (row.rssi >= -115 && row.snrCenti >= -1000)
+        return "FAIR";
+    return "WEAK";
+}
+
+uint16_t dashboardQualityColor(const DashboardRow &row)
+{
+    if (!row.signalValid)
+        return ST77XX_WHITE;
+    if (row.rssi >= -100 && row.snrCenti >= 0)
+        return ST77XX_GREEN;
+    if (row.rssi >= -115 && row.snrCenti >= -1000)
+        return ST77XX_YELLOW;
+    return ST77XX_RED;
+}
+
+const char *dashboardResponseText(DashboardResponse response)
+{
+    switch (response) {
+    case DashboardResponse::Waiting:
+        return "WAIT";
+    case DashboardResponse::Received:
+        return "YES";
+    case DashboardResponse::Missed:
+        return "NO";
+    case DashboardResponse::ReplySent:
+        return "SENT";
+    case DashboardResponse::ReplyFailed:
+        return "FAIL";
+    case DashboardResponse::SendFailed:
+        return "TX ERR";
+    }
+    return "--";
+}
+
+uint16_t dashboardResponseColor(DashboardResponse response)
+{
+    if (response == DashboardResponse::Waiting)
+        return ST77XX_YELLOW;
+    if (response == DashboardResponse::Received || response == DashboardResponse::ReplySent)
+        return ST77XX_GREEN;
+    return ST77XX_RED;
+}
+
+void drawDashboardHeader()
+{
+    display.fillRect(0, 0, 240, 15, ST77XX_BLACK);
+    display.setTextWrap(false);
+    display.setTextSize(1);
+    display.setTextColor(ST77XX_CYAN);
+    display.setCursor(4, 4);
+    display.print(ROLE_NAME);
+    display.print(" CONTROL");
+    display.fillRect(100, 0, 140, 14, ST77XX_BLACK);
+    display.setTextColor(dashboardStatusColor);
+    display.setCursor(104, 4);
+    display.print(dashboardStatus);
+    display.drawFastHLine(0, 14, 240, ST77XX_WHITE);
+}
+
+void drawDashboardRows()
+{
+    display.fillRect(0, 15, 240, 105, ST77XX_BLACK);
+    display.setTextSize(1);
+    display.setTextColor(ST77XX_CYAN);
+    display.setCursor(4, 18);
+    display.print("PING");
+    display.setCursor(45, 18);
+    display.print("QUALITY");
+    display.setCursor(92, 18);
+    display.print("RSSI/SNR");
+    display.setCursor(184, 18);
+    display.print("RESPONSE");
+    display.drawFastHLine(0, 28, 240, display.color565(70, 70, 70));
+
+    for (uint8_t index = 0; index < dashboardRowCount; ++index) {
+        const DashboardRow &row = dashboardRows[index];
+        const int16_t y = 32 + index * 10;
+        display.setTextColor(ST77XX_WHITE);
+        display.setCursor(4, y);
+        display.print('#');
+        display.print(row.sequence);
+        display.setTextColor(dashboardQualityColor(row));
+        display.setCursor(45, y);
+        display.print(dashboardQuality(row));
+        display.setCursor(92, y);
+        if (row.signalValid) {
+            display.print(row.rssi);
+            display.print('/');
+            display.print(row.snrCenti / 100.0F, 1);
+        } else {
+            display.print("--");
+        }
+        display.setTextColor(dashboardResponseColor(row.response));
+        display.setCursor(184, y);
+        display.print(dashboardResponseText(row.response));
+    }
+}
+
+void drawDashboardFooter()
+{
+    display.fillRect(0, 120, 172, 15, ST77XX_BLACK);
+    display.setTextSize(1);
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(4, 122);
+    display.print(ROLE_NAME);
+    display.print(loggingEnabled ? " R" : " P");
+    display.print(" L");
+    if (storageReady) {
+        display.print(storage.slots());
+        display.print('/');
+        display.print(storage.capacity());
+    } else {
+        display.print('-');
+    }
+    if (loggingEnabled)
+        display.print(" T:CTRL");
+    drawBatteryStatus();
+}
+
+void drawDashboard()
+{
+    updateBatteryReading();
+    display.fillScreen(ST77XX_BLACK);
+    drawDashboardHeader();
+    drawDashboardRows();
+    drawDashboardFooter();
+    if (menuMode != MenuMode::Closed)
+        redrawMenuOverlay();
+}
+
+void drawPausedPanel(int16_t x, int16_t width, const char *title)
+{
+    const uint16_t panel = display.color565(7, 18, 27);
+    const uint16_t border = display.color565(24, 82, 105);
+    display.fillRoundRect(x, 22, width, 72, 5, panel);
+    display.drawRoundRect(x, 22, width, 72, 5, border);
+    display.setTextSize(1);
+    display.setTextColor(ST77XX_CYAN);
+    display.setCursor(x + 6, 27);
+    display.print(title);
+}
+
+void drawPausedGpsLine(uint8_t index, const char *text, uint16_t color, int16_t y, uint8_t textSize,
+                       int16_t clearY, int16_t clearHeight)
+{
+    if (pausedGpsCacheValid && !strcmp(pausedGpsRendered[index], text) &&
+        pausedGpsRenderedColor[index] == color)
+        return;
+    strncpy(pausedGpsRendered[index], text, sizeof(pausedGpsRendered[index]) - 1);
+    pausedGpsRendered[index][sizeof(pausedGpsRendered[index]) - 1] = '\0';
+    pausedGpsRenderedColor[index] = color;
+    display.fillRect(7, clearY, 107, clearHeight, display.color565(7, 18, 27));
+    display.setTextSize(textSize);
+    display.setTextColor(color);
+    display.setCursor(10, y);
+    display.print(text);
+}
+
+void drawPausedGpsMetrics()
+{
+    const bool gpsFresh = gps.location.isValid() && gps.location.age() < GPS_MAX_FIX_AGE_MS;
+    const bool gpsLocked = gpsFixTrusted && gpsFresh;
+    const bool noData = gps.charsProcessed() < 10;
+    const char *status = gpsLocked ? "LOCKED" : (noData ? "NO DATA" : "SEARCH");
+    const uint16_t statusColor = gpsLocked ? ST77XX_GREEN : (noData ? ST77XX_RED : ST77XX_YELLOW);
+
+    char satellites[5] = "--";
+    char hdop[8] = "--";
+    char speed[8] = "--";
+    if (gps.satellites.isValid())
+        snprintf(satellites, sizeof(satellites), "%02lu", gps.satellites.value());
+    if (gps.hdop.isValid())
+        snprintf(hdop, sizeof(hdop), "%.1f", gps.hdop.hdop());
+    if (gpsSpeedIsFresh())
+        snprintf(speed, sizeof(speed), "%.1f", gps.speed.kmph());
+
+    char quality[24];
+    char position1[24];
+    char position2[24];
+    snprintf(quality, sizeof(quality), "S%s H%s V%s", satellites, hdop, speed);
+    if (gpsLocked) {
+        snprintf(position1, sizeof(position1), "LAT %.5f", gps.location.lat());
+        snprintf(position2, sizeof(position2), "LON %.5f", gps.location.lng());
+    } else {
+        snprintf(position1, sizeof(position1), "FIX %u/%u", gpsGoodFixCount, requiredGpsGoodFixes());
+        snprintf(position2, sizeof(position2), "GPS quality pending");
+    }
+
+    drawPausedGpsLine(0, status, statusColor, 39, 2, 37, 19);
+    drawPausedGpsLine(1, quality, ST77XX_WHITE, 59, 1, 57, 10);
+    drawPausedGpsLine(2, position1, ST77XX_WHITE, 70, 1, 68, 10);
+    drawPausedGpsLine(3, position2, ST77XX_WHITE, 81, 1, 79, 10);
+    pausedGpsCacheValid = true;
+}
+
+void drawControlStorageMetrics()
+{
+    const uint32_t slots = storageReady ? storage.slots() : 0;
+    const bool soundOn = ROLE == SurveyRole::Mobile && soundEnabled;
+    if (controlStorageCacheValid && controlStorageReadyRendered == storageReady &&
+        controlStorageSlotsRendered == slots && controlSoundRendered == soundOn)
+        return;
+    controlStorageReadyRendered = storageReady;
+    controlStorageSlotsRendered = slots;
+    controlSoundRendered = soundOn;
+
+    const uint16_t panel = display.color565(7, 18, 27);
+    display.fillRect(125, 37, 108, 19, panel);
+    display.setTextSize(2);
+    display.setTextColor(ST77XX_GREEN);
+    display.setCursor(128, 39);
+    if (storageReady)
+        display.print(slots);
+    else
+        display.print("--");
+    display.setTextSize(1);
+    display.print(" REC");
+
+    constexpr int16_t storageBarX = 128;
+    constexpr int16_t storageBarY = 57;
+    constexpr int16_t storageBarWidth = 102;
+    display.drawRect(storageBarX, storageBarY, storageBarWidth, 6, ST77XX_WHITE);
+    display.fillRect(storageBarX + 1, storageBarY + 1, storageBarWidth - 2, 4, panel);
+    if (storageReady && storage.capacity()) {
+        const uint32_t fill = (storageBarWidth - 2) * slots / storage.capacity();
+        if (fill)
+            display.fillRect(storageBarX + 1, storageBarY + 1, fill, 4, ST77XX_CYAN);
+    }
+
+    display.fillRect(125, 64, 108, 29, panel);
+    display.setTextSize(1);
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(128, 66);
+    display.print("FREE ");
+    if (storageReady)
+        display.print(storage.freeRecords());
+    else
+        display.print("--");
+    display.setCursor(128, 76);
+    display.print("DATA ");
+    if (storageReady) {
+        display.print(storage.usedBytes() / 1024UL);
+        display.print('/');
+        display.print((SURVEY_STORAGE_BYTES - SURVEY_STORAGE_HEADER_BYTES) / 1024UL);
+        display.print(" KB");
+    } else {
+        display.print("--");
+    }
+    display.setCursor(128, 86);
+    if (ROLE == SurveyRole::Mobile) {
+        display.print("SOUND ");
+        display.setTextColor(soundEnabled ? ST77XX_GREEN : ST77XX_YELLOW);
+        display.print(soundEnabled ? "ON" : "MUTED");
+    } else {
+        display.print("SOUND BASE SILENT");
+    }
+    controlStorageCacheValid = true;
+}
+
+void drawControlCenter()
+{
+    updateBatteryReading();
+    display.fillScreen(ST77XX_BLACK);
+    display.setTextWrap(false);
+
+    const uint16_t header = display.color565(5, 28, 42);
+    display.fillRect(0, 0, 240, 18, header);
+    display.fillRect(0, 0, 4, 18, ST77XX_CYAN);
+    display.setTextSize(1);
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(9, 5);
+    display.print(ROLE_NAME);
+    display.print(" // CONTROL CENTER");
+    const uint16_t modeColor = loggingEnabled ? ST77XX_GREEN : ST77XX_YELLOW;
+    display.drawRoundRect(185, 2, 51, 13, 4, modeColor);
+    display.setTextColor(modeColor);
+    display.setCursor(192, 5);
+    display.print(loggingEnabled ? "ACTIVE" : "PAUSED");
+
+    drawPausedPanel(4, 113, "GPS STATUS");
+    drawPausedPanel(122, 114, "LOG STORAGE");
+    pausedGpsCacheValid = false;
+    drawPausedGpsMetrics();
+    controlStorageCacheValid = false;
+    drawControlStorageMetrics();
+
+    const uint16_t radioPanel = display.color565(7, 18, 27);
+    display.fillRoundRect(4, 97, 232, 20, 4, radioPanel);
+    display.drawRoundRect(4, 97, 232, 20, 4, display.color565(24, 82, 105));
+    display.setTextColor(radioReady ? ST77XX_GREEN : ST77XX_RED);
+    display.setCursor(9, 100);
+    display.print(radioReady ? "RF" : "RF!");
+    display.setTextColor(ST77XX_WHITE);
+    display.print(' ');
+    display.print(SURVEY_FREQUENCY_MHZ, 3);
+    display.print("MHz SF");
+    display.print(SURVEY_SPREADING_FACTOR);
+    display.print(" CR4/");
+    display.print(SURVEY_CODING_RATE);
+    display.setCursor(9, 109);
+    display.print("BW");
+    display.print(static_cast<unsigned>(SURVEY_BANDWIDTH_KHZ));
+    display.print(" TX");
+    display.print(SURVEY_TX_POWER_DBM);
+    display.print("dBm ID ");
+    char shortId[9];
+    snprintf(shortId, sizeof(shortId), "%08lX", static_cast<unsigned long>(deviceId));
+    display.print(shortId);
+
+    display.fillRect(0, 120, 172, 15, ST77XX_BLACK);
+    display.setTextColor(ST77XX_CYAN);
+    display.setCursor(4, 122);
+    display.print(loggingEnabled ? "TAP: LOG  HOLD: MENU" : "HOLD BUTTON: MENU");
+    drawBatteryStatus();
+    if (menuMode != MenuMode::Closed)
+        redrawMenuOverlay();
+}
+
+void setDashboardStatus(const char *status, uint16_t color)
+{
+    strncpy(dashboardStatus, status, sizeof(dashboardStatus) - 1);
+    dashboardStatus[sizeof(dashboardStatus) - 1] = '\0';
+    dashboardStatusColor = color;
+    if (loggingEnabled && !collectionControlVisible && menuMode == MenuMode::Closed)
+        drawDashboardHeader();
+}
+
+void clearDashboardRows()
+{
+    memset(dashboardRows, 0, sizeof(dashboardRows));
+    dashboardRowCount = 0;
+}
+
+void addDashboardRow(uint32_t sequence, bool signalValid, int16_t rssi, int16_t snrCenti,
+                     DashboardResponse response)
+{
+    if (dashboardRowCount == DASHBOARD_ROW_COUNT) {
+        memmove(&dashboardRows[0], &dashboardRows[1],
+                sizeof(DashboardRow) * (DASHBOARD_ROW_COUNT - 1));
+        --dashboardRowCount;
+    }
+    dashboardRows[dashboardRowCount++] = {true, signalValid, sequence, rssi, snrCenti, response};
+    if (loggingEnabled && menuMode == MenuMode::Closed) {
+        if (collectionControlVisible) {
+            drawControlStorageMetrics();
+        } else {
+            drawDashboardRows();
+            drawDashboardFooter();
+        }
+    }
+}
+
+void updateDashboardRow(uint32_t sequence, bool signalValid, int16_t rssi, int16_t snrCenti,
+                        DashboardResponse response)
+{
+    for (int8_t index = static_cast<int8_t>(dashboardRowCount) - 1; index >= 0; --index) {
+        DashboardRow &row = dashboardRows[index];
+        if (row.active && row.sequence == sequence) {
+            row.signalValid = signalValid;
+            row.rssi = rssi;
+            row.snrCenti = snrCenti;
+            row.response = response;
+            if (loggingEnabled && menuMode == MenuMode::Closed) {
+                if (collectionControlVisible) {
+                    drawControlStorageMetrics();
+                } else {
+                    drawDashboardRows();
+                    drawDashboardFooter();
+                }
+            }
+            return;
+        }
+    }
+    addDashboardRow(sequence, signalValid, rssi, snrCenti, response);
+}
+
 void showScreen(const char *title, const char *line1 = nullptr, const char *line2 = nullptr, const char *line3 = nullptr)
 {
     updateBatteryReading();
@@ -644,26 +1081,7 @@ void showScreen(const char *title, const char *line1 = nullptr, const char *line
     } else {
         display.print('-');
     }
-    constexpr int16_t batteryX = 174;
-    constexpr int16_t batteryY = 121;
-    constexpr int16_t batteryWidth = 19;
-    constexpr int16_t batteryHeight = 10;
-    display.drawRect(batteryX, batteryY, batteryWidth, batteryHeight, ST77XX_WHITE);
-    display.fillRect(batteryX + batteryWidth, batteryY + 3, 2, 4, ST77XX_WHITE);
-    display.setCursor(200, 122);
-    if (batteryReadingValid) {
-        const uint8_t percent = batteryPercent(batteryMillivolts);
-        const uint16_t color = percent > 50 ? ST77XX_GREEN : (percent > 20 ? ST77XX_YELLOW : ST77XX_RED);
-        const int16_t fillWidth = static_cast<int16_t>((batteryWidth - 4) * percent / 100);
-        if (fillWidth > 0)
-            display.fillRect(batteryX + 2, batteryY + 2, fillWidth, batteryHeight - 4, color);
-        display.setTextColor(color);
-        display.print(percent);
-        display.print('%');
-    } else {
-        display.setTextColor(ST77XX_WHITE);
-        display.print("--");
-    }
+    drawBatteryStatus();
     if (menuMode != MenuMode::Closed)
         redrawMenuOverlay();
 }
@@ -671,14 +1089,9 @@ void showScreen(const char *title, const char *line1 = nullptr, const char *line
 #if defined(SURVEY_ROLE_MOBILE)
 void showMovementWaiting(double distanceMeters, float requiredDistanceMeters)
 {
-    if (menuMode != MenuMode::Closed)
-        return;
-    char message[48];
-    snprintf(message, sizeof(message), "Waiting for movement %.1f / %.1f m", distanceMeters,
-             requiredDistanceMeters);
-    display.fillRect(0, 100, 240, 19, ST77XX_BLACK);
-    display.setTextColor(ST77XX_YELLOW);
-    drawWrappedText(message, 4, 102, 232, 118, 1);
+    (void)distanceMeters;
+    (void)requiredDistanceMeters;
+    setDashboardStatus("WAIT MOVEMENT", ST77XX_YELLOW);
 }
 #endif
 
@@ -699,14 +1112,18 @@ void showLoggingStatus()
 {
     if (!storageReady)
         showScreen("STORAGE FAILED", storage.errorText(), "Data cannot persist");
-    else if (loggingEnabled)
-        showScreen("LOGGING ACTIVE", ROLE == SurveyRole::Mobile ? "GPS probes enabled" : "Replies enabled");
+    else if (loggingEnabled) {
+        if (collectionControlVisible)
+            drawControlCenter();
+        else
+            drawDashboard();
+    }
     else if (storage.needsFormat())
         showScreen("LOG NEEDS WIPE", "Old/unknown format", "Extract first if needed");
     else if (!storage.canAppend())
         showScreen("OLD LOG FOUND", "Extraction still works", "Wipe to use compact log");
     else
-        showScreen(ROLE_NAME, "Logging paused", "Stored logs retained", "Start from menu");
+        drawControlCenter();
 }
 
 const char *menuLabel(uint8_t selection)
@@ -715,16 +1132,14 @@ const char *menuLabel(uint8_t selection)
     case 0:
         return loggingEnabled ? "STOP LOGGING" : "START / APPEND";
     case 1:
-        return "LOG STORAGE";
-    case 2:
         if (ROLE == SurveyRole::Base)
             return "SOUND: BASE SILENT";
         return soundEnabled ? "SOUND: ON" : "SOUND: MUTED";
-    case 3:
+    case 2:
         return "WIPE ALL LOGS";
-    case 4:
+    case 3:
         return "RESTART DEVICE";
-    case 5:
+    case 4:
         return "POWER OFF";
     default:
         return "EXIT MENU";
@@ -783,30 +1198,8 @@ void clearMenuHoldProgress()
 void showMenu()
 {
     drawPopupFrame("SURVEY MENU");
-    for (uint8_t option = 0; option < 7; ++option)
+    for (uint8_t option = 0; option < 6; ++option)
         drawMenuOption(option, option == menuSelection);
-}
-
-void showStoragePopup()
-{
-    drawPopupFrame("LOG STORAGE");
-    char records[32];
-    char freeRecords[32];
-    char bytes[32];
-    snprintf(records, sizeof(records), "Used: %lu / %lu rec", static_cast<unsigned long>(storage.slots()),
-             static_cast<unsigned long>(storage.capacity()));
-    snprintf(freeRecords, sizeof(freeRecords), "Free: %lu records",
-             static_cast<unsigned long>(storage.freeRecords()));
-    snprintf(bytes, sizeof(bytes), "Data: %lu / %lu KB", static_cast<unsigned long>(storage.usedBytes() / 1024UL),
-             static_cast<unsigned long>((SURVEY_STORAGE_BYTES - SURVEY_STORAGE_HEADER_BYTES) / 1024UL));
-    display.setTextColor(ST77XX_WHITE);
-    display.setTextSize(1);
-    drawWrappedText(records, 20, 36, 200, 50, 1);
-    drawWrappedText(freeRecords, 20, 56, 200, 70, 1);
-    drawWrappedText(bytes, 20, 76, 200, 94, 1);
-    display.setTextColor(popupAccent());
-    display.setCursor(20, 105);
-    display.print("Tap or hold: back");
 }
 
 void showConfirmationPopup(const char *title, const char *warning, const char *confirmText)
@@ -825,8 +1218,6 @@ void redrawMenuOverlay()
 {
     if (menuMode == MenuMode::Select)
         showMenu();
-    else if (menuMode == MenuMode::StorageInfo)
-        showStoragePopup();
     else if (menuMode == MenuMode::ConfirmErase)
         showConfirmationPopup("CONFIRM WIPE", "DELETE ALL LOGS", "Hold again to erase");
     else if (menuMode == MenuMode::ConfirmPowerOff)
@@ -850,12 +1241,15 @@ void startLogging()
     }
     sessionId = static_cast<uint32_t>(random(1, INT32_MAX));
     clearPendingProbes();
+    clearDashboardRows();
+    collectionControlVisible = false;
 #if defined(SURVEY_ROLE_MOBILE)
     nextSequence = 0;
     lastSendMs = 0;
     lastProbePositionValid = false;
 #endif
     loggingEnabled = true;
+    setDashboardStatus(ROLE == SurveyRole::Mobile ? "GPS WAIT" : "LISTENING", ST77XX_YELLOW);
     if (!appendEvent(SurveyEvent::Boot, 0, 0, currentPosition(), {})) {
         loggingEnabled = false;
         showScreen("LOG WRITE FAILED", "Logging remains paused", "Restart or extract logs");
@@ -867,6 +1261,7 @@ void startLogging()
 void stopLogging()
 {
     loggingEnabled = false;
+    collectionControlVisible = false;
     clearPendingProbes();
     showLoggingStatus();
 }
@@ -903,6 +1298,9 @@ void wipeLogs()
     digitalWrite(TFT_POWER, HIGH);
     const uint32_t physicalPin = g_ADigitalPinMap[USER_BUTTON_PIN];
     nrf_gpio_cfg_sense_input(physicalPin, NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
+    // System-off wake is a reset while the wake/DFU button is still held.
+    // Ask the bootloader to skip its button check once and start this app.
+    NRF_POWER->GPREGRET = BOOTLOADER_SKIP_DFU_MAGIC;
     NRF_POWER->SYSTEMOFF = 1;
     __DSB();
     while (true)
@@ -911,14 +1309,20 @@ void wipeLogs()
 
 void handleShortButtonPress()
 {
-    lastMenuInteractionMs = millis();
     if (menuMode == MenuMode::Closed) {
-        menuMode = MenuMode::Select;
-        menuSelection = 0;
-        showMenu();
-    } else if (menuMode == MenuMode::Select) {
+        if (loggingEnabled) {
+            collectionControlVisible = !collectionControlVisible;
+            if (collectionControlVisible)
+                drawControlCenter();
+            else
+                drawDashboard();
+        }
+        return;
+    }
+    lastMenuInteractionMs = millis();
+    if (menuMode == MenuMode::Select) {
         const uint8_t previousSelection = menuSelection;
-        menuSelection = (menuSelection + 1) % 7;
+        menuSelection = (menuSelection + 1) % 6;
         clearMenuHoldProgress();
         drawMenuOption(previousSelection, false);
         drawMenuOption(menuSelection, true);
@@ -946,11 +1350,6 @@ void handleLongButtonPress()
         menuMode = MenuMode::Closed;
         powerOffDevice();
     }
-    if (menuMode == MenuMode::StorageInfo) {
-        menuMode = MenuMode::Select;
-        showMenu();
-        return;
-    }
     switch (menuSelection) {
     case 0:
         menuMode = MenuMode::Closed;
@@ -960,10 +1359,6 @@ void handleLongButtonPress()
             startLogging();
         break;
     case 1:
-        menuMode = MenuMode::StorageInfo;
-        showStoragePopup();
-        break;
-    case 2:
         if (ROLE == SurveyRole::Mobile) {
             soundEnabled = !soundEnabled;
 #if defined(SURVEY_ROLE_MOBILE)
@@ -979,17 +1374,17 @@ void handleLongButtonPress()
         clearMenuHoldProgress();
         drawMenuOption(menuSelection, true);
         break;
-    case 3:
+    case 2:
         menuMode = MenuMode::ConfirmErase;
         showConfirmationPopup("CONFIRM WIPE", "DELETE ALL LOGS", "Hold again to erase");
         break;
-    case 4:
+    case 3:
         menuMode = MenuMode::Closed;
         showScreen("RESTARTING", "Please wait...");
         delay(500);
         NVIC_SystemReset();
         break;
-    case 5:
+    case 4:
         menuMode = MenuMode::ConfirmPowerOff;
         showConfirmationPopup("CONFIRM POWER OFF", "TURN DEVICE OFF", "Hold again to power off");
         break;
@@ -1215,53 +1610,26 @@ void updateGpsTrust()
 #if defined(SURVEY_ROLE_MOBILE)
 void showGpsWaitStatus()
 {
-    char detail[40];
-    char quality[40];
     const unsigned long bytes = gps.charsProcessed();
     const unsigned long satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
-    const double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 0.0;
-    snprintf(quality, sizeof(quality), "%lu sat HDOP %.2f", satellites, hdop);
 
     if (bytes < 10) {
-        snprintf(detail, sizeof(detail), "Check GPS wiring");
-        showScreen("GPS UART NO DATA", detail, quality);
+        setDashboardStatus("GPS NO DATA", ST77XX_RED);
     } else if (!gps.location.isValid() || gps.location.age() >= GPS_MAX_FIX_AGE_MS) {
-        snprintf(detail, sizeof(detail), "%lu bytes received", bytes);
-        showScreen("WAITING FOR GPS", "Need a fresh position", detail, quality);
+        setDashboardStatus("GPS WAIT", ST77XX_YELLOW);
     } else if (!gps.satellites.isValid() || gps.satellites.age() >= GPS_MAX_FIX_AGE_MS ||
                satellites < GPS_MIN_SATELLITES) {
-        snprintf(detail, sizeof(detail), "Need at least %u satellites", GPS_MIN_SATELLITES);
-        showScreen("GPS QUALITY LOW", detail, quality, "No packet sent");
+        setDashboardStatus("GPS SAT LOW", ST77XX_YELLOW);
     } else if (!gps.hdop.isValid() || gps.hdop.age() >= GPS_MAX_FIX_AGE_MS ||
                gps.hdop.value() > GPS_MAX_HDOP_CENTI) {
-        snprintf(detail, sizeof(detail), "Need HDOP <= %.2f", GPS_MAX_HDOP_CENTI / 100.0F);
-        showScreen("GPS QUALITY LOW", detail, quality, "No packet sent");
+        setDashboardStatus("GPS HDOP LOW", ST77XX_YELLOW);
     } else if (gpsSpeedIsFresh() && gps.speed.kmph() > GPS_MAX_TRAVEL_SPEED_KMPH) {
-        snprintf(detail, sizeof(detail), "Speed %.1f km/h rejected", gps.speed.kmph());
-        showScreen("GPS SPEED INVALID", detail, quality, "No packet sent");
+        setDashboardStatus("SPEED INVALID", ST77XX_RED);
     } else {
-        const uint8_t requiredFixes = requiredGpsGoodFixes();
-        snprintf(detail, sizeof(detail), "Stable fixes %u / %u", gpsGoodFixCount, requiredFixes);
-        if (gpsDrivingMode()) {
-            char speed[40];
-            snprintf(speed, sizeof(speed), "Vehicle mode %.1f km/h", gps.speed.kmph());
-            showScreen("GPS STABILIZING", detail, quality, speed);
-        } else {
-            showScreen("GPS STABILIZING", detail, quality, "No packet sent yet");
-        }
+        setDashboardStatus("GPS STABILIZE", ST77XX_YELLOW);
     }
 }
 #endif
-
-void formatCoordinates(char *output, size_t outputSize, const SurveyPosition &position)
-{
-    if (!position.valid) {
-        snprintf(output, outputSize, "GPS NO LOCK");
-        return;
-    }
-    snprintf(output, outputSize, "GPS %.6f, %.6f", position.latitudeE7 / 10000000.0,
-             position.longitudeE7 / 10000000.0);
-}
 
 void fillPosition(SurveyRecord &record, const SurveyPosition &local, const SurveyPosition &remote)
 {
@@ -1357,9 +1725,8 @@ void sendProbe(const SurveyPosition &position)
     const uint32_t packetId = packet.crc32;
     const int16_t state = transmitPacket(&packet, sizeof(packet));
     if (state != RADIOLIB_ERR_NONE) {
-        char error[32];
-        snprintf(error, sizeof(error), "Radio error %d", state);
-        showScreen("SEND FAILED", error, "No sample logged");
+        addDashboardRow(sequence, false, 0, 0, DashboardResponse::SendFailed);
+        setDashboardStatus("RADIO ERROR", ST77XX_RED);
         return;
     }
 
@@ -1370,11 +1737,8 @@ void sendProbe(const SurveyPosition &position)
     lastProbeLatitude = position.latitudeE7 / 10000000.0;
     lastProbeLongitude = position.longitudeE7 / 10000000.0;
     lastProbePositionValid = true;
-    char first[32];
-    char second[32];
-    snprintf(first, sizeof(first), "Probe #%lu sent", static_cast<unsigned long>(sequence));
-    snprintf(second, sizeof(second), "%u sat HDOP %.2f", position.satellites, position.hdopCenti / 100.0F);
-    showScreen("PACKET SENT", first, second, "Waiting for base reply");
+    addDashboardRow(sequence, false, 0, 0, DashboardResponse::Waiting);
+    setDashboardStatus("WAITING REPLY", ST77XX_YELLOW);
 }
 #endif
 
@@ -1408,14 +1772,9 @@ void handleProbe(const ProbePacket &probe, int16_t rssi, int16_t snrCenti)
     appendEvent(SurveyEvent::ProbeRx, probe.sequence, probe.senderId, local, probe.position, true, rssi, snrCenti,
                 false, 0, 0, probe.crc32, state == RADIOLIB_ERR_NONE ? ReplySent : 0, probe.sessionId);
 
-    char first[32];
-    char second[32];
-    char third[40];
-    snprintf(first, sizeof(first), "#%lu RX %d dBm", static_cast<unsigned long>(probe.sequence), rssi);
-    snprintf(second, sizeof(second), "SNR %.2f %s", snrCenti / 100.0F,
-             state == RADIOLIB_ERR_NONE ? "REPLY OK" : "FAIL");
-    formatCoordinates(third, sizeof(third), local);
-    showScreen("PACKET RECEIVED", first, second, third);
+    addDashboardRow(probe.sequence, true, rssi, snrCenti,
+                    state == RADIOLIB_ERR_NONE ? DashboardResponse::ReplySent : DashboardResponse::ReplyFailed);
+    setDashboardStatus("LISTENING", state == RADIOLIB_ERR_NONE ? ST77XX_GREEN : ST77XX_RED);
 #if defined(SURVEY_ROLE_BASE)
     lastBasePacketMs = millis();
 #endif
@@ -1437,14 +1796,9 @@ void handleReply(const ReplyPacket &reply, int16_t reverseRssi, int16_t reverseS
     appendEvent(SurveyEvent::ReplyRx, reply.sequence, reply.baseId, probe->position, reply.basePosition, true,
                 reverseRssi, reverseSnrCenti, true, forwardRssi, reply.forwardSnrCentiDb, reply.crc32);
 
-    char first[32];
-    char second[32];
-    char third[40];
-    snprintf(first, sizeof(first), "Reply #%lu RX", static_cast<unsigned long>(reply.sequence));
-    snprintf(second, sizeof(second), "Back %d / %.2f", reverseRssi, reverseSnrCenti / 100.0F);
-    snprintf(third, sizeof(third), "Out %.2f dBm / %.2f dB | GPS %s", reply.forwardRssiCentiDbm / 100.0F,
-             reply.forwardSnrCentiDb / 100.0F, reply.basePosition.valid ? "OK" : "NO");
-    showScreen("REPLY RECEIVED", first, second, third);
+    updateDashboardRow(reply.sequence, true, forwardRssi, reply.forwardSnrCentiDb,
+                       DashboardResponse::Received);
+    setDashboardStatus("GPS OK", ST77XX_GREEN);
 }
 
 void processRadio()
@@ -1491,9 +1845,8 @@ void expirePending()
         probe.active = false;
         appendEvent(SurveyEvent::Timeout, probe.sequence, 0, probe.position, {}, false, 0, 0, false, 0, 0,
                     probe.packetId);
-        char first[32];
-        snprintf(first, sizeof(first), "Probe #%lu", static_cast<unsigned long>(probe.sequence));
-        showScreen("REPLY TIMEOUT", first, "Packet loss logged", "Base log tells which direction");
+        updateDashboardRow(probe.sequence, false, 0, 0, DashboardResponse::Missed);
+        setDashboardStatus("GPS OK", ST77XX_GREEN);
     }
 }
 
@@ -1673,6 +2026,16 @@ void loop()
     processButton();
     processRadio();
     expirePending();
+    if (updateBatteryReading() && menuMode == MenuMode::Closed) {
+        if (radioReady && storageReady && storage.canAppend() && storage.hasSpace(1) &&
+            (!loggingEnabled || collectionControlVisible)) {
+            drawPausedGpsMetrics();
+            drawControlStorageMetrics();
+            drawBatteryStatus();
+        } else {
+            drawBatteryStatus();
+        }
+    }
 
 #if defined(SURVEY_ROLE_MOBILE)
     if (loggingEnabled && radioReady && locationUpdated) {
@@ -1711,21 +2074,12 @@ void loop()
         (!lastBasePacketMs || static_cast<uint32_t>(now - lastBasePacketMs) >= BASE_PACKET_SCREEN_HOLD_MS)) {
         lastBaseStatusMs = now;
         const SurveyPosition position = currentPosition();
-        char quality[32];
-        char coordinates[40];
         if (position.valid)
-            snprintf(quality, sizeof(quality), "%u sat HDOP %.2f", position.satellites,
-                     position.hdopCenti / 100.0F);
+            setDashboardStatus("GPS OK", ST77XX_GREEN);
         else if (gps.charsProcessed() < 10)
-            snprintf(quality, sizeof(quality), "GPS UART no data");
+            setDashboardStatus("GPS NO DATA", ST77XX_RED);
         else
-            snprintf(quality, sizeof(quality), "%lu bytes %lu sat", gps.charsProcessed(),
-                     gps.satellites.isValid() ? gps.satellites.value() : 0);
-        if (position.valid)
-            formatCoordinates(coordinates, sizeof(coordinates), position);
-        else
-            snprintf(coordinates, sizeof(coordinates), "%lu checksum errors", gps.failedChecksum());
-        showScreen(position.valid ? "BASE GPS LOCK" : "BASE READY", "Listening for probes", quality, coordinates);
+            setDashboardStatus("GPS WAIT", ST77XX_YELLOW);
     }
 #endif
 #if defined(SURVEY_ROLE_MOBILE)

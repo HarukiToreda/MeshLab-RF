@@ -30,23 +30,27 @@ The first installation of the internal-flash build may show `LOG NEEDS WIPE` bec
 
 Logging starts paused after every boot so a setup period does not consume log space. Use the T114 user button on both radios:
 
-1. Tap once to open the popup menu over the current survey screen.
-2. Tap to move the highlight through `START / APPEND` or `STOP LOGGING`, `LOG STORAGE`, `SOUND: ON/MUTED`, `WIPE ALL LOGS`, `RESTART DEVICE`, `POWER OFF`, and `EXIT MENU` as applicable. The base identifies sound as always silent.
-3. Hold for 500 ms to select the displayed item, matching Meshtastic's screened-device timing. The action registers at the threshold while the button is still held; a short click registers on release.
+1. Hold for 500 ms to open the popup menu. A tap does nothing while paused and switches views while collecting.
+2. Tap to move through `START / APPEND` or `STOP LOGGING`, sound, wipe, restart, power, and exit.
+3. Hold for 500 ms to select the displayed item.
 
 `WIPE ALL LOGS` requires a second hold to confirm. Wiping is permanent and leaves logging paused. Extract the two logs first if they contain a walk you need.
 
-`LOG STORAGE` shows records used, the 8,140-record maximum, records still free, and used/available data KB. The normal footer also shows `Lused/total`, so capacity remains visible while collecting data. `SOUND: ON/MUTED` controls the mobile's send and receive pings for the current power session; the base is always silent.
+The control center shows records used, free, and used/available KB. `SOUND: ON/MUTED` controls mobile pings; the base is always silent.
 
-`POWER OFF` also requires a second hold. It stops logging, sleeps the LoRa radio and GPS, turns off the display, and enters nRF52840 system-off. Press the same user button to turn the tester back on; it restarts with logging paused and the stored log intact. `RESTART DEVICE` restarts without wiping the log.
+`POWER OFF` also requires a second hold. It stops logging, sleeps the radio and GPS, and enters system-off. Press the same button to wake directly into the tester with logging paused and logs intact. `RESTART DEVICE` restarts without wiping the log.
 
 Start logging on the base, then start logging on the mobile when both have the desired GPS status. Stop logging on each at the end of the walk. `START / APPEND` preserves existing version 2 records and creates a new session; it does not erase earlier walks.
 
 ## Display behavior
 
-The mobile display reports every successful probe transmission, every reply with outward and return RSSI/SNR, and every reply timeout. Its pin-33 buzzer makes one 35 ms ping after a successful send and one after a received reply. The base is silent. The base display reports every received probe with RSSI/SNR, whether its reply was sent, and its current GPS coordinates when locked.
+While collecting, both displays show the latest nine pings as a scrolling log with quality and RSSI/SNR. Mobile rows change from `WAIT` to `YES` or `NO`; base rows show whether the reply was sent. The mobile buzzer pings after a successful send and reply. The base is silent.
 
-Both displays include a battery gauge, logging state (`R` for running or `P` for paused), and used/total log slots. The battery percentage is an open-circuit voltage estimate and may move under load.
+Tap while collecting to switch between the scrolling log and control center. Hold from either view to open the menu.
+
+Both displays include a battery gauge, logging state (`R` or `P`), and used/total log slots. Battery updates every five seconds and remains an open-circuit voltage estimate.
+
+When paused, the control center shows GPS lock, satellites, HDOP, speed, coordinates, storage, sound, radio settings, device ID, and battery.
 
 The GPS UART is checked continuously. A coordinate is trusted only after consecutive fresh fixes with at least six satellites, HDOP at or below 2.00, and no implausible position jump. Walking mode requires five good fixes. At 20 km/h or faster, vehicle mode requires seven good fixes and scales its jump allowance from the GPS-reported speed, so legitimate driving motion is accepted without relaxing the satellite or HDOP requirements. Speeds above 180 km/h are rejected. The mobile sends the first trusted point, then requires at least five meters of movement when walking or 15 meters while driving and the five-second interval before another probe. Stationary GPS jitter therefore does not create repeated samples. `GPS UART NO DATA`, `WAITING FOR GPS`, `GPS QUALITY LOW`, `GPS STABILIZING`, and `WAITING FOR MOVEMENT` identify the exact reason no packet is being sent. Both builds use the T114 reference wiring: CPU RX P1.5 (Arduino 37), CPU TX P1.7 (Arduino 39), GPS standby P1.2 (34), and peripheral power P0.21 (21).
 
