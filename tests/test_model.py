@@ -24,6 +24,7 @@ from mesh_simulator.model import (
     REGION_BANDS,
     PropagationModel,
     Scenario,
+    SimEvent,
     SimulationEngine,
     SimulationResult,
     create_demo_scenario,
@@ -1244,6 +1245,29 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(loss, 10)
         self.assertTrue(any("Crossing building" in name for name in names))
 
+    def test_large_import_spatial_index_rejects_neighbor_cell_obstacles_off_the_ray(self):
+        source = Node(x=0, y=0)
+        target = Node(x=10_000, y=10_000)
+        crossing = Obstacle(x1=4_900, y1=4_900, x2=5_100, y2=5_100)
+        off_ray = Obstacle(x1=4_900, y1=5_300, x2=5_100, y2=5_400)
+        distant = [
+            Obstacle(
+                x1=20_000 + index * 40,
+                y1=20_000,
+                x2=20_020 + index * 40,
+                y2=20_020,
+            )
+            for index in range(127)
+        ]
+        model = PropagationModel(
+            Scenario(nodes=[source, target], obstacles=[crossing, off_ray, *distant])
+        )
+
+        candidates = model._candidate_obstacles(source, target)
+
+        self.assertIn(crossing, candidates)
+        self.assertNotIn(off_ray, candidates)
+
     def test_high_antennas_clear_building(self):
         a = Node(x=0, y=0, antenna_height_m=100)
         b = Node(x=1000, y=0, antenna_height_m=100)
@@ -1431,6 +1455,21 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(MeshSimulatorApp._beacon_ray_count(201), 96)
         self.assertEqual(MeshSimulatorApp._beacon_ray_count(2_315), 72)
         self.assertEqual(MeshSimulatorApp._beacon_ray_count(8_783), 48)
+
+    def test_dense_packet_contours_use_the_adaptive_ray_count(self):
+        source = Node(id="source")
+        scenario = Scenario(
+            nodes=[source],
+            obstacles=[Obstacle(enabled=False) for _index in range(4_001)],
+        )
+        result = SimulationResult(events=[SimEvent(0.0, "TX", source.id)])
+        model = PropagationModel(scenario)
+        empty_profile = BeaconProfile(source.id, source.x, source.y, [])
+
+        with patch.object(model, "beacon_profile", return_value=empty_profile) as profile:
+            build_coverage_contours(scenario, result, model)
+
+        self.assertEqual(profile.call_args.kwargs["angular_samples"], 48)
 
     def test_geographic_projection_roundtrip(self):
         x, y = latlon_to_world(40.7138, -74.004, 40.7128, -74.006)

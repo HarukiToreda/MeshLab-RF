@@ -1178,7 +1178,23 @@ class PropagationModel:
             for nearby_x in range(cell_x - 1, cell_x + 2):
                 for nearby_y in range(cell_y - 1, cell_y + 2):
                     indices.update(self._obstacle_cells.get((nearby_x, nearby_y), ()))
-        return [self.scenario.obstacles[index] for index in sorted(indices)]
+        # Neighbouring grid cells are deliberately conservative, but a long
+        # diagonal can still collect many buildings beside the segment. Reject
+        # those with an exact segment/AABB clip before the costlier polygon walk.
+        # A physical polygon or brush hit must cross its normalized bounds.
+        candidates: list[Obstacle] = []
+        for index in sorted(indices):
+            obstacle = self.scenario.obstacles[index]
+            _length, midpoint_t, _exit_t = self._segment_rect_intersection(
+                source.x,
+                source.y,
+                target.x,
+                target.y,
+                self._obstacle_bounds[id(obstacle)],
+            )
+            if midpoint_t is not None:
+                candidates.append(obstacle)
+        return candidates
 
     @staticmethod
     def _polygon_is_convex(polygon: list[tuple[float, float]]) -> bool:

@@ -581,6 +581,17 @@ def result_uses_coverage_ripples(result: SimulationResult) -> bool:
     return result.routing_mode != "DM_LEARNED"
 
 
+def adaptive_coverage_ray_count(object_count: int) -> int:
+    """Keep coverage responsive as imported obstacle density increases."""
+    if object_count <= 200:
+        return 120
+    if object_count <= 1000:
+        return 96
+    if object_count <= 4000:
+        return 72
+    return 48
+
+
 def build_coverage_contours(
     scenario: Scenario,
     result: SimulationResult,
@@ -616,6 +627,10 @@ def build_coverage_contours(
         angular_samples = 24
     else:
         angular_samples = 16
+    angular_samples = min(
+        angular_samples,
+        adaptive_coverage_ray_count(len(scenario.nodes) + len(scenario.obstacles)),
+    )
     model = model or PropagationModel(scenario)
 
     # Use the exact same coverage computation as the beacon so the packet's
@@ -6181,13 +6196,7 @@ class MeshSimulatorApp:
     @staticmethod
     def _beacon_ray_count(obstacle_count: int) -> int:
         """Fewer rays on obstacle-dense maps keeps the one-off sweep responsive."""
-        if obstacle_count <= 200:
-            return 120
-        if obstacle_count <= 1000:
-            return 96
-        if obstacle_count <= 4000:
-            return 72
-        return 48
+        return adaptive_coverage_ray_count(obstacle_count)
 
     def start_beacon(self) -> None:
         """Turn the selected node into a pulsating beacon that maps its own coverage.
