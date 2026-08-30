@@ -1426,8 +1426,11 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(wall.behavior, "BLOCK")
         self.assertEqual(scenario.environment.path_loss_exponent, 2.45)
 
-    def test_dense_building_maps_keep_the_original_beacon_sampling(self):
+    def test_beacon_sampling_adapts_to_scene_density(self):
+        self.assertEqual(MeshSimulatorApp._beacon_ray_count(200), 120)
+        self.assertEqual(MeshSimulatorApp._beacon_ray_count(201), 96)
         self.assertEqual(MeshSimulatorApp._beacon_ray_count(2_315), 72)
+        self.assertEqual(MeshSimulatorApp._beacon_ray_count(8_783), 48)
 
     def test_geographic_projection_roundtrip(self):
         x, y = latlon_to_world(40.7138, -74.004, 40.7128, -74.006)

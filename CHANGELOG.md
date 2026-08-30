@@ -11,6 +11,7 @@
 
 ### Fixed
 
+- **Beacon speed.** Dense maps now use the intended adaptive ray count, making coverage appear much sooner.
 - **Dense obstacle imports.** Fixed patchwork gaps and missing buildings. Capped cells now subdivide reliably, with downloaded results kept up to 20,000 buildings per tile.
 - **Coordinate projection inflated link distance away from the equator** (up to ~32% longer, ~2.4 dB phantom path loss at this project's test latitude). Fixed at the source; old scenario files migrate automatically on load.
 - **Survey map labels/markers were unreadable against the light map background.** Now use the app's dark-halo text styling.

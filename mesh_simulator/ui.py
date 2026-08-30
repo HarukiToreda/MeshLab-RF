@@ -6221,9 +6221,8 @@ class MeshSimulatorApp:
         self.beacon_request_id += 1
         request_id = self.beacon_request_id
         cap = self._coverage_range_cap()
-        samples = max(
-            144,
-            self._beacon_ray_count(len(self.scenario.nodes) + len(self.scenario.obstacles)),
+        samples = self._beacon_ray_count(
+            len(self.scenario.nodes) + len(self.scenario.obstacles)
         )
         segment_samples = max(
             56,
@@ -6393,9 +6392,8 @@ class MeshSimulatorApp:
         self.static_coverage_request_id += 1
         request_id = self.static_coverage_request_id
         cap = self._coverage_range_cap()
-        samples = max(
-            144,
-            self._beacon_ray_count(len(self.scenario.nodes) + len(self.scenario.obstacles)),
+        samples = self._beacon_ray_count(
+            len(self.scenario.nodes) + len(self.scenario.obstacles)
         )
         segment_samples = max(
             56,
