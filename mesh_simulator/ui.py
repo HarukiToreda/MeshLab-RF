@@ -9039,8 +9039,14 @@ class MeshSimulatorApp:
                 self.load_topography()
             return
         if self.tool == "beacon":
+            hit = self.hit_test(event.x, event.y)
+            if isinstance(hit, Node):
+                self.selected_id = hit.id
+                self.set_tool("select")
+                self.start_beacon()
+                return
             x, y = self.drag_start_world
-            node = self.add_node(x, y, name=f"Beacon {len(self.scenario.nodes) + 1}")
+            self.add_node(x, y, name=f"Beacon {len(self.scenario.nodes) + 1}")
             needs_terrain = not self._terrain_covers(x, y)
             if needs_terrain:
                 self.load_topography()
