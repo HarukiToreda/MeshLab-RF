@@ -1,6 +1,9 @@
 import io
 import math
+import queue
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageColor
@@ -256,6 +259,48 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(app.canvas.coordinates, [(17, 0, 0)])
 
+    def test_rapid_zoom_out_preview_never_reveals_empty_canvas(self):
+        class Canvas:
+            @staticmethod
+            def winfo_width() -> int:
+                return 4
+
+            @staticmethod
+            def winfo_height() -> int:
+                return 4
+
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.canvas = Canvas()
+        app.scenario = Scenario()
+        app.scenario.environment.initial_view_width_m = 4.0
+        app.scenario.environment.initial_view_height_m = 4.0
+        # This represents a long uninterrupted wheel burst: the new viewport
+        # spans ten times the raster captured at the last settled render.
+        app.zoom = 0.1
+        app.view_x = -18.0
+        app.view_y = -18.0
+        app.zoom_extended_source = None
+        app.zoom_extended_source_key = None
+        composite = Image.new("RGB", (4, 4), "blue")
+        geographic = Image.new("RGB", (4, 4), "red")
+
+        preview = app._transformed_zoom_source(
+            composite,
+            (4, 4, 0.0, 0.0, 1.0),
+            background_source=geographic,
+        )
+
+        self.assertIsNotNone(preview)
+        self.assertEqual(preview.getpixel((0, 0)), (255, 0, 0))
+        self.assertEqual(preview.getpixel((3, 3)), (255, 0, 0))
+        self.assertTrue(
+            all(
+                preview.getpixel((x, y)) != ImageColor.getrgb(MAPLESS_BACKGROUND)
+                for y in range(preview.height)
+                for x in range(preview.width)
+            )
+        )
+
     def test_wheel_events_refresh_the_preview_immediately_every_tick(self):
         """A deferred-by-one-frame preview let the map raster lag one tick
         behind the vector items canvas.scale() moves instantly, which read as
@@ -347,6 +392,100 @@ class ModelTests(unittest.TestCase):
 
         self.assertEqual(preview_calls, ["preview"])
         self.assertFalse(any(delay == 16 for delay, _callback in app.root.callbacks))
+
+    def test_tile_arrival_during_zoom_preserves_preview_until_settle(self):
+        """A background tile must not discard the raster currently serving as
+        the continuous wheel preview. The settle render consumes all arrivals
+        together after the gesture ends."""
+
+        class Root:
+            callbacks: list[tuple[int, object]] = []
+
+            @classmethod
+            def after(cls, delay: int, callback):
+                cls.callbacks.append((delay, callback))
+                return "poll"
+
+        key = ("Generated", 12, 1200, 1500)
+        results: queue.Queue = queue.Queue()
+        results.put((key, b"cached tile"))
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.root = Root()
+        app.map_service = type("MapService", (), {"tile_results": results})()
+        app.geo_results = queue.Queue()
+        app.map_tile_bytes = {}
+        app.map_tile_failures = set()
+        app.zoom_render_after = "settle-token"
+        app.pan_start = None
+        app.geographic_layer_dirty = False
+        invalidations: list[bool] = []
+        renders: list[bool] = []
+        app._invalidate_geographic_layer = lambda **_kwargs: invalidations.append(True)
+        app.schedule_render = lambda: renders.append(True)
+
+        app._poll_map_services()
+
+        self.assertEqual(app.map_tile_bytes[key], b"cached tile")
+        self.assertTrue(app.geographic_layer_dirty)
+        self.assertEqual(invalidations, [])
+        self.assertEqual(renders, [])
+
+    def test_visible_cached_tile_bypasses_worker_poll_delay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_path = Path(temporary) / "tile.png"
+            cache_path.write_bytes(b"already rendered")
+
+            class MapService:
+                @staticmethod
+                def cache_path_for(*_key):
+                    return cache_path
+
+            app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+            app.map_service = MapService()
+            app.map_tile_bytes = {}
+            app.generated_tile_labels = {}
+            key = ("Street", 10, 5, 6)
+
+            self.assertEqual(app._load_cached_map_tile(key), b"already rendered")
+            self.assertEqual(app.map_tile_bytes[key], b"already rendered")
+
+    def test_viewport_obstacle_index_culls_distant_imports(self):
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.scenario = Scenario(
+            obstacles=[
+                Obstacle(x1=index * 1000.0, y1=0.0, x2=index * 1000.0 + 20.0, y2=20.0)
+                for index in range(500)
+            ]
+        )
+        app._obstacle_bounds_cache = {}
+        app._obstacle_view_index = None
+
+        visible = app._visible_obstacles_for_bounds((-10.0, -10.0, 2100.0, 30.0))
+
+        self.assertEqual([item[0] for item in visible], app.scenario.obstacles[:3])
+        self.assertIsNotNone(app._obstacle_view_index)
+
+    def test_node_layout_returns_only_viewport_near_nodes(self):
+        class Canvas:
+            @staticmethod
+            def winfo_width():
+                return 800
+
+            @staticmethod
+            def winfo_height():
+                return 600
+
+        near = Node(id="near", name="Near", x=100.0, y=100.0)
+        far = Node(id="far", name="Far", x=10000.0, y=10000.0)
+        app = MeshSimulatorApp.__new__(MeshSimulatorApp)
+        app.canvas = Canvas()
+        app.scenario = Scenario(nodes=[near, far])
+        app.selected_id = None
+        app.world_to_screen = lambda x, y: (x, y)
+
+        self.assertEqual(app._prepare_node_label_layout(), [near])
+        self.assertIn("near", app.node_label_layout)
+        self.assertNotIn("far", app.node_label_layout)
 
     def test_segmented_beacon_warnings_do_not_create_canvas_obstacle_items(self):
         rays = [

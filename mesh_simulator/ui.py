@@ -747,10 +747,17 @@ class MeshSimulatorApp:
         self.zoom_composite_source: Image.Image | None = None
         self.zoom_composite_source_key: tuple[int, int] | None = None
         self.zoom_preview_composite_active = False
+        # Tile workers can finish while a wheel/pan gesture is still using the
+        # current geographic raster as its zero-latency preview. Keep that
+        # raster alive until the gesture settles; dropping its PhotoImage as
+        # each tile arrives exposes the empty map outline mid-zoom.
+        self.geographic_layer_dirty = False
         self.zoom_geographic_photo: ImageTk.PhotoImage | None = None
         self.zoom_beacon_photo: ImageTk.PhotoImage | None = None
         self.zoom_static_photo: ImageTk.PhotoImage | None = None
         self.zoom_composite_photo: ImageTk.PhotoImage | None = None
+        self.zoom_extended_source: Image.Image | None = None
+        self.zoom_extended_source_key: tuple[int, int] | None = None
         self.zoom_preview_active_tags: set[str] = set()
         self._world_screen_transform: tuple[float, float, float, float] | None = None
         self._beacon_ripple_profile_id: int | None = None
@@ -873,6 +880,7 @@ class MeshSimulatorApp:
         # arrive.
         self.last_map_composite: Image.Image | None = None
         self.last_map_composite_view: tuple[float, float, float] | None = None
+        self.last_map_composite_context: tuple[object, ...] | None = None
         self.obstacle_layer_image: ImageTk.PhotoImage | None = None
         self.obstacle_layer_source: Image.Image | None = None
         self.obstacle_layer_source_key: tuple[object, ...] | None = None
@@ -884,6 +892,12 @@ class MeshSimulatorApp:
             int,
             tuple[tuple[object, ...], tuple[float, float, float, float]],
         ] = {}
+        self._obstacle_view_index: tuple[
+            float,
+            dict[tuple[int, int], list[int]],
+            list[int],
+            list[tuple[float, float, float, float]],
+        ] | None = None
         self.node_label_layout: dict[str, tuple[float, float, float, float, float, float]] = {}
         self._scene_tree_signatures: dict[str, tuple[object, ...]] = {}
         self._scene_tree_imported_obstacle_limit = SCENE_TREE_OBSTACLE_PAGE_SIZE
@@ -3420,10 +3434,11 @@ class MeshSimulatorApp:
                 self.map_tile_failures.add(key)
                 self.status_var.set(f"Map tile unavailable: {result}")
             else:
+                newly_available = key not in self.map_tile_bytes
                 self.map_tile_bytes[key] = result
-                if key[0] == "TerrainDEM":
+                if newly_available and key[0] == "TerrainDEM":
                     terrain_arrived = True
-                redraw = True
+                redraw = redraw or newly_available
         if terrain_arrived:
             self._refresh_auto_node_elevations()
         while True:
@@ -3465,8 +3480,14 @@ class MeshSimulatorApp:
                 self.status_var.set(f"{source} failed: {error}")
                 messagebox.showerror(f"{source} failed", str(error), parent=self.root)
         if redraw:
-            self._invalidate_geographic_layer()
-            self.schedule_render()
+            if self.pan_start is not None or self.zoom_render_after is not None:
+                # Preserve the image currently being transformed by the active
+                # gesture. One coalesced settle-render includes every tile that
+                # arrived in the meantime.
+                self.geographic_layer_dirty = True
+            else:
+                self._invalidate_geographic_layer(obstacles_changed=False)
+                self.schedule_render()
         try:
             self.root.after(100, self._poll_map_services)
         except tk.TclError:
@@ -5866,7 +5887,7 @@ class MeshSimulatorApp:
             self._animate_next()
 
     def schedule_render(self) -> None:
-        if self.pan_start is not None:
+        if self.pan_start is not None or self.zoom_render_after is not None:
             return
         if self.render_after is None:
             self.render_after = self.root.after_idle(self._scheduled_render)
@@ -7134,6 +7155,8 @@ class MeshSimulatorApp:
         self.zoom_preview_composite_active = False
         self.zoom_preview_active_tags.clear()
         self._world_screen_transform = None
+        if getattr(self, "geographic_layer_dirty", False):
+            self._invalidate_geographic_layer(obstacles_changed=False)
         c = self.canvas
         c.delete("all")
         env = self.scenario.environment
@@ -7176,11 +7199,7 @@ class MeshSimulatorApp:
             )
             self._draw_vector_obstacles(c, self.obstacle_layer_vectors)
         else:
-            self._visible_obstacle_bounds = []
-            for obstacle in self.scenario.obstacles:
-                bounds = self._obstacle_bounds(obstacle)
-                if self._bounds_overlap(bounds, visible_bounds):
-                    self._visible_obstacle_bounds.append((obstacle, bounds))
+            self._visible_obstacle_bounds = self._visible_obstacles_for_bounds(visible_bounds)
             visible_obstacles = [obstacle for obstacle, _bounds in self._visible_obstacle_bounds]
             self._draw_obstacle_layer(c, visible_obstacles)
         self._draw_map_labels(c, visible_bounds)
@@ -7189,8 +7208,7 @@ class MeshSimulatorApp:
         self._draw_retained_coverage(c)
         self._tag_items_created_since(c, packet_start, PACKET_LAYER_TAG)
         node_start = len(c.find_all())
-        self._prepare_node_label_layout()
-        for node in self.scenario.nodes:
+        for node in self._prepare_node_label_layout():
             self._draw_node(c, node)
         self._tag_items_created_since(c, node_start, NODE_LAYER_TAG)
         self._draw_survey_overlay(c)
@@ -7450,8 +7468,7 @@ class MeshSimulatorApp:
         self._tag_items_created_since(c, packet_start, PACKET_LAYER_TAG)
 
         node_start = len(c.find_all())
-        self._prepare_node_label_layout()
-        for node in self.scenario.nodes:
+        for node in self._prepare_node_label_layout():
             self._draw_node(c, node)
         self._tag_items_created_since(c, node_start, NODE_LAYER_TAG)
 
@@ -7478,6 +7495,35 @@ class MeshSimulatorApp:
             decoded = decode_color_tile(data) if key[0] == "Generated" else decode_grayscale_tile(data)
             self.map_tile_decoded[key] = decoded
         return decoded.resize((pixel_size, pixel_size), Image.Resampling.BILINEAR)
+
+    def _load_cached_map_tile(
+        self, key: tuple[str, int, int, int]
+    ) -> bytes | None:
+        """Read a visible tile directly from the local cache.
+
+        Sending disk hits through the worker/result/poll cycle adds at least a
+        100 ms blank-frame delay and can repeat for several batches while the
+        user zooms out. Network misses still stay on background workers.
+        """
+        cached = self.map_tile_bytes.get(key)
+        if cached is not None:
+            return cached
+        layer, zoom, tile_x, tile_y = key
+        cache_path = self.map_service.cache_path_for(layer, zoom, tile_x, tile_y)
+        if not cache_path.exists():
+            return None
+        try:
+            data = cache_path.read_bytes()
+            if layer == "Generated":
+                labels_path = cache_path.with_suffix(".labels.json")
+                if labels_path.exists():
+                    self.generated_tile_labels[(zoom, tile_x, tile_y)] = json.loads(
+                        labels_path.read_text(encoding="utf-8")
+                    )
+        except (OSError, ValueError):
+            return None
+        self.map_tile_bytes[key] = data
+        return data
 
     MAX_MAP_LABELS_PER_FRAME = 220
 
@@ -7563,12 +7609,24 @@ class MeshSimulatorApp:
             return self._compose_terrain_only_layer(c, composed)
         if not env.map_configured:
             return composed
+        layer = env.map_layer if env.map_layer in TILE_LAYERS else "Generated"
         scale = self._base_scale() * self.zoom
+        map_context = (
+            env.map_center_lat,
+            env.map_center_lon,
+            layer,
+            self.map_visible.get(),
+            self.terrain_only_view.get(),
+        )
         # Paint the last composited frame into the new view first, scaled and
         # shifted to match -- an instant (if slightly stale) placeholder so a
         # zoom/pan into not-yet-fetched tiles shows a filled map right away
         # instead of blank space while the real tiles load in the background.
-        if self.last_map_composite is not None and self.last_map_composite_view is not None:
+        if (
+            self.last_map_composite is not None
+            and self.last_map_composite_view is not None
+            and self.last_map_composite_context == map_context
+        ):
             old_view_x, old_view_y, old_scale = self.last_map_composite_view
             ratio = scale / old_scale if old_scale > 1e-9 else 0.0
             # Shrinking the placeholder is always cheap, however far out the
@@ -7578,6 +7636,15 @@ class MeshSimulatorApp:
             # an enormous image on a large zoom-in.
             if 0.0 < ratio <= 50.0:
                 try:
+                    # Unknown outer territory is temporarily filled from the
+                    # previous frame instead of flashing the white unloaded
+                    # outline. The correctly transformed center and sharp new
+                    # tiles are pasted over this fallback immediately below.
+                    composed.paste(
+                        self.last_map_composite.resize(
+                            (canvas_width, canvas_height), Image.Resampling.BILINEAR
+                        )
+                    )
                     new_width = max(1, round(self.last_map_composite.width * ratio))
                     new_height = max(1, round(self.last_map_composite.height * ratio))
                     placeholder = self.last_map_composite.resize(
@@ -7588,7 +7655,6 @@ class MeshSimulatorApp:
                     composed.paste(placeholder, (offset_x, offset_y))
                 except Exception:
                     pass
-        layer = env.map_layer if env.map_layer in TILE_LAYERS else "Generated"
         zoom = choose_tile_zoom(scale, int(TILE_LAYERS[layer]["max_zoom"]))
         center_x, center_y = latlon_to_mercator(env.map_center_lat, env.map_center_lon)
         mercator_scale = world_scale_factor(env.map_center_lat)
@@ -7612,7 +7678,7 @@ class MeshSimulatorApp:
             for raw_tile_x in range(math.floor(tile_left), math.floor(tile_right) + 1):
                 tile_x = raw_tile_x % maximum
                 key = (layer, zoom, tile_x, tile_y)
-                data = self.map_tile_bytes.get(key)
+                data = self._load_cached_map_tile(key)
                 if data is None:
                     if key not in self.map_tile_failures:
                         self.map_service.request_tile(*key)
@@ -7664,6 +7730,7 @@ class MeshSimulatorApp:
             }
         self.last_map_composite = composed
         self.last_map_composite_view = (self.view_x, self.view_y, scale)
+        self.last_map_composite_context = map_context
         return composed
 
     @staticmethod
@@ -7729,7 +7796,7 @@ class MeshSimulatorApp:
             for raw_tile_x in range(math.floor(tile_left), math.floor(tile_right) + 1):
                 key = ("TerrainDEM", zoom, raw_tile_x % maximum, tile_y)
                 required_keys.append(key)
-                if key not in self.map_tile_bytes and key not in self.map_tile_failures:
+                if self._load_cached_map_tile(key) is None and key not in self.map_tile_failures:
                     self.map_service.request_tile(*key)
         available_keys = tuple(key for key in required_keys if key in self.map_tile_bytes)
 
@@ -8009,6 +8076,61 @@ class MeshSimulatorApp:
         self._obstacle_bounds_cache[id(obstacle)] = (signature, bounds)
         return bounds
 
+    def _visible_obstacles_for_bounds(
+        self, visible_bounds: tuple[float, float, float, float]
+    ) -> list[tuple[Obstacle, tuple[float, float, float, float]]]:
+        """Query a reusable world-space grid instead of scanning every import.
+
+        Dense city scenarios contain thousands of buildings. Most are outside
+        a zoomed-in viewport, so an O(all obstacles) pass after every pan/zoom
+        wastes more time than drawing the handful that can actually be seen.
+        """
+        index = getattr(self, "_obstacle_view_index", None)
+        if index is None:
+            bounds = [self._obstacle_bounds(obstacle) for obstacle in self.scenario.obstacles]
+            if not bounds:
+                self._obstacle_view_index = (1.0, {}, [], [])
+                return []
+            scene_left = min(item[0] for item in bounds)
+            scene_top = min(item[1] for item in bounds)
+            scene_right = max(item[2] for item in bounds)
+            scene_bottom = max(item[3] for item in bounds)
+            area = max(1.0, scene_right - scene_left) * max(1.0, scene_bottom - scene_top)
+            cell_m = max(50.0, math.sqrt(area * 24.0 / max(1, len(bounds))))
+            cells: dict[tuple[int, int], list[int]] = {}
+            global_indices: list[int] = []
+            for obstacle_index, (left, top, right, bottom) in enumerate(bounds):
+                cell_left, cell_top = math.floor(left / cell_m), math.floor(top / cell_m)
+                cell_right, cell_bottom = math.floor(right / cell_m), math.floor(bottom / cell_m)
+                occupied = (cell_right - cell_left + 1) * (cell_bottom - cell_top + 1)
+                if occupied > 256:
+                    global_indices.append(obstacle_index)
+                    continue
+                for cell_y in range(cell_top, cell_bottom + 1):
+                    for cell_x in range(cell_left, cell_right + 1):
+                        cells.setdefault((cell_x, cell_y), []).append(obstacle_index)
+            index = (cell_m, cells, global_indices, bounds)
+            self._obstacle_view_index = index
+
+        cell_m, cells, global_indices, bounds = index
+        left, top, right, bottom = visible_bounds
+        cell_left, cell_top = math.floor(left / cell_m), math.floor(top / cell_m)
+        cell_right, cell_bottom = math.floor(right / cell_m), math.floor(bottom / cell_m)
+        requested_cells = (cell_right - cell_left + 1) * (cell_bottom - cell_top + 1)
+        if requested_cells > max(4096, len(cells) * 2):
+            candidate_indices = range(len(bounds))
+        else:
+            candidates = set(global_indices)
+            for cell_y in range(cell_top, cell_bottom + 1):
+                for cell_x in range(cell_left, cell_right + 1):
+                    candidates.update(cells.get((cell_x, cell_y), ()))
+            candidate_indices = sorted(candidates)
+        return [
+            (self.scenario.obstacles[index], bounds[index])
+            for index in candidate_indices
+            if self._bounds_overlap(bounds[index], visible_bounds)
+        ]
+
     def _draw_vector_obstacles(self, c: tk.Canvas, obstacles: list[Obstacle]) -> None:
         for obstacle in obstacles:
             if (
@@ -8022,7 +8144,7 @@ class MeshSimulatorApp:
             if obstacle.id == self.selected_id:
                 self._tag_items_created_since(c, obstacle_start, SELECTED_OBSTACLE_TAG)
 
-    def _invalidate_geographic_layer(self) -> None:
+    def _invalidate_geographic_layer(self, *, obstacles_changed: bool = True) -> None:
         self.obstacle_layer_image = None
         self.obstacle_layer_source = None
         self.obstacle_layer_source_key = None
@@ -8030,7 +8152,10 @@ class MeshSimulatorApp:
         self._visible_obstacle_bounds = []
         self.zoom_composite_source = None
         self.zoom_composite_source_key = None
-        self._obstacle_bounds_cache.clear()
+        self.geographic_layer_dirty = False
+        if obstacles_changed:
+            self._obstacle_bounds_cache.clear()
+            self._obstacle_view_index = None
 
     def _render_selected_obstacle(self, obstacle: Obstacle) -> None:
         if not hasattr(self, "canvas"):
@@ -8041,6 +8166,7 @@ class MeshSimulatorApp:
         self._draw_obstacle(c, obstacle)
         self._tag_items_created_since(c, starting_count, SELECTED_OBSTACLE_TAG)
         bounds = self._obstacle_bounds(obstacle)
+        self._obstacle_view_index = None
         for index, (candidate, _old_bounds) in enumerate(self._visible_obstacle_bounds):
             if candidate is obstacle:
                 self._visible_obstacle_bounds[index] = (obstacle, bounds)
@@ -8154,10 +8280,11 @@ class MeshSimulatorApp:
             for px, py in ((sx1, sy1), (sx2, sy1), (sx1, sy2), (sx2, sy2)):
                 c.create_rectangle(px - 4, py - 4, px + 4, py + 4, fill="#9de8ff", outline="#12384f")
 
-    def _prepare_node_label_layout(self) -> None:
+    def _prepare_node_label_layout(self) -> list[Node]:
         canvas_width = max(1, self.canvas.winfo_width())
         canvas_height = max(1, self.canvas.winfo_height())
         visible: list[tuple[str, str, float, float, bool]] = []
+        visible_nodes: list[Node] = []
         ordered_nodes = sorted(
             self.scenario.nodes,
             key=lambda node: (node.id != self.selected_id, node.name.lower(), node.node_num),
@@ -8166,6 +8293,7 @@ class MeshSimulatorApp:
             x, y = self.world_to_screen(node.x, node.y)
             if not (-260 <= x <= canvas_width + 260 and -70 <= y <= canvas_height + 70):
                 continue
+            visible_nodes.append(node)
             infrastructure = node.role in {
                 "ROUTER",
                 "ROUTER_LATE",
@@ -8175,6 +8303,7 @@ class MeshSimulatorApp:
             }
             visible.append((node.id, node.name, x, y, infrastructure))
         self.node_label_layout = layout_node_labels(visible, canvas_width, canvas_height)
+        return visible_nodes
 
     def _active_packet_reached(self) -> dict[str, dict[str, Any]] | None:
         if self.live_path_test_id is not None:
@@ -8306,10 +8435,6 @@ class MeshSimulatorApp:
             (2, 0),
             (0, -2),
             (0, 2),
-            (-1, -1),
-            (-1, 1),
-            (1, -1),
-            (1, 1),
         ):
             c.create_text(x + offset_x, y + offset_y, text=text, fill="#05080d", font=font)
         c.create_text(x, y, text=text, fill=fill, font=font)
@@ -8844,7 +8969,7 @@ class MeshSimulatorApp:
     @staticmethod
     def _halo_text(c: tk.Canvas, x: float, y: float, **kwargs: Any) -> None:
         """Black text ringed with a white halo so it reads on any background."""
-        for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+        for offset_x, offset_y in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             c.create_text(x + offset_x, y + offset_y, fill="white", **kwargs)
         c.create_text(x, y, fill="black", **kwargs)
 
@@ -9070,8 +9195,14 @@ class MeshSimulatorApp:
         tag: str,
         photo_attribute: str,
         segmented: bool = False,
+        extend_background: bool = False,
     ) -> None:
-        preview = self._transformed_zoom_source(source, source_key, segmented=segmented)
+        preview = self._transformed_zoom_source(
+            source,
+            source_key,
+            segmented=segmented,
+            background_source=source if extend_background else None,
+        )
         if preview is None:
             return
         items = self.canvas.find_withtag(tag)
@@ -9116,6 +9247,7 @@ class MeshSimulatorApp:
         source_key: tuple[object, ...] | None,
         *,
         segmented: bool = False,
+        background_source: Image.Image | None = None,
     ) -> Image.Image | None:
         if source is None or source_key is None:
             return None
@@ -9147,8 +9279,64 @@ class MeshSimulatorApp:
         scale_ratio = source_scale / destination_scale
         source_x = (self.view_x - source_view_x) * source_scale
         source_y = (self.view_y - source_view_y) * source_scale
+        transform_source = source
+        source_right = source_x + width * scale_ratio
+        source_bottom = source_y + height * scale_ratio
+        if background_source is not None and (
+            source_x < 0.0
+            or source_y < 0.0
+            or source_right > source_width
+            or source_bottom > source_height
+        ):
+            # Zooming out asks for pixels beyond the previous frame. Build one
+            # reusable temporary surround from that map rather than letting PIL
+            # fill the revealed outline with white. The exact previous frame is
+            # pasted in the center, so existing geography stays sharp while the
+            # stretched surround is visible only until fresh tiles settle.
+            extension_key = (id(source), id(background_source))
+            extended = self.zoom_extended_source
+            cached_pad_x = 0 if extended is None else (extended.width - source_width) // 2
+            cached_pad_y = 0 if extended is None else (extended.height - source_height) // 2
+            required_pad_x = math.ceil(
+                max(0.0, -source_x, source_right - source_width)
+            )
+            required_pad_y = math.ceil(
+                max(0.0, -source_y, source_bottom - source_height)
+            )
+            cache_covers_view = (
+                self.zoom_extended_source_key == extension_key
+                and extended is not None
+                and cached_pad_x >= required_pad_x
+                and cached_pad_y >= required_pad_y
+            )
+            if not cache_covers_view:
+                # Start with generous headroom for normal wheel bursts, then
+                # grow with the requested crop if the user keeps zooming out.
+                # This makes the preview coverage unbounded without repeatedly
+                # allocating a larger bitmap on every wheel event.
+                pad_x = max(
+                    math.ceil(source_width * 0.75),
+                    math.ceil(required_pad_x * 1.35),
+                )
+                pad_y = max(
+                    math.ceil(source_height * 0.75),
+                    math.ceil(required_pad_y * 1.35),
+                )
+                extended_width = source_width + pad_x * 2
+                extended_height = source_height + pad_y * 2
+                extended = background_source.resize(
+                    (extended_width, extended_height), Image.Resampling.NEAREST
+                )
+                extended.paste(source, (pad_x, pad_y))
+                self.zoom_extended_source = extended
+                self.zoom_extended_source_key = extension_key
+                cached_pad_x = pad_x
+                cached_pad_y = pad_y
+            transform_source = extended
+            source_x += cached_pad_x
+            source_y += cached_pad_y
         fill = (0, 0, 0, 0) if source.mode == "RGBA" else MAPLESS_BACKGROUND
-        return source.transform(
+        return transform_source.transform(
             (width, height),
             Image.Transform.AFFINE,
             (scale_ratio, 0.0, source_x, 0.0, scale_ratio, source_y),
@@ -9194,6 +9382,7 @@ class MeshSimulatorApp:
         preview = self._transformed_zoom_source(
             self.zoom_composite_source,
             geographic_key,
+            background_source=geographic,
         )
         if preview is None:
             return False
@@ -9237,6 +9426,7 @@ class MeshSimulatorApp:
                 self.obstacle_layer_source_key,
                 tag=GEOGRAPHIC_LAYER_TAG,
                 photo_attribute="zoom_geographic_photo",
+                extend_background=True,
             )
             self._zoom_preview_layer(
                 self.beacon_segment_source,
