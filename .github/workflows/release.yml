@@ -70,10 +70,15 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: release
           merge-multiple: true
+
+      - name: Build short release changelog
+        run: python3 tools/release_notes.py CHANGELOG.md "${GITHUB_REF_NAME}" release-notes.md
 
       - name: Preserve signal-tester firmware downloads
         env:
@@ -90,4 +95,4 @@ jobs:
           release/*
           --verify-tag
           --title "MeshLab RF ${GITHUB_REF_NAME}"
-          --generate-notes
+          --notes-file release-notes.md
