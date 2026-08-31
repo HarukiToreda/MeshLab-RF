@@ -7,13 +7,17 @@
 - Signal testers now wake directly instead of entering OTA mode.
 - Battery gauges now refresh every five seconds.
 - Paused metrics now refresh without repainting the full screen.
+- Log wipes now return to a clean control center with a confirmation banner.
 
 ### Changed
 
 - Survey collection now uses a scrolling nine-ping status log.
 - Paused testers now show a metrics dashboard and require a hold to open the menu.
 - A tap while collecting now switches between the live log and control center.
+- The same log/control tap toggle now works while paused.
+- Paused log views now load the newest records stored in flash.
 - Storage metrics now live only in the control center, not the menu.
+- Screen timeout choices now include 30 seconds, 60 seconds, 10 minutes, and always on.
 
 ## 1.0.1 - 2026-08-30
 

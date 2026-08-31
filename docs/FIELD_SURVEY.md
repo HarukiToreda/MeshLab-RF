@@ -30,13 +30,15 @@ The first installation of the internal-flash build may show `LOG NEEDS WIPE` bec
 
 Logging starts paused after every boot so a setup period does not consume log space. Use the T114 user button on both radios:
 
-1. Hold for 500 ms to open the popup menu. A tap does nothing while paused and switches views while collecting.
-2. Tap to move through `START / APPEND` or `STOP LOGGING`, sound, wipe, restart, power, and exit.
+1. Tap to switch between the control center and live log. Hold for 500 ms to open the menu.
+2. Tap to move through `START / APPEND` or `STOP LOGGING`, sound, screen timeout, wipe, restart, power, and exit.
 3. Hold for 500 ms to select the displayed item.
 
 `WIPE ALL LOGS` requires a second hold to confirm. Wiping is permanent and leaves logging paused. Extract the two logs first if they contain a walk you need.
 
 The control center shows records used, free, and used/available KB. `SOUND: ON/MUTED` controls mobile pings; the base is always silent.
+
+`SCREEN` offers 30 seconds, 60 seconds, 10 minutes, or always on. Only the backlight sleeps; logging continues. The first button press wakes the screen without taking another action.
 
 `POWER OFF` also requires a second hold. It stops logging, sleeps the radio and GPS, and enters system-off. Press the same button to wake directly into the tester with logging paused and logs intact. `RESTART DEVICE` restarts without wiping the log.
 
@@ -46,11 +48,13 @@ Start logging on the base, then start logging on the mobile when both have the d
 
 While collecting, both displays show the latest nine pings as a scrolling log with quality and RSSI/SNR. Mobile rows change from `WAIT` to `YES` or `NO`; base rows show whether the reply was sent. The mobile buzzer pings after a successful send and reply. The base is silent.
 
-Tap while collecting to switch between the scrolling log and control center. Hold from either view to open the menu.
+Tap at any time to switch between the scrolling log and control center. Hold from either view to open the menu.
+
+While paused, the log view shows the newest records stored in flash, including records from before a restart.
 
 Both displays include a battery gauge, logging state (`R` or `P`), and used/total log slots. Battery updates every five seconds and remains an open-circuit voltage estimate.
 
-When paused, the control center shows GPS lock, satellites, HDOP, speed, coordinates, storage, sound, radio settings, device ID, and battery.
+When paused, the control center shows GPS lock, satellites, HDOP, speed, coordinates, storage, sound, screen timeout, radio settings, device ID, and battery.
 
 The GPS UART is checked continuously. A coordinate is trusted only after consecutive fresh fixes with at least six satellites, HDOP at or below 2.00, and no implausible position jump. Walking mode requires five good fixes. At 20 km/h or faster, vehicle mode requires seven good fixes and scales its jump allowance from the GPS-reported speed, so legitimate driving motion is accepted without relaxing the satellite or HDOP requirements. Speeds above 180 km/h are rejected. The mobile sends the first trusted point, then requires at least five meters of movement when walking or 15 meters while driving and the five-second interval before another probe. Stationary GPS jitter therefore does not create repeated samples. `GPS UART NO DATA`, `WAITING FOR GPS`, `GPS QUALITY LOW`, `GPS STABILIZING`, and `WAITING FOR MOVEMENT` identify the exact reason no packet is being sent. Both builds use the T114 reference wiring: CPU RX P1.5 (Arduino 37), CPU TX P1.7 (Arduino 39), GPS standby P1.2 (34), and peripheral power P0.21 (21).
 

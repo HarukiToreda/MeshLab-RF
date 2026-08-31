@@ -42,6 +42,10 @@ constexpr uint8_t PENDING_COUNT = 4;
 constexpr uint8_t DASHBOARD_ROW_COUNT = 9;
 constexpr uint8_t BUZZER_QUEUE_CAPACITY = 4;
 constexpr uint8_t BUTTON_EDGE_QUEUE_CAPACITY = 16;
+constexpr uint8_t MENU_OPTION_COUNT = 7;
+constexpr uint32_t SCREEN_TIMEOUT_OPTIONS_MS[] = {30000UL, 60000UL, 600000UL, 0UL};
+constexpr uint8_t SCREEN_TIMEOUT_OPTION_COUNT =
+    sizeof(SCREEN_TIMEOUT_OPTIONS_MS) / sizeof(SCREEN_TIMEOUT_OPTIONS_MS[0]);
 
 TinyGPSPlus gps;
 Adafruit_ST7789 display(&SPI1, TFT_CS, TFT_DC, TFT_RESET);
@@ -120,13 +124,47 @@ uint16_t dashboardStatusColor = ST77XX_YELLOW;
 char pausedGpsRendered[4][24] = {};
 uint16_t pausedGpsRenderedColor[4] = {};
 bool pausedGpsCacheValid = false;
-bool collectionControlVisible = false;
+bool controlCenterSelected = true;
 bool controlStorageCacheValid = false;
 bool controlStorageReadyRendered = false;
 bool controlSoundRendered = false;
+uint8_t controlScreenTimeoutRendered = UINT8_MAX;
 uint32_t controlStorageSlotsRendered = UINT32_MAX;
+bool controlCenterRendered = false;
+uint32_t transientNoticeUntilMs = 0;
+uint8_t screenTimeoutSelection = SCREEN_TIMEOUT_OPTION_COUNT - 1;
+bool screenAwake = true;
+uint32_t lastScreenInteractionMs = 0;
 
 constexpr uint16_t BATTERY_OCV_MV[] = {4190, 4050, 3990, 3890, 3800, 3720, 3630, 3530, 3420, 3300, 3100};
+
+const char *screenTimeoutMenuLabel()
+{
+    switch (screenTimeoutSelection) {
+    case 0:
+        return "SCREEN: 30 SEC";
+    case 1:
+        return "SCREEN: 60 SEC";
+    case 2:
+        return "SCREEN: 10 MIN";
+    default:
+        return "SCREEN: ALWAYS ON";
+    }
+}
+
+const char *screenTimeoutShortLabel()
+{
+    switch (screenTimeoutSelection) {
+    case 0:
+        return "30S";
+    case 1:
+        return "60S";
+    case 2:
+        return "10M";
+    default:
+        return "ON";
+    }
+}
 
 uint8_t batteryPercent(uint16_t millivolts)
 {
@@ -732,11 +770,18 @@ void drawDashboardHeader()
     display.setTextColor(ST77XX_CYAN);
     display.setCursor(4, 4);
     display.print(ROLE_NAME);
-    display.print(" CONTROL");
+    display.print(" LOG");
     display.fillRect(100, 0, 140, 14, ST77XX_BLACK);
-    display.setTextColor(dashboardStatusColor);
+    display.setTextColor(loggingEnabled ? dashboardStatusColor : ST77XX_CYAN);
     display.setCursor(104, 4);
-    display.print(dashboardStatus);
+    if (loggingEnabled) {
+        display.print(dashboardStatus);
+    } else if (storageReady) {
+        display.print(storage.slots());
+        display.print(" SAVED");
+    } else {
+        display.print("STORAGE --");
+    }
     display.drawFastHLine(0, 14, 240, ST77XX_WHITE);
 }
 
@@ -779,6 +824,117 @@ void drawDashboardRows()
     }
 }
 
+bool dashboardRowFromStoredFields(uint8_t roleValue, uint8_t eventValue, uint8_t flags, uint32_t sequence,
+                                  int16_t localRssi, int16_t localSnrCenti, int16_t remoteRssi,
+                                  int16_t remoteSnrCenti, DashboardRow &row)
+{
+    const SurveyRole storedRole = static_cast<SurveyRole>(roleValue);
+    const SurveyEvent event = static_cast<SurveyEvent>(eventValue);
+    row = {true, false, sequence, 0, 0, DashboardResponse::Missed};
+
+    if (storedRole == SurveyRole::Mobile) {
+        if (event == SurveyEvent::ReplyRx) {
+            if (flags & RemoteRxValid) {
+                row.signalValid = true;
+                row.rssi = remoteRssi;
+                row.snrCenti = remoteSnrCenti;
+            } else if (flags & LocalRxValid) {
+                row.signalValid = true;
+                row.rssi = localRssi;
+                row.snrCenti = localSnrCenti;
+            }
+            row.response = DashboardResponse::Received;
+            return true;
+        }
+        if (event == SurveyEvent::Timeout) {
+            row.response = DashboardResponse::Missed;
+            return true;
+        }
+        if (event == SurveyEvent::Send) {
+            row.response = DashboardResponse::Waiting;
+            return true;
+        }
+        return false;
+    }
+
+    if (storedRole == SurveyRole::Base && event == SurveyEvent::ProbeRx) {
+        row.signalValid = (flags & LocalRxValid) != 0;
+        row.rssi = localRssi;
+        row.snrCenti = localSnrCenti;
+        row.response = flags & ReplySent ? DashboardResponse::ReplySent : DashboardResponse::ReplyFailed;
+        return true;
+    }
+    if (storedRole == SurveyRole::Base && event == SurveyEvent::ReplyTx) {
+        row.response = DashboardResponse::ReplySent;
+        return true;
+    }
+    return false;
+}
+
+bool readStoredDashboardRow(uint32_t slot, DashboardRow &row, uint32_t &sessionIdValue)
+{
+    uint8_t raw[sizeof(LegacySurveyRecordV1)] = {};
+    if (!storage.readRaw(slot, raw))
+        return false;
+
+    if (storage.version() == SURVEY_FORMAT_VERSION && storage.recordSize() == sizeof(SurveyRecord)) {
+        SurveyRecord record = {};
+        memcpy(&record, raw, sizeof(record));
+        if (record.magic != SURVEY_RECORD_MAGIC || record.version != SURVEY_FORMAT_VERSION ||
+            record.crc32 != crc32(&record, offsetof(SurveyRecord, crc32)))
+            return false;
+        sessionIdValue = record.sessionId;
+        return dashboardRowFromStoredFields(record.role, record.event, record.flags, record.sequence,
+                                            record.localRssiDbm, record.localSnrCentiDb, record.remoteRssiDbm,
+                                            record.remoteSnrCentiDb, row);
+    }
+
+    if (storage.version() == SURVEY_LEGACY_FORMAT_VERSION &&
+        storage.recordSize() == sizeof(LegacySurveyRecordV1)) {
+        LegacySurveyRecordV1 record = {};
+        memcpy(&record, raw, sizeof(record));
+        if (record.magic != SURVEY_RECORD_MAGIC || record.version != SURVEY_LEGACY_FORMAT_VERSION ||
+            record.crc32 != crc32(&record, offsetof(LegacySurveyRecordV1, crc32)))
+            return false;
+        sessionIdValue = record.sessionId;
+        return dashboardRowFromStoredFields(record.role, record.event, record.flags, record.sequence,
+                                            record.localRssiDbm, record.localSnrCentiDb, record.remoteRssiDbm,
+                                            record.remoteSnrCentiDb, row);
+    }
+    return false;
+}
+
+void loadStoredDashboardRows()
+{
+    DashboardRow newest[DASHBOARD_ROW_COUNT] = {};
+    uint32_t sessions[DASHBOARD_ROW_COUNT] = {};
+    uint8_t count = 0;
+    for (uint32_t slot = storage.slots(); slot > 0 && count < DASHBOARD_ROW_COUNT;) {
+        --slot;
+        DashboardRow row = {};
+        uint32_t storedSession = 0;
+        if (!readStoredDashboardRow(slot, row, storedSession))
+            continue;
+        bool duplicate = false;
+        for (uint8_t index = 0; index < count; ++index) {
+            if (sessions[index] == storedSession && newest[index].sequence == row.sequence) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate)
+            continue;
+        newest[count] = row;
+        sessions[count] = storedSession;
+        ++count;
+    }
+
+    memset(dashboardRows, 0, sizeof(dashboardRows));
+    dashboardRowCount = count;
+    for (uint8_t index = 0; index < count; ++index)
+        dashboardRows[index] = newest[count - 1 - index];
+}
+
 void drawDashboardFooter()
 {
     display.fillRect(0, 120, 172, 15, ST77XX_BLACK);
@@ -795,14 +951,18 @@ void drawDashboardFooter()
     } else {
         display.print('-');
     }
-    if (loggingEnabled)
-        display.print(" T:CTRL");
+    display.print(" T:CTRL");
     drawBatteryStatus();
 }
 
 void drawDashboard()
 {
+    controlCenterSelected = false;
+    controlCenterRendered = false;
+    transientNoticeUntilMs = 0;
     updateBatteryReading();
+    if (!loggingEnabled && storageReady)
+        loadStoredDashboardRows();
     display.fillScreen(ST77XX_BLACK);
     drawDashboardHeader();
     drawDashboardRows();
@@ -881,11 +1041,13 @@ void drawControlStorageMetrics()
     const uint32_t slots = storageReady ? storage.slots() : 0;
     const bool soundOn = ROLE == SurveyRole::Mobile && soundEnabled;
     if (controlStorageCacheValid && controlStorageReadyRendered == storageReady &&
-        controlStorageSlotsRendered == slots && controlSoundRendered == soundOn)
+        controlStorageSlotsRendered == slots && controlSoundRendered == soundOn &&
+        controlScreenTimeoutRendered == screenTimeoutSelection)
         return;
     controlStorageReadyRendered = storageReady;
     controlStorageSlotsRendered = slots;
     controlSoundRendered = soundOn;
+    controlScreenTimeoutRendered = screenTimeoutSelection;
 
     const uint16_t panel = display.color565(7, 18, 27);
     display.fillRect(125, 37, 108, 19, panel);
@@ -931,21 +1093,20 @@ void drawControlStorageMetrics()
     }
     display.setCursor(128, 86);
     if (ROLE == SurveyRole::Mobile) {
-        display.print("SOUND ");
+        display.print("SND ");
         display.setTextColor(soundEnabled ? ST77XX_GREEN : ST77XX_YELLOW);
         display.print(soundEnabled ? "ON" : "MUTED");
     } else {
-        display.print("SOUND BASE SILENT");
+        display.print("SND --");
     }
+    display.setTextColor(ST77XX_WHITE);
+    display.print(" SCR ");
+    display.print(screenTimeoutShortLabel());
     controlStorageCacheValid = true;
 }
 
-void drawControlCenter()
+void drawControlCenterHeader()
 {
-    updateBatteryReading();
-    display.fillScreen(ST77XX_BLACK);
-    display.setTextWrap(false);
-
     const uint16_t header = display.color565(5, 28, 42);
     display.fillRect(0, 0, 240, 18, header);
     display.fillRect(0, 0, 4, 18, ST77XX_CYAN);
@@ -959,6 +1120,17 @@ void drawControlCenter()
     display.setTextColor(modeColor);
     display.setCursor(192, 5);
     display.print(loggingEnabled ? "ACTIVE" : "PAUSED");
+}
+
+void drawControlCenter()
+{
+    controlCenterSelected = true;
+    controlCenterRendered = true;
+    transientNoticeUntilMs = 0;
+    updateBatteryReading();
+    display.fillScreen(ST77XX_BLACK);
+    display.setTextWrap(false);
+    drawControlCenterHeader();
 
     drawPausedPanel(4, 113, "GPS STATUS");
     drawPausedPanel(122, 114, "LOG STORAGE");
@@ -993,10 +1165,32 @@ void drawControlCenter()
     display.fillRect(0, 120, 172, 15, ST77XX_BLACK);
     display.setTextColor(ST77XX_CYAN);
     display.setCursor(4, 122);
-    display.print(loggingEnabled ? "TAP: LOG  HOLD: MENU" : "HOLD BUTTON: MENU");
+    display.print("TAP: LOG  HOLD: MENU");
     drawBatteryStatus();
     if (menuMode != MenuMode::Closed)
         redrawMenuOverlay();
+}
+
+void showLogsWipedNotice()
+{
+    const uint16_t notice = display.color565(0, 92, 62);
+    display.fillRect(0, 0, 240, 18, notice);
+    display.fillRect(0, 0, 4, 18, ST77XX_GREEN);
+    display.setTextWrap(false);
+    display.setTextSize(1);
+    display.setTextColor(ST77XX_WHITE);
+    display.setCursor(9, 5);
+    display.print("LOGS WIPED // 0 RECORDS");
+    transientNoticeUntilMs = millis() + 2500;
+}
+
+void serviceTransientNotice()
+{
+    if (!transientNoticeUntilMs || static_cast<int32_t>(millis() - transientNoticeUntilMs) < 0)
+        return;
+    transientNoticeUntilMs = 0;
+    if (controlCenterRendered && menuMode == MenuMode::Closed)
+        drawControlCenterHeader();
 }
 
 void setDashboardStatus(const char *status, uint16_t color)
@@ -1004,7 +1198,7 @@ void setDashboardStatus(const char *status, uint16_t color)
     strncpy(dashboardStatus, status, sizeof(dashboardStatus) - 1);
     dashboardStatus[sizeof(dashboardStatus) - 1] = '\0';
     dashboardStatusColor = color;
-    if (loggingEnabled && !collectionControlVisible && menuMode == MenuMode::Closed)
+    if (loggingEnabled && !controlCenterSelected && menuMode == MenuMode::Closed)
         drawDashboardHeader();
 }
 
@@ -1024,7 +1218,7 @@ void addDashboardRow(uint32_t sequence, bool signalValid, int16_t rssi, int16_t 
     }
     dashboardRows[dashboardRowCount++] = {true, signalValid, sequence, rssi, snrCenti, response};
     if (loggingEnabled && menuMode == MenuMode::Closed) {
-        if (collectionControlVisible) {
+        if (controlCenterSelected) {
             drawControlStorageMetrics();
         } else {
             drawDashboardRows();
@@ -1044,7 +1238,7 @@ void updateDashboardRow(uint32_t sequence, bool signalValid, int16_t rssi, int16
             row.snrCenti = snrCenti;
             row.response = response;
             if (loggingEnabled && menuMode == MenuMode::Closed) {
-                if (collectionControlVisible) {
+                if (controlCenterSelected) {
                     drawControlStorageMetrics();
                 } else {
                     drawDashboardRows();
@@ -1059,6 +1253,8 @@ void updateDashboardRow(uint32_t sequence, bool signalValid, int16_t rssi, int16
 
 void showScreen(const char *title, const char *line1 = nullptr, const char *line2 = nullptr, const char *line3 = nullptr)
 {
+    controlCenterRendered = false;
+    transientNoticeUntilMs = 0;
     updateBatteryReading();
     display.fillScreen(ST77XX_BLACK);
     display.setTextWrap(false);
@@ -1113,7 +1309,7 @@ void showLoggingStatus()
     if (!storageReady)
         showScreen("STORAGE FAILED", storage.errorText(), "Data cannot persist");
     else if (loggingEnabled) {
-        if (collectionControlVisible)
+        if (controlCenterSelected)
             drawControlCenter();
         else
             drawDashboard();
@@ -1122,8 +1318,10 @@ void showLoggingStatus()
         showScreen("LOG NEEDS WIPE", "Old/unknown format", "Extract first if needed");
     else if (!storage.canAppend())
         showScreen("OLD LOG FOUND", "Extraction still works", "Wipe to use compact log");
-    else
+    else if (controlCenterSelected)
         drawControlCenter();
+    else
+        drawDashboard();
 }
 
 const char *menuLabel(uint8_t selection)
@@ -1136,10 +1334,12 @@ const char *menuLabel(uint8_t selection)
             return "SOUND: BASE SILENT";
         return soundEnabled ? "SOUND: ON" : "SOUND: MUTED";
     case 2:
-        return "WIPE ALL LOGS";
+        return screenTimeoutMenuLabel();
     case 3:
-        return "RESTART DEVICE";
+        return "WIPE ALL LOGS";
     case 4:
+        return "RESTART DEVICE";
+    case 5:
         return "POWER OFF";
     default:
         return "EXIT MENU";
@@ -1198,7 +1398,7 @@ void clearMenuHoldProgress()
 void showMenu()
 {
     drawPopupFrame("SURVEY MENU");
-    for (uint8_t option = 0; option < 6; ++option)
+    for (uint8_t option = 0; option < MENU_OPTION_COUNT; ++option)
         drawMenuOption(option, option == menuSelection);
 }
 
@@ -1242,7 +1442,7 @@ void startLogging()
     sessionId = static_cast<uint32_t>(random(1, INT32_MAX));
     clearPendingProbes();
     clearDashboardRows();
-    collectionControlVisible = false;
+    controlCenterSelected = false;
 #if defined(SURVEY_ROLE_MOBILE)
     nextSequence = 0;
     lastSendMs = 0;
@@ -1261,7 +1461,7 @@ void startLogging()
 void stopLogging()
 {
     loggingEnabled = false;
-    collectionControlVisible = false;
+    controlCenterSelected = true;
     clearPendingProbes();
     showLoggingStatus();
 }
@@ -1271,10 +1471,12 @@ void wipeLogs()
     loggingEnabled = false;
     clearPendingProbes();
     showScreen("WIPING LOGS", "Please wait...", "Do not remove power");
-    if (storageReady && storage.format())
-        showScreen("LOGS WIPED", "Logging remains paused");
-    else
+    if (storageReady && storage.format()) {
+        drawControlCenter();
+        showLogsWipedNotice();
+    } else {
         showScreen("WIPE FAILED", "Storage unavailable");
+    }
 }
 
 [[noreturn]] void powerOffDevice()
@@ -1310,19 +1512,16 @@ void wipeLogs()
 void handleShortButtonPress()
 {
     if (menuMode == MenuMode::Closed) {
-        if (loggingEnabled) {
-            collectionControlVisible = !collectionControlVisible;
-            if (collectionControlVisible)
-                drawControlCenter();
-            else
-                drawDashboard();
-        }
+        if (controlCenterRendered)
+            drawDashboard();
+        else
+            drawControlCenter();
         return;
     }
     lastMenuInteractionMs = millis();
     if (menuMode == MenuMode::Select) {
         const uint8_t previousSelection = menuSelection;
-        menuSelection = (menuSelection + 1) % 6;
+        menuSelection = (menuSelection + 1) % MENU_OPTION_COUNT;
         clearMenuHoldProgress();
         drawMenuOption(previousSelection, false);
         drawMenuOption(menuSelection, true);
@@ -1375,16 +1574,23 @@ void handleLongButtonPress()
         drawMenuOption(menuSelection, true);
         break;
     case 2:
+        screenTimeoutSelection = (screenTimeoutSelection + 1) % SCREEN_TIMEOUT_OPTION_COUNT;
+        lastScreenInteractionMs = millis();
+        controlStorageCacheValid = false;
+        clearMenuHoldProgress();
+        drawMenuOption(menuSelection, true);
+        break;
+    case 3:
         menuMode = MenuMode::ConfirmErase;
         showConfirmationPopup("CONFIRM WIPE", "DELETE ALL LOGS", "Hold again to erase");
         break;
-    case 3:
+    case 4:
         menuMode = MenuMode::Closed;
         showScreen("RESTARTING", "Please wait...");
         delay(500);
         NVIC_SystemReset();
         break;
-    case 4:
+    case 5:
         menuMode = MenuMode::ConfirmPowerOff;
         showConfirmationPopup("CONFIRM POWER OFF", "TURN DEVICE OFF", "Hold again to power off");
         break;
@@ -1399,9 +1605,15 @@ void commitStableButtonState(bool down)
 {
     buttonStableDown = down;
     if (down) {
+        lastScreenInteractionMs = millis();
         buttonPressedMs = buttonChangedMs;
         buttonLongHandled = false;
         buttonHoldProgress = 0;
+        if (!screenAwake) {
+            screenAwake = true;
+            digitalWrite(TFT_BACKLIGHT, LOW);
+            suppressButtonRelease = true;
+        }
         return;
     }
     if (suppressButtonRelease) {
@@ -1485,6 +1697,17 @@ void processButton()
         menuMode = MenuMode::Closed;
         showLoggingStatus();
     }
+}
+
+void serviceScreenTimeout()
+{
+    if (!screenAwake)
+        return;
+    const uint32_t timeoutMs = SCREEN_TIMEOUT_OPTIONS_MS[screenTimeoutSelection];
+    if (!timeoutMs || static_cast<uint32_t>(millis() - lastScreenInteractionMs) < timeoutMs)
+        return;
+    screenAwake = false;
+    digitalWrite(TFT_BACKLIGHT, HIGH);
 }
 
 int64_t daysFromCivil(int year, unsigned month, unsigned day)
@@ -1936,6 +2159,8 @@ void setupDisplay()
     digitalWrite(TFT_POWER, LOW);
     pinMode(TFT_BACKLIGHT, OUTPUT);
     digitalWrite(TFT_BACKLIGHT, LOW);
+    screenAwake = true;
+    lastScreenInteractionMs = millis();
     delay(50);
     SPI1.setPins(255, TFT_SCK, TFT_MOSI);
     display.init(135, 240);
@@ -2024,11 +2249,12 @@ void loop()
     }
     processSerial();
     processButton();
+    serviceTransientNotice();
+    serviceScreenTimeout();
     processRadio();
     expirePending();
     if (updateBatteryReading() && menuMode == MenuMode::Closed) {
-        if (radioReady && storageReady && storage.canAppend() && storage.hasSpace(1) &&
-            (!loggingEnabled || collectionControlVisible)) {
+        if (controlCenterRendered && radioReady && storageReady && storage.canAppend() && storage.hasSpace(1)) {
             drawPausedGpsMetrics();
             drawControlStorageMetrics();
             drawBatteryStatus();

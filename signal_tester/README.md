@@ -17,15 +17,17 @@ python -m platformio run -e t114-survey-base
 
 The generated UF2 files are named `heltec-t114-signal-mobile.uf2` and `heltec-t114-signal-base.uf2` inside their corresponding `.pio/build` directories. Checked-in ready-to-flash copies are in [`artifacts/signal-tester`](../artifacts/signal-tester); those binaries are outputs, while this directory contains the editable source.
 
-Logging is paused at boot. Hold the T114 button for 500 ms to open the menu; a tap does nothing while paused. Tap to move and hold to select inside the menu. Power-off waits for release, and the next press wakes directly into the tester. Logs remain until `WIPE ALL LOGS` is confirmed.
+Logging is paused at boot. Tap to switch between the control center and live log, even while paused. Hold for 500 ms to open the menu; inside it, tap to move and hold to select. The screen timeout can be set to 30 seconds, 60 seconds, 10 minutes, or always on. The first press after a timeout only wakes the display. Power-off waits for release, and the next press wakes directly into the tester. Logs remain until `WIPE ALL LOGS` is confirmed.
 
 The battery gauge refreshes every five seconds, including while logging is paused.
 
-The paused control center shows GPS quality, coordinates, speed, storage, sound, radio settings, device ID, and battery.
+The paused control center shows GPS quality, coordinates, speed, storage, sound, screen timeout, radio settings, device ID, and battery.
 
 While collecting, both testers show a nine-row live log. New pings scroll in at the bottom with quality, RSSI/SNR, and reply status; the mobile updates `WAIT` to `YES` or `NO` when each result arrives.
 
-While collecting, tap to switch between the live log and control center. Hold from either view to open the menu.
+Tap to switch between the live log and control center. Hold from either view to open the menu.
+
+While paused, the log view loads the newest saved records from flash, including after a restart.
 
 The mobile sends its first probe only after consecutive fresh fixes have at least six satellites and HDOP no worse than 2.00. Walking mode requires five good fixes. At 20 km/h or faster, vehicle mode requires seven good fixes and judges position changes against the GPS-reported speed instead of rejecting normal driving motion; speeds above 180 km/h remain rejected as implausible for this survey. After the first sample, another probe requires at least five meters of movement when walking or 15 meters while driving, as well as the five-second rate limit, so a stationary tester does not fill the log with duplicate positions. These thresholds are configurable in `include/survey_config.h`.
 
