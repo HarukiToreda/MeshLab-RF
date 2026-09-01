@@ -2,8 +2,11 @@
 
 ## Unreleased
 
+## 1.0.2 - 2026-09-01
+
 ### Fixed
 
+- Packaged applications now include the vector-tile decoder required to display the generated map.
 - Signal testers now wake directly instead of entering OTA mode.
 - Battery gauges now refresh every five seconds.
 - Paused metrics now refresh without repainting the full screen.
