@@ -107,9 +107,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}"
-          release/*
-          --verify-tag
-          --title "MeshLab RF ${GITHUB_REF_NAME}"
-          --notes-file release-notes.md
+        run: |
+          mapfile -d '' assets < <(find release -type f -print0)
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+            --verify-tag \
+            --title "MeshLab RF ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md
